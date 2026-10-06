@@ -394,4 +394,127 @@ final class MediaProbeControllerTests: XCTestCase {
         XCTAssertFalse(probe.connected, "stale peer callback must not restart the probe")
         XCTAssertFalse(probe.mediaReady)
     }
+
+    /// Build-47 stats-selection fixtures: energy/level merge must resolve the
+    /// LOCAL media-source via `mediaSourceId` (or fall back to any audio
+    /// media-source), must NEVER treat `audioLevel`-only as "energy seen",
+    /// and must keep the remote inbound level separate.
+    func testCaptureSignalEvidenceSelectsLocalMediaSourceById() {
+        let entries = [
+            MediaProbeController.StatsEntry(id: "RTCOutboundRTPAudioStream_1",
+                type: "outbound-rtp",
+                values: ["kind": "audio", "packetsSent": NSNumber(value: 12),
+                         "mediaSourceId": "RTCAudioSource_1"]),
+            MediaProbeController.StatsEntry(id: "RTCAudioSource_1",
+                type: "media-source",
+                values: ["kind": "audio", "totalAudioEnergy": NSNumber(value: 0.75),
+                         "audioLevel": NSNumber(value: 0.25)]),
+            MediaProbeController.StatsEntry(id: "RTCInboundRTPAudioStream_2",
+                type: "inbound-rtp",
+                values: ["kind": "audio", "audioLevel": NSNumber(value: 0.9)]),
+        ]
+        let evidence = MediaProbeController.captureSignalEvidence(from: entries)
+        XCTAssertTrue(evidence.energySeen)
+        XCTAssertEqual(evidence.energy, 0.75)
+        XCTAssertTrue(evidence.levelSeen)
+        XCTAssertEqual(evidence.level, 0.25)
+        XCTAssertTrue(evidence.inboundLevelSeen)
+        XCTAssertEqual(evidence.inboundLevel, 0.9, "the remote RFC 6464 level is never local capture evidence")
+    }
+
+    func testCaptureSignalEvidenceFallsBackWithoutMediaSourceId() {
+        let entries = [
+            MediaProbeController.StatsEntry(id: "RTCOutboundRTPAudioStream_1",
+                type: "outbound-rtp", values: ["kind": "audio", "packetsSent": NSNumber(value: 12)]),
+            MediaProbeController.StatsEntry(id: "RTCAudioSource_9",
+                type: "media-source",
+                values: ["kind": "audio", "totalAudioEnergy": NSNumber(value: 0.4)]),
+        ]
+        let evidence = MediaProbeController.captureSignalEvidence(from: entries)
+        XCTAssertTrue(evidence.energySeen)
+        XCTAssertEqual(evidence.energy, 0.4)
+    }
+
+    /// A report carrying `audioLevel` WITHOUT `totalAudioEnergy` must never
+    /// be read as "energy seen" — the conflation would manufacture false
+    /// zero-energy evidence.
+    func testCaptureSignalEvidenceLevelOnlyIsNotEnergySeen() {
+        let entries = [
+            MediaProbeController.StatsEntry(id: "RTCOutboundRTPAudioStream_1",
+                type: "outbound-rtp",
+                values: ["kind": "audio", "audioLevel": NSNumber(value: 0.0)]),
+            MediaProbeController.StatsEntry(id: "RTCAudioSource_1",
+                type: "media-source",
+                values: ["kind": "audio", "audioLevel": NSNumber(value: 0.0)]),
+        ]
+        let evidence = MediaProbeController.captureSignalEvidence(from: entries)
+        XCTAssertFalse(evidence.energySeen, "level-only reports must not mark energy as seen")
+        XCTAssertEqual(evidence.energy, 0)
+        XCTAssertTrue(evidence.levelSeen)
+    }
+
+    /// Older SDK builds attach the source energy to the outbound-rtp entry
+    /// itself; the merge must accept it there too.
+    func testCaptureSignalEvidenceEnergyOnOutboundRtp() {
+        let entries = [
+            MediaProbeController.StatsEntry(id: "RTCOutboundRTPAudioStream_1",
+                type: "outbound-rtp",
+                values: ["kind": "audio", "totalAudioEnergy": NSNumber(value: 0.6)]),
+        ]
+        let evidence = MediaProbeController.captureSignalEvidence(from: entries)
+        XCTAssertTrue(evidence.energySeen)
+        XCTAssertEqual(evidence.energy, 0.6)
+    }
+
+    /// Absent/reset/stale shapes: no stats at all, or a kind-mismatched
+    /// media-source, produce "no evidence" — never a false witness.
+    func testCaptureSignalEvidenceAbsentStatsAreNoEvidence() {
+        XCTAssertFalse(MediaProbeController.captureSignalEvidence(from: []).energySeen)
+        let wrongKind = [
+            MediaProbeController.StatsEntry(id: "RTCVideoSource_1",
+                type: "media-source",
+                values: ["kind": "video", "totalAudioEnergy": NSNumber(value: 0.9)]),
+        ]
+        let evidence = MediaProbeController.captureSignalEvidence(from: wrongKind)
+        XCTAssertFalse(evidence.energySeen, "a non-audio source must never supply audio energy")
+    }
+
+    /// Build-47 energy label: fixed-precision, locale-stable, never
+    /// scientific notation — exported logs must be diffable across devices.
+    func testEnergyLabelIsFixedPrecisionAndLocaleStable() {
+        XCTAssertEqual(MediaProbeController.energyLabel(0), "0.000000")
+        XCTAssertEqual(MediaProbeController.energyLabel(0.5), "0.500000")
+        XCTAssertEqual(MediaProbeController.energyLabel(0.0000012), "0.000001")
+        XCTAssertFalse(MediaProbeController.energyLabel(0).contains("e"),
+                       "energy labels never use scientific notation")
+    }
+
+    /// Build-47 session snapshot: privacy-safe keys only (scalars and port
+    /// TYPES), every field present even on a simulator session where rates
+    /// may be 0 — the shape is what future field exports rely on.
+    func testDirectAudioSessionSnapshotShape() {
+        let snapshot = MediaProbeController.directAudioSessionSnapshot()
+        for key in ["active=", "inputAvailable=", "secondaryHint=",
+                    "rate=", "io=", "inLatency=", "outLatency=", "out=", "vol="] {
+            XCTAssertTrue(snapshot.contains(key), "snapshot must include \(key)")
+        }
+        XCTAssertTrue(snapshot.hasPrefix("direct audio session state"))
+    }
+
+    /// Build-46 field regression, encoded: the silent call satisfied EVERY
+    /// transport invariant — this documents that transport proof alone is
+    /// `.proven` and therefore cannot certify audible audio. The gate now
+    /// RECORDS capture-signal evidence after the transport proof, but that
+    /// evidence is collection-only (exact zero is ambiguous), so the honest
+    /// state is: transport proven, sound NOT proven, root cause unresolved.
+    func testTransportProofPassesForTheBuild46SilentCallShape() {
+        let proof = MediaProbeController.audioFlowProof(
+            adopted: true, rtcAudioEnabled: true,
+            inboundPackets: 321, outboundPackets: 12,
+            baselineInbound: 252, baselineOutbound: 0,
+            playoutSamples: 11520, baselinePlayoutSamples: 0,
+            playoutStatSeen: true, statsRoundsSinceAdoption: 3)
+        XCTAssertEqual(proof, .proven,
+                       "the build-46 silent call passed every transport check — transport proof is not sound proof")
+    }
 }

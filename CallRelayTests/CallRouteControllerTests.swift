@@ -26,6 +26,13 @@ final class FakeDirectProbe: DirectProbeControlling {
     /// unavailable (accepted ONCE, explicitly — never a round-one fallback).
     var playoutStatUnavailableValue = false
     var playoutStatUnavailable: Bool { playoutStatUnavailableValue }
+    /// Capture-signal evidence scripting (build-47 diagnostics): whether the
+    /// SDK reported the ENERGY key and the post-adoption energy delta.
+    /// Evidence-only — the gate never arms recovery from these.
+    var outboundAudioEnergyReportedValue = false
+    var outboundAudioEnergyReported: Bool { outboundAudioEnergyReportedValue }
+    var outboundAudioEnergyValue = 0.0
+    var outboundAudioEnergySinceAdoption: Double { outboundAudioEnergyValue }
     /// Bounded audio-device restart scripting: `restartCapable` gates whether
     /// a restart arms at all; `restartHealsAudio` flips the gate input when
     /// the restart runs (the healthy-after-restart device).
@@ -159,7 +166,8 @@ final class CallRouteControllerTests: XCTestCase {
                   attachTimeout: 0.3,
                   comparisonTimeout: 0.8, comparisonPoll: 0.02,
                   startupOpportunityTimeout: 1.0, startupMeasurementSeconds: 0.5,
-                  startupMeasurementPoll: 0.02, directAudioReadyTimeout: 0.2)
+                  startupMeasurementPoll: 0.02, directAudioReadyTimeout: 0.2,
+                  directSignalCheckSeconds: 0.2, directSignalGatePoll: 0.05)
         }
 
         func makeHandoff() -> RoutePreflightController.Handoff? {
@@ -894,6 +902,105 @@ final class CallRouteControllerTests: XCTestCase {
         XCTAssertEqual(h.controller.routeState.mode, .direct,
                        "the user's forced-route choice survives a transport recovery")
         XCTAssertEqual(handoffProbe.closeCount, 1, "the dead peer is closed at handover")
+        h.controller.teardown()
+    }
+
+    // MARK: Capture-signal evidence (build-47 field diagnostics)
+
+    /// Build-46 field shape: EVERY transport check passed while both parties
+    /// heard nothing. The signal evidence phase records the encoder-fed
+    /// energy delta — and by CONTRACT it never arms recovery from it (exact
+    /// zero is ambiguous: NS/gating, quiet room, DTX, part-window mute,
+    /// interruption). Silent energy with an unmuted mic keeps the direct
+    /// path: no restart, no rollback, no notice.
+    func testAdoptedDirectAudioGateSilentEnergyKeepsDirectWithoutRecovery() async throws {
+        let h = Harness()
+        let handoffProbe = FakeDirectProbe()
+        handoffProbe.audioFlowingValue = true
+        handoffProbe.outboundAudioEnergyReportedValue = true
+        handoffProbe.outboundAudioEnergyValue = 0
+        h.handoffProbe = handoffProbe
+        h.transportReported = "ice"
+        h.makeController(.direct)
+        h.controller.relayDidConnect(wsMedia: nil)
+        await waitUntil(timeout: 2) { h.controller.routeState.active == .direct }
+        await pump(0.6) // > directSignalCheckSeconds (0.2 s): a (forbidden) trigger would have fired
+        XCTAssertEqual(h.controller.routeState.active, .direct,
+                       "ambiguous zero energy is evidence, never a recovery trigger")
+        XCTAssertEqual(handoffProbe.restartAudioCount, 0, "no restart is armed from signal evidence")
+        XCTAssertEqual(h.promoteStagedCalls, 0, "no rollback is armed from signal evidence")
+        XCTAssertTrue(h.notices.isEmpty, "evidence collection is not a fallback notice")
+        h.controller.teardown()
+    }
+
+    /// A mic muted for the whole observation window produces exactly the
+    /// same zero-energy shape; the evidence-only contract treats it
+    /// identically — remote silence/mute is never treated as broken.
+    func testAdoptedDirectAudioGateMutedMicEnergyIsNotBrokenness() async throws {
+        let h = Harness()
+        let handoffProbe = FakeDirectProbe()
+        handoffProbe.audioFlowingValue = true
+        handoffProbe.outboundAudioEnergyReportedValue = true
+        handoffProbe.outboundAudioEnergyValue = 0
+        h.handoffProbe = handoffProbe
+        h.isMuted = true
+        h.transportReported = "ice"
+        h.makeController(.direct)
+        h.controller.relayDidConnect(wsMedia: nil)
+        await waitUntil(timeout: 2) { h.controller.routeState.active == .direct }
+        await pump(0.6) // > directSignalCheckSeconds (0.2 s)
+        XCTAssertEqual(h.controller.routeState.active, .direct)
+        XCTAssertEqual(handoffProbe.restartAudioCount, 0)
+        XCTAssertEqual(h.promoteStagedCalls, 0)
+        XCTAssertTrue(h.notices.isEmpty)
+        h.controller.teardown()
+    }
+
+    /// When the SDK never reports the ENERGY key there is simply no signal
+    /// evidence: the transport proof still keeps the direct path, with no
+    /// recovery of any kind.
+    func testAdoptedDirectAudioGateMissingEnergyStatKeepsDirect() async throws {
+        let h = Harness()
+        let handoffProbe = FakeDirectProbe()
+        handoffProbe.audioFlowingValue = true
+        handoffProbe.outboundAudioEnergyReportedValue = false
+        handoffProbe.outboundAudioEnergyValue = 0
+        h.handoffProbe = handoffProbe
+        h.transportReported = "ice"
+        h.makeController(.direct)
+        h.controller.relayDidConnect(wsMedia: nil)
+        await waitUntil(timeout: 2) { h.controller.routeState.active == .direct }
+        await pump(0.6) // > directSignalCheckSeconds (0.2 s)
+        XCTAssertEqual(h.controller.routeState.active, .direct,
+                       "a missing energy stat is no-evidence, not failure")
+        XCTAssertEqual(handoffProbe.restartAudioCount, 0)
+        XCTAssertEqual(h.promoteStagedCalls, 0)
+        XCTAssertTrue(h.notices.isEmpty)
+        h.controller.teardown()
+    }
+
+    /// Positive energy appearing mid-window is recorded without changing
+    /// anything either — the transport proof already kept the direct path.
+    func testAdoptedDirectAudioGateEnergyAppearsKeepsDirect() async throws {
+        let h = Harness()
+        let handoffProbe = FakeDirectProbe()
+        handoffProbe.audioFlowingValue = true
+        handoffProbe.outboundAudioEnergyReportedValue = true
+        handoffProbe.outboundAudioEnergyValue = 0
+        h.handoffProbe = handoffProbe
+        h.transportReported = "ice"
+        h.makeController(.direct)
+        h.controller.relayDidConnect(wsMedia: nil)
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 60_000_000)
+            handoffProbe.outboundAudioEnergyValue = 0.25
+        }
+        await waitUntil(timeout: 2) { h.controller.routeState.active == .direct }
+        await pump(0.6) // > directSignalCheckSeconds (0.2 s)
+        XCTAssertEqual(h.controller.routeState.active, .direct)
+        XCTAssertEqual(handoffProbe.restartAudioCount, 0)
+        XCTAssertEqual(h.promoteStagedCalls, 0)
+        XCTAssertTrue(h.notices.isEmpty)
         h.controller.teardown()
     }
 

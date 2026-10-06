@@ -29,7 +29,7 @@ configs:
 
 settings:
   base:
-    MARKETING_VERSION: "0.3.39"
+    MARKETING_VERSION: "0.3.40"
     # v0.3.5 public build 9 stays immutable. Build 12 (0.3.5) was the
     # TestFlight CloudKit/WSS/LCK repair; build 13 ships the build-12 crash,
     # iCloud, push-environment and audio fixes in BOTH editions and adds the
@@ -177,7 +177,20 @@ settings:
     # reuses the strict existing gateway path (explicit chooser, never a
     # silent line substitution or cellular fallback) and SMS only ever opens
     # the prefilled composer for in-app confirmation — never auto-sends.
-    CURRENT_PROJECT_VERSION: "46"
+    # Build 47 (0.3.40) does NOT claim to repair the build-46 direct-call
+    # silence: the field call passed every in-process transport check (RTP
+    # both ways, NetEq pull, unit started) while both parties heard nothing,
+    # and the exact OS-level cause could not be isolated without device or
+    # gateway evidence. What it repairs is the HONESTY of the health model
+    # and the evidence it collects: the gate's "proven" now says explicitly
+    # that transport counters do not prove audible sound; the SDK's
+    # encoder-fed `totalAudioEnergy`/`audioLevel` capture energy is recorded
+    # post-adoption alongside mute-window samples and a session-state
+    # snapshot (evidence only — exact zero is ambiguous, so no recovery is
+    # armed from it and the single bounded restart budget is unchanged); and
+    # the misleading `admStarts` semantics (SDK device-session begin, not
+    # audio-unit start) are documented at every log site.
+    CURRENT_PROJECT_VERSION: "47"
     SWIFT_VERSION: "5.0"
     IPHONEOS_DEPLOYMENT_TARGET: "17.0"
     # Compiler-driven SwiftUI string extraction into Localizable.xcstrings.

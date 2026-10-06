@@ -85,12 +85,20 @@ enum RTCAudioDemand {
 }
 
 /// Privacy-safe `RTCAudioSession` delegate that records the audio device
-/// module's REAL play/record lifecycle: start, stop and audio-unit start
-/// failure. This is the per-call evidence that settles whether local
-/// capture/playback actually activated (build-42 warm direct-first silence
-/// had transport proof only). Counters and redacted log lines only — never
-/// audio content. `RTCAudioSession` holds delegates WEAKLY, so the shared
-/// instance is retained statically and installed exactly once.
+/// module's device-SESSION lifecycle. Counters and redacted log lines only —
+/// never audio content. `RTCAudioSession` holds delegates WEAKLY, so the
+/// shared instance is retained statically and installed exactly once.
+///
+/// HONEST SEMANTICS (build-47 field repair): `audioSessionDidStartPlayOrRecord`
+/// fires from the SDK's `InitPlayOrRecord` — BEFORE the VoIP audio unit is
+/// initialized or started, and it fires even while `isAudioEnabled == false`
+/// (manual audio, no demand), in which case the unit NEVER runs. The build-43
+/// build-up read this callback as "the ADM is running" and certified silent
+/// calls healthy on it; the "started"/"stopped" lines below are kept for log
+/// continuity but describe session begin/end, NOT audible audio. The honest
+/// unit-permission witness is the `isAudioEnabled` transition, logged through
+/// `RTCAudioDemand`, and the gate now also records capture energy + session
+/// state snapshots (see `MediaProbeController.directAudioSessionSnapshot`).
 final class RTCAudioSessionDiagnostics: NSObject, RTCAudioSessionDelegate {
     static let shared = RTCAudioSessionDiagnostics()
     private static let installLock = NSLock()
@@ -98,8 +106,8 @@ final class RTCAudioSessionDiagnostics: NSObject, RTCAudioSessionDelegate {
     private let lock = NSLock()
     private var startCount = 0
 
-    /// Monotonic count of ADM play/record starts since install (adoption and
-    /// gate logs snapshot it so a start between the two is attributable).
+    /// Monotonic count of SDK device-session begins since install (adoption
+    /// and gate logs snapshot it so a begin between the two is attributable).
     /// Lock-protected: delegate callbacks arrive on WebRTC/system threads
     /// while readers log on the main actor.
     var admStartCount: Int {
@@ -131,6 +139,8 @@ final class RTCAudioSessionDiagnostics: NSObject, RTCAudioSessionDelegate {
         let count = startCount
         lock.unlock()
         DiagnosticsCensus.shared.increment("audio.rtcAdmStart")
+        // "started" = SDK device-session BEGIN (see class doc): the VoIP unit
+        // may still be uninitialized here, or never start at all.
         logOnMain("rtc adm play/record started (total=\(count))")
     }
 
@@ -210,6 +220,35 @@ final class MediaProbeController: NSObject {
     /// reports). Zero until audio actually flows on this peer.
     private(set) var inboundAudioPackets: UInt64 = 0
     private(set) var outboundAudioPackets: UInt64 = 0
+    /// Local CAPTURE signal evidence (build-47 field diagnostics): WebRTC
+    /// `totalAudioEnergy` is the energy of the audio fed to the encoder,
+    /// accumulated in-process from the captured signal — 0 for digital
+    /// silence, positive for non-silence — and `audioLevel` is its 0..1
+    /// companion. Selection: both keys are read from `media-source` stats
+    /// (the local capture source) and, when the SDK instead attaches them to
+    /// `outbound-rtp`, from there — a single max over both is safe because
+    /// they describe the same source. `inbound-rtp.audioLevel` is the REMOTE
+    /// level (RFC 6464) and is kept separately. The ENERGY and LEVEL keys
+    /// are tracked SEPARATELY: a report carrying `audioLevel` WITHOUT
+    /// `totalAudioEnergy` must never be read as "energy seen" (that
+    /// conflation would manufacture false zero-energy evidence). LIFETIME:
+    /// counters reset at teardown and re-baseline at adoption; an SDK-side
+    /// mid-call stat reset reads as a frozen zero delta (no-evidence),
+    /// which the evidence-only contract already treats as ambiguous.
+    /// These are EVIDENCE-ONLY diagnostics: positive energy narrows the
+    /// fault chain only to "downstream of the encoder input" and exact zero
+    /// is ambiguous (NS/gating, quiet room, DTX, part-window mute,
+    /// interruption) — never conclusive localization, never a trigger.
+    /// Privacy-safe scalars only — never audio content.
+    private(set) var outboundAudioEnergy: Double = 0
+    private(set) var outboundAudioEnergyStatSeen = false
+    private(set) var outboundAudioLevel: Double = 0
+    private(set) var outboundAudioLevelStatSeen = false
+    /// Remote signal level when the gateway includes the RFC 6464 audio-level
+    /// extension (`inbound-rtp` `audioLevel`); gateway-dependent, so it is
+    /// evidence-of-presence only, never a health gate.
+    private(set) var inboundAudioLevel: Double = 0
+    private(set) var inboundLevelStatSeen = false
     /// NetEq output samples delivered to the AUDIO OUTPUT path (WebRTC
     /// `totalSamplesReceived`, max across reports). Verified semantics for
     /// the bundled M151 binary (branch-heads/7379 `neteq_impl.cc:217` →
@@ -236,6 +275,16 @@ final class MediaProbeController: NSObject {
     private var adoptionInboundPackets: UInt64 = 0
     private var adoptionOutboundPackets: UInt64 = 0
     private var adoptionInboundSamples: UInt64 = 0
+    private var adoptionOutboundEnergy: Double = 0
+
+    /// Capture-signal energy delta since adoption (`totalAudioEnergy`,
+    /// max-baselined at adoption). Evidence-only — see the property docs.
+    var outboundAudioEnergySinceAdoption: Double {
+        max(0, outboundAudioEnergy - adoptionOutboundEnergy)
+    }
+    /// True only when the SDK actually reported the ENERGY key (never inferred
+    /// from `audioLevel`).
+    var outboundAudioEnergyReported: Bool { outboundAudioEnergyStatSeen }
 
     /// Three-state local-media proof for the adopted direct path.
     enum AudioFlowProof: Equatable {
@@ -296,6 +345,33 @@ final class MediaProbeController: NSObject {
         }
         return playoutSamples >= baselinePlayoutSamples + playoutLivenessFloorSamples
             ? .proven : .unproven
+    }
+
+    /// Privacy-safe snapshot of the shared audio session + RTC session state
+    /// (scalars and port TYPES only). Recorded at adoption, at the audio gate
+    /// and on every route change while the direct transport is active so a
+    /// future field export can tell "session inactive", "input unavailable"
+    /// or "secondary audio hint" apart from a healthy session — the evidence
+    /// the build-46 silent call lacked.
+    static func directAudioSessionSnapshot(
+        avSession: AVAudioSession = AVAudioSession.sharedInstance(),
+        rtcSession: RTCAudioSession = RTCAudioSession.sharedInstance()) -> String {
+        "direct audio session state"
+            + " active=\(rtcSession.isActive)"
+            + " inputAvailable=\(avSession.isInputAvailable)"
+            + " secondaryHint=\(avSession.secondaryAudioShouldBeSilencedHint)"
+            + " rate=\(Int(avSession.sampleRate))"
+            + " io=\(Int((avSession.ioBufferDuration * 1000).rounded()))ms"
+            + " inLatency=\(String(format: "%.1f", avSession.inputLatency * 1000))ms"
+            + " outLatency=\(String(format: "%.1f", avSession.outputLatency * 1000))ms"
+            + " out=\(AudioSessionBridge.outputPortSummary(avSession))"
+            + " vol=\(String(format: "%.2f", avSession.outputVolume))"
+    }
+
+    /// Compact, locale-stable label for an audio-energy scalar (avoiding
+    /// scientific notation drift in exported logs).
+    static func energyLabel(_ energy: Double) -> String {
+        String(format: "%.6f", energy)
     }
 
     var onConnected: (() -> Void)?
@@ -411,6 +487,7 @@ final class MediaProbeController: NSObject {
         adoptionInboundPackets = inboundAudioPackets
         adoptionOutboundPackets = outboundAudioPackets
         adoptionInboundSamples = inboundPlayoutSamples
+        adoptionOutboundEnergy = outboundAudioEnergy
         let rtc = RTCAudioSession.sharedInstance()
         if let session { rtc.audioSessionDidActivate(session) }
         if !holdsAudioDemand {
@@ -421,13 +498,20 @@ final class MediaProbeController: NSObject {
         // Privacy-safe per-call snapshot that settles capture/playback
         // activation on the next field export (port TYPE + output volume +
         // counters only; the delegate logs the actual ADM start separately).
+        // `admStarts` counts SDK device-SESSION begins (`InitPlayOrRecord`),
+        // NOT audio-unit starts: with manual audio a detached probe can bump
+        // it while `isAudioEnabled` stays false and the VoIP unit never runs
+        // (M151 `audio_device_ios.mm`); `rtcAudioEnabled`/`rtcSessionActive`
+        // below are the honest unit-permission/session witnesses.
         let avSession = AVAudioSession.sharedInstance()
         DiagnosticsStore.shared.log("audio",
             "direct media adopt out=\(AudioSessionBridge.outputPortSummary(avSession))"
             + " vol=\(String(format: "%.2f", avSession.outputVolume))"
             + " sessionFwd=\(session != nil) admStarts=\(RTCAudioSessionDiagnostics.shared.admStartCount)"
+            + " rtcAudioEnabled=\(rtc.isAudioEnabled) rtcSessionActive=\(rtc.isActive)"
             + " inPkts=\(adoptionInboundPackets) inSamples=\(adoptionInboundSamples)"
-            + " outPkts=\(adoptionOutboundPackets)")
+            + " outPkts=\(adoptionOutboundPackets) outEnergy=\(Self.energyLabel(adoptionOutboundEnergy))")
+        DiagnosticsStore.shared.log("audio", Self.directAudioSessionSnapshot())
         // Fast stats for the bounded audio gate, then settle to the normal
         // 1 s cadence so evidence arrives quickly without permanent overhead.
         statsTimerCadence(0.25)
@@ -716,6 +800,88 @@ final class MediaProbeController: NSObject {
 
     // MARK: Stats (diagnostics)
 
+    /// One flattened stats entry for the pure merge function: the stat id,
+    /// its RTC type and its values dictionary.
+    struct StatsEntry {
+        let id: String
+        let type: String
+        let values: [String: Any]
+    }
+
+    /// Merged capture-signal evidence from one stats report: the LOCAL
+    /// source energy/level (see the property docs for the exact selection
+    /// and ambiguity contracts) and the REMOTE inbound level, kept separate.
+    /// Pure and unit-testable — `pollStats` flattens the SDK report into
+    /// `StatsEntry` values and applies this.
+    struct CaptureSignalEvidence {
+        var energy: Double = 0
+        var energySeen = false
+        var level: Double = 0
+        var levelSeen = false
+        var inboundLevel: Double = 0
+        var inboundLevelSeen = false
+    }
+
+    static func captureSignalEvidence(from entries: [StatsEntry]) -> CaptureSignalEvidence {
+        var evidence = CaptureSignalEvidence()
+        var outboundMediaSourceId: String?
+        var audioMediaSourceId: String?
+        var audioMediaSourceValues: [String: Any]?
+        for entry in entries {
+            let isAudio = (entry.values["kind"] as? String) == "audio"
+                || (entry.values["mediaType"] as? String) == "audio"
+            switch entry.type {
+            case "outbound-rtp" where isAudio:
+                outboundMediaSourceId = entry.values["mediaSourceId"] as? String
+                // Older builds may attach the source energy/level to the
+                // outbound-rtp entry instead of a media-source entry; when
+                // both exist the media-source value (resolved below) merges
+                // over this via max. Keys stay separate witnesses.
+                if let v = (entry.values["totalAudioEnergy"] as? NSNumber)?.doubleValue {
+                    evidence.energy = max(evidence.energy, v)
+                    evidence.energySeen = true
+                }
+                if let v = (entry.values["audioLevel"] as? NSNumber)?.doubleValue {
+                    evidence.level = max(evidence.level, v)
+                    evidence.levelSeen = true
+                }
+            case "media-source" where isAudio:
+                // The modern schema puts totalAudioEnergy/audioLevel on the
+                // media-source entry referenced by the outbound stream's
+                // mediaSourceId; when the reference is absent (older SDK),
+                // fall back to any audio media-source entry. Selection
+                // matters so the remote inbound level can never be mistaken
+                // for local capture evidence.
+                if audioMediaSourceId == nil {
+                    audioMediaSourceId = entry.id
+                    audioMediaSourceValues = entry.values
+                }
+                if let wanted = outboundMediaSourceId, entry.id == wanted {
+                    audioMediaSourceId = entry.id
+                    audioMediaSourceValues = entry.values
+                }
+            case "inbound-rtp" where isAudio:
+                if let v = (entry.values["audioLevel"] as? NSNumber)?.doubleValue {
+                    evidence.inboundLevel = max(evidence.inboundLevel, v)
+                    evidence.inboundLevelSeen = true
+                }
+            default:
+                break
+            }
+        }
+        if let source = audioMediaSourceValues {
+            if let v = (source["totalAudioEnergy"] as? NSNumber)?.doubleValue {
+                evidence.energy = max(evidence.energy, v)
+                evidence.energySeen = true
+            }
+            if let v = (source["audioLevel"] as? NSNumber)?.doubleValue {
+                evidence.level = max(evidence.level, v)
+                evidence.levelSeen = true
+            }
+        }
+        return evidence
+    }
+
     private func pollStats() {
         guard let pc = peerConnection, connected else { return }
         pc.statistics { [weak self] report in
@@ -725,9 +891,14 @@ final class MediaProbeController: NSObject {
             var playoutSamples: UInt64 = 0
             var playoutSeen = false
             var outboundCodecId: String?
+            var entries: [StatsEntry] = []
+            entries.reserveCapacity(report.statistics.count)
+            var nominatedRtts: [Double] = []
             for statistic in report.statistics.values {
                 let isAudio = (statistic.values["kind"] as? String) == "audio"
                     || (statistic.values["mediaType"] as? String) == "audio"
+                entries.append(StatsEntry(id: statistic.id, type: statistic.type,
+                                          values: statistic.values))
                 if statistic.type == "inbound-rtp", isAudio {
                     let packets = (statistic.values["packetsReceived"] as? NSNumber)?.uint64Value ?? 0
                     inboundAudio = max(inboundAudio, packets)
@@ -747,13 +918,9 @@ final class MediaProbeController: NSObject {
                       (statistic.values["nominated"] as? NSNumber)?.boolValue == true,
                       let rttSeconds = (statistic.values["currentRoundTripTime"] as? NSNumber)?.doubleValue,
                       rttSeconds > 0 else { continue }
-                Task { @MainActor in
-                    self.statsSamples.append(rttSeconds)
-                    if self.statsSamples.count > 120 {
-                        self.statsSamples.removeFirst(self.statsSamples.count - 120)
-                    }
-                }
+                nominatedRtts.append(rttSeconds)
             }
+            let signal = Self.captureSignalEvidence(from: entries)
             // The PROVEN negotiated uplink codec: the outbound stream's
             // codecId resolves to the codec stat's mimeType — real RTP
             // evidence, unlike the SDP-advertised preference logged at
@@ -776,6 +943,24 @@ final class MediaProbeController: NSObject {
                     if playoutSeen {
                         self.inboundPlayoutSamples = max(self.inboundPlayoutSamples, playoutSamples)
                         self.playoutSamplesStatSeen = true
+                    }
+                    if signal.energySeen {
+                        self.outboundAudioEnergy = max(self.outboundAudioEnergy, signal.energy)
+                        self.outboundAudioEnergyStatSeen = true
+                    }
+                    if signal.levelSeen {
+                        self.outboundAudioLevel = max(self.outboundAudioLevel, signal.level)
+                        self.outboundAudioLevelStatSeen = true
+                    }
+                    if signal.inboundLevelSeen {
+                        self.inboundAudioLevel = max(self.inboundAudioLevel, signal.inboundLevel)
+                        self.inboundLevelStatSeen = true
+                    }
+                    for rttSeconds in nominatedRtts {
+                        self.statsSamples.append(rttSeconds)
+                    }
+                    if self.statsSamples.count > 120 {
+                        self.statsSamples.removeFirst(self.statsSamples.count - 120)
                     }
                     if self.adopted { self.statsRoundsSinceAdoption += 1 }
                 }
@@ -817,11 +1002,18 @@ final class MediaProbeController: NSObject {
         outboundAudioPackets = 0
         inboundPlayoutSamples = 0
         playoutSamplesStatSeen = false
+        outboundAudioEnergy = 0
+        outboundAudioEnergyStatSeen = false
+        outboundAudioLevel = 0
+        outboundAudioLevelStatSeen = false
+        inboundAudioLevel = 0
+        inboundLevelStatSeen = false
         statsRoundsSinceAdoption = 0
         rtpCodecLogged = false
         adoptionInboundPackets = 0
         adoptionOutboundPackets = 0
         adoptionInboundSamples = 0
+        adoptionOutboundEnergy = 0
         echoChannelOpen = false
         echoChannel = nil
         pendingEcho = nil
@@ -1028,6 +1220,13 @@ protocol DirectProbeControlling: AnyObject {
     /// default to 0 with `playoutSamplesStatSeen == false`.
     var inboundPlayoutSamples: UInt64 { get }
     var playoutSamplesStatSeen: Bool { get }
+    /// Capture-signal evidence (build-47 field diagnostics): the
+    /// post-adoption `totalAudioEnergy` delta and whether the SDK actually
+    /// reported that ENERGY key. Evidence-only — no recovery is ever armed
+    /// from it (exact zero is ambiguous: NS/gating, quiet room, DTX,
+    /// part-window mute, interruption). Fakes default to 0/false.
+    var outboundAudioEnergySinceAdoption: Double { get }
+    var outboundAudioEnergyReported: Bool { get }
     /// ONE bounded local audio-device restart for a peer whose RTP advances
     /// while the output path never pulled samples. Returns true when the
     /// restart was armed. Fakes default to a no-op `false` (gate then rolls
@@ -1077,6 +1276,9 @@ extension DirectProbeControlling {
     func audioSessionActivated(_ session: AVAudioSession) {}
     /// Test fakes default to accepting the forwarded deactivation.
     func audioSessionDeactivated(_ session: AVAudioSession) {}
+    /// Capture-signal evidence: fakes default to "energy stat never reported".
+    var outboundAudioEnergySinceAdoption: Double { 0 }
+    var outboundAudioEnergyReported: Bool { false }
     /// Fakes are treated as self-activation capable; the live probe really
     /// activates the shared AVAudioSession.
     @discardableResult

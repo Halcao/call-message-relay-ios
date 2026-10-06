@@ -202,6 +202,16 @@ final class CallRouteController {
         /// The echo data channel is NEVER counted as audio readiness.
         var directAudioReadyTimeout: TimeInterval = 2.0
         var directAudioGatePoll: TimeInterval = 0.1
+        /// Capture-signal EVIDENCE window (build-47 field diagnostics): after
+        /// the transport proof passes, the encoder-fed energy delta
+        /// (`totalAudioEnergy`) and mute-state samples are recorded over this
+        /// bounded window. COLLECTION-ONLY — exact zero is ambiguous (NS/
+        /// gating, quiet room, DTX, part-window mute, interruption), so no
+        /// restart or rollback is ever armed from it; the single bounded
+        /// restart budget stays exactly the phase-1 transport failure.
+        var directSignalCheckSeconds: TimeInterval = 4.0
+        /// Poll cadence inside the evidence window.
+        var directSignalGatePoll: TimeInterval = 0.5
         /// Bounded staged-relay attach attempts (initial + retries) so a
         /// transient failure cannot strand the call on a failing direct path.
         var stageRelayAttempts = 3
@@ -1369,70 +1379,141 @@ final class CallRouteController {
     /// detached the old WSS host, this gate runs AFTER cutover and does NOT
     /// claim a gapless handover — it is the strongest evidence the current
     /// protocol allows, with a bounded failure exposure.
+    ///
+    /// BUILD-46/47 HONESTY NOTE: the build-46 field call satisfied EVERY
+    /// check above — RTP both ways, NetEq output advancing (implying the
+    /// playout pull ran), volume 1.0 — while both parties heard nothing.
+    /// Transport counters prove the software pull runs, not that audible
+    /// sound exists, so after the transport proof this gate additionally
+    /// RECORDS capture-signal evidence (the SDK's encoder-fed
+    /// `totalAudioEnergy` delta and mute/window samples). That evidence is
+    /// COLLECTION-ONLY and LOCALIZES NOTHING CONCLUSIVELY: positive energy
+    /// only says the encoder received non-silence (the chain after it — RTP
+    /// send, gateway path, remote playback — is still unproven), and exact
+    /// zero is ambiguous (noise suppression/gating, a quiet room, DTX,
+    /// part-window mute or an interruption can all produce it), so no
+    /// restart or rollback is ever armed from it — the single bounded
+    /// restart budget stays exactly the phase-1 transport failure. The
+    /// build-46 two-way silence root cause is NOT isolated by this build;
+    /// this evidence only narrows the search on the next field export.
     private func startDirectAudioGate(probe: DirectProbeControlling, gen: UInt64) {
         audioGateTask?.cancel()
         audioGateTask = Task { [weak self] in
             guard let self else { return }
             let startedAt = Date()
+            var transportProven = false
             while !Task.isCancelled {
                 if probe.audioFlowing {
                     DiagnosticsStore.shared.log("route",
                         "direct audio gate passed afterMs=\(Int(Date().timeIntervalSince(startedAt) * 1000))"
                         + " inPkts=\(probe.inboundAudioPackets) neteqOut=\(probe.inboundPlayoutSamples)"
                         + " outPkts=\(probe.outboundAudioPackets)"
-                        + " admStarts=\(RTCAudioSessionDiagnostics.shared.admStartCount)")
-                    return
+                        + " admStarts=\(RTCAudioSessionDiagnostics.shared.admStartCount)"
+                        + " (session begin, not unit start; transport counters"
+                        + " do NOT prove audible sound — build-46 field call,"
+                        + " root cause unresolved)")
+                    transportProven = true
+                    break
                 }
                 if probe.playoutStatUnavailable {
                     // The SDK never reported the playout-output key across
                     // multiple stats rounds: accept the pre-fix packet
                     // evidence ONCE, explicitly — never the silent round-one
                     // fallback that misjudged the build-42 silent call.
+                    // Explicit transport-only verdict: the signal evidence
+                    // phase is skipped (nothing further can be concluded).
                     DiagnosticsCensus.shared.increment("audio.gatePlayoutStatMissing")
                     DiagnosticsStore.shared.log("route",
                         "direct audio gate passed on packet evidence (playout stat unavailable)"
                         + " inPkts=\(probe.inboundAudioPackets) outPkts=\(probe.outboundAudioPackets)"
                         + " admStarts=\(RTCAudioSessionDiagnostics.shared.admStartCount)")
-                    return
+                    transportProven = true
+                    break
                 }
                 if Date().timeIntervalSince(startedAt) >= self.cadence.directAudioReadyTimeout { break }
                 try? await Task.sleep(nanoseconds: UInt64(self.cadence.directAudioGatePoll * 1_000_000_000))
             }
-            guard !Task.isCancelled, gen == self.epoch, !self.tearingDown,
-                  self.activeDirect === probe, self.transport == .direct else { return }
-            DiagnosticsStore.shared.log("route",
-                "direct audio gate: no live local media withinMs="
-                + "\(Int(self.cadence.directAudioReadyTimeout * 1000))"
-                + " inPkts=\(probe.inboundAudioPackets) neteqOut=\(probe.inboundPlayoutSamples)"
-                + " outPkts=\(probe.outboundAudioPackets) playoutStatSeen=\(probe.playoutSamplesStatSeen)"
-                + " admStarts=\(RTCAudioSessionDiagnostics.shared.admStartCount)"
-                + "; one bounded audio-device restart")
-            if probe.restartAudioDevice() {
-                let restartAt = Date()
-                while !Task.isCancelled,
-                      Date().timeIntervalSince(restartAt) < self.cadence.directAudioRestartTimeout {
-                    if probe.audioFlowing {
-                        DiagnosticsStore.shared.log("route",
-                            "direct audio gate passed after audio device restart"
-                            + " neteqOut=\(probe.inboundPlayoutSamples)"
-                            + " admStarts=\(RTCAudioSessionDiagnostics.shared.admStartCount)")
-                        return
+            if !transportProven {
+                guard !Task.isCancelled, gen == self.epoch, !self.tearingDown,
+                      self.activeDirect === probe, self.transport == .direct else { return }
+                DiagnosticsStore.shared.log("route",
+                    "direct audio gate: no live local media withinMs="
+                    + "\(Int(self.cadence.directAudioReadyTimeout * 1000))"
+                    + " inPkts=\(probe.inboundAudioPackets) neteqOut=\(probe.inboundPlayoutSamples)"
+                    + " outPkts=\(probe.outboundAudioPackets) playoutStatSeen=\(probe.playoutSamplesStatSeen)"
+                    + " admStarts=\(RTCAudioSessionDiagnostics.shared.admStartCount)"
+                    + "; one bounded audio-device restart")
+                if probe.restartAudioDevice() {
+                    let restartAt = Date()
+                    while !Task.isCancelled,
+                          Date().timeIntervalSince(restartAt) < self.cadence.directAudioRestartTimeout {
+                        if probe.audioFlowing {
+                            DiagnosticsStore.shared.log("route",
+                                "direct audio gate passed after audio device restart"
+                                + " neteqOut=\(probe.inboundPlayoutSamples)"
+                                + " admStarts=\(RTCAudioSessionDiagnostics.shared.admStartCount)")
+                            transportProven = true
+                            break
+                        }
+                        try? await Task.sleep(nanoseconds: UInt64(self.cadence.directAudioGatePoll * 1_000_000_000))
                     }
-                    try? await Task.sleep(nanoseconds: UInt64(self.cadence.directAudioGatePoll * 1_000_000_000))
+                }
+                if !transportProven {
+                    guard !Task.isCancelled, gen == self.epoch, !self.tearingDown,
+                          self.activeDirect === probe, self.transport == .direct else { return }
+                    DiagnosticsStore.shared.log("route",
+                        "direct audio gate failed: no live local media after bounded restart"
+                        + " inPkts=\(probe.inboundAudioPackets) neteqOut=\(probe.inboundPlayoutSamples)"
+                        + " outPkts=\(probe.outboundAudioPackets)"
+                        + " admStarts=\(RTCAudioSessionDiagnostics.shared.admStartCount)"
+                        + "; rolling back to relay")
+                    await self.withTransaction { [weak self] in
+                        await self?.performRelayHandover(trigger: .audioNotReady)
+                    }
+                    return
                 }
             }
-            guard !Task.isCancelled, gen == self.epoch, !self.tearingDown,
-                  self.activeDirect === probe, self.transport == .direct else { return }
-            DiagnosticsStore.shared.log("route",
-                "direct audio gate failed: no live local media after bounded restart"
-                + " inPkts=\(probe.inboundAudioPackets) neteqOut=\(probe.inboundPlayoutSamples)"
-                + " outPkts=\(probe.outboundAudioPackets)"
-                + " admStarts=\(RTCAudioSessionDiagnostics.shared.admStartCount)"
-                + "; rolling back to relay")
-            await self.withTransaction { [weak self] in
-                await self?.performRelayHandover(trigger: .audioNotReady)
-            }
+            await self.recordCaptureSignalEvidence(probe: probe, gen: gen)
         }
+    }
+
+    /// COLLECTION-ONLY capture-signal evidence (build-47 field diagnostics).
+    /// After the transport proof, observe the encoder-fed `totalAudioEnergy`
+    /// delta for a bounded window alongside mute-state samples, then record
+    /// ONE evidence line plus a session-state snapshot. AMBIGUITY CONTRACT:
+    /// this evidence NEVER conclusively locates the fault chain. Positive
+    /// energy only narrows it to "downstream of the encoder input" (RTP
+    /// send, gateway media path and remote playback all remain possible);
+    /// exact zero is NOT proof of a dead path — noise suppression or
+    /// gating, a genuinely quiet room, codec DTX, a mic muted for PART of
+    /// the window, or an interruption can all produce it. So this phase
+    /// NEVER arms a restart or a rollback; the per-adoption recovery budget
+    /// stays exactly the ONE bounded phase-1 transport restart.
+    private func recordCaptureSignalEvidence(probe: DirectProbeControlling, gen: UInt64) async {
+        let windowStart = Date()
+        let mutedAtStart = self.callbacks.isMuted()
+        var mutedMidSample = false
+        while !Task.isCancelled,
+              Date().timeIntervalSince(windowStart) < self.cadence.directSignalCheckSeconds {
+            if self.callbacks.isMuted() { mutedMidSample = true }
+            try? await Task.sleep(nanoseconds: UInt64(self.cadence.directSignalGatePoll * 1_000_000_000))
+        }
+        guard !Task.isCancelled, gen == self.epoch, !self.tearingDown,
+              self.activeDirect === probe, self.transport == .direct else { return }
+        let mutedAtEnd = self.callbacks.isMuted()
+        let energy = probe.outboundAudioEnergySinceAdoption
+        let energyPart = probe.outboundAudioEnergyReported
+            ? "energy=\(MediaProbeController.energyLabel(energy))"
+            : "energyStat=missing"
+        let mutePart = "muted(start=\(mutedAtStart) mid=\(mutedMidSample) end=\(mutedAtEnd))"
+        DiagnosticsCensus.shared.increment(
+            "audio.gateSignalEvidence.\(probe.outboundAudioEnergyReported ? "reported" : "missing")")
+        DiagnosticsStore.shared.log("route",
+            "direct audio signal evidence afterMs=\(Int(Date().timeIntervalSince(windowStart) * 1000))"
+            + " \(energyPart) \(mutePart)"
+            + " outPkts=\(probe.outboundAudioPackets) neteqOut=\(probe.inboundPlayoutSamples)"
+            + " (evidence only — localizes nothing conclusively, no recovery armed)")
+        DiagnosticsStore.shared.log("audio", MediaProbeController.directAudioSessionSnapshot())
     }
 
     // MARK: Continuous quality on the active peer
