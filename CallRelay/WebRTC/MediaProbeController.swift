@@ -184,6 +184,12 @@ final class MediaProbeController: NSObject {
     private var peerConnection: RTCPeerConnection?
     private var statsTimer: Timer?
     private var echoTimer: Timer?
+    /// Build-68 incremental gathering state: every candidate gathered after
+    /// the offer was produced, in order, plus the completion signal.
+    private var gatheredCandidates: [String] = []
+    private var trickleActive = false
+    var onLocalCandidate: ((String) -> Void)?
+    var onGatheringComplete: (() -> Void)?
     private var gatheringObserver: NSKeyValueObservation?
     private var gatheringContinuation: CheckedContinuation<Void, Error>?
 
@@ -198,6 +204,11 @@ final class MediaProbeController: NSObject {
 
     private(set) var connected = false
     private(set) var adopted = false
+    /// Build-50 hot standby: a DEMOTED peer stays `adopted` (its transport is
+    /// kept) with its ADM suspended; re-promotion resumes via
+    /// `resumeAudioDeviceAfterFailedHandover` instead of re-entering the
+    /// guarded `adopt`.
+    var isAdoptedPeer: Bool { adopted }
 
     /// Local candidates gathered for THIS probe by type (host/srflx/relay/
     /// prflx). A `host` candidate can connect on a shared subnet, but a
@@ -410,6 +421,48 @@ final class MediaProbeController: NSObject {
     // MARK: Offer / answer
 
     func makeOffer(ice: ICEConfiguration) async throws -> String {
+        let pc = try await prepareOfferPeer(ice: ice)
+        try await waitForGatheringComplete(pc)
+        guard let local = pc.localDescription else { throw MediaError.missingLocalDescription }
+        return local.sdp
+    }
+
+    /// Build-68 trickle offer: the SAME peer preparation, but the SDP is
+    /// returned as soon as the local description exists — no gathering wait
+    /// at all. Candidates gathered afterwards reach the caller through
+    /// `onLocalCandidate` (and `locallyGatheredCandidates`), and the caller
+    /// posts them plus polls the gateway's own incremental candidates. Callers
+    /// MUST only use this when the gateway advertised `iceTrickle`.
+    func makeOfferTrickle(ice: ICEConfiguration) async throws -> TrickleOffer {
+        gatheredCandidates = []
+        trickleActive = true
+        let pc = try await prepareOfferPeer(ice: ice)
+        let offer = try await pc.offer(for: RTCMediaConstraints(
+            mandatoryConstraints: ["OfferToReceiveAudio": "true"], optionalConstraints: nil))
+        let munged = RTCSessionDescription(type: .offer, sdp: SDPCodecFilter.preferOpusWithPCMU(offer.sdp))
+        try await pc.setLocalDescription(munged)
+        guard let local = pc.localDescription else { throw MediaError.missingLocalDescription }
+        return TrickleOffer(sdp: local.sdp, gatheredBefore: gatheredCandidates.count)
+    }
+
+    var locallyGatheredCandidates: [String] { gatheredCandidates }
+
+    var gatheringFinished: Bool { peerConnection?.iceGatheringState == .complete }
+
+    /// Applies ONE candidate delivered by the gateway on the incremental
+    /// plane. A malformed line or a peer that is already gone is ignored: the
+    /// candidate stream is best-effort by design (a missing srflx candidate
+    /// only means that pair cannot be checked, never a failed call).
+    func addRemoteCandidate(_ sdp: String) {
+        let line = sdp.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.isEmpty, line.hasPrefix("candidate:"),
+              let pc = peerConnection, pc.remoteDescription != nil else { return }
+        let candidate = RTCIceCandidate(sdp: line, sdpMLineIndex: 0, sdpMid: "0")
+        pc.add(candidate)
+    }
+
+    /// Shared peer preparation for both offer shapes.
+    private func prepareOfferPeer(ice: ICEConfiguration) async throws -> RTCPeerConnection {
         let config = RTCConfiguration()
         config.iceServers = ice.iceServers.map {
             RTCIceServer(urlStrings: $0.urls, username: $0.username, credential: $0.credential, tlsCertPolicy: .secure)
@@ -438,12 +491,7 @@ final class MediaProbeController: NSObject {
                 echoChannel = channel
             }
         }
-        let offer = try await pc.offer(for: constraints)
-        let munged = RTCSessionDescription(type: .offer, sdp: SDPCodecFilter.preferOpusWithPCMU(offer.sdp))
-        try await pc.setLocalDescription(munged)
-        try await waitForGatheringComplete(pc)
-        guard let local = pc.localDescription else { throw MediaError.missingLocalDescription }
-        return local.sdp
+        return pc
     }
 
     func applyAnswer(_ sdp: String) async throws {
@@ -963,6 +1011,18 @@ final class MediaProbeController: NSObject {
                         self.statsSamples.removeFirst(self.statsSamples.count - 120)
                     }
                     if self.adopted { self.statsRoundsSinceAdoption += 1 }
+                    // Fresh-media arms are ADVANCE-based and tokenized
+                    // (build 50): an arm baselines at the packet counter AT
+                    // ARM TIME and fires only on a LATER advance, and only
+                    // while its token is still current — a re-arm (new
+                    // baseline) or a nil-arm can never let an old callback
+                    // fire. This is what makes recurring standby proofs and
+                    // the promoted-audio gate work on a probe that already
+                    // has inbound packets (the old first-packet-only hook
+                    // fired exactly once per process).
+                    Self.fireFreshMediaArm(&self.freshMediaArm,
+                                           currentToken: self.freshMediaToken,
+                                           inboundPackets: self.inboundAudioPackets)
                 }
             }
         }
@@ -970,6 +1030,25 @@ final class MediaProbeController: NSObject {
 
     /// The RTP-proven codec was logged for this peer (once).
     private var rtpCodecLogged = false
+
+    // MARK: Fresh-media arm (build 50: advance-based, tokenized)
+    //
+    // `setRecoveryFreshMedia` baselines at the inbound counter AT ARM TIME:
+    // only packets arriving AFTER the arm count as proof. The token fences
+    // stale arms: a re-arm replaces the arm (new baseline + new token), so
+    // an earlier arm's callback can never fire late. Extracted as a static
+    // for direct unit testing of the ingestion logic.
+    private var freshMediaArm: (baseline: UInt64, token: UInt64, callback: () -> Void)?
+    private var freshMediaToken: UInt64 = 0
+
+    static func fireFreshMediaArm(_ arm: inout (baseline: UInt64, token: UInt64, callback: () -> Void)?,
+                                  currentToken: UInt64,
+                                  inboundPackets: UInt64) {
+        guard let current = arm, inboundPackets > current.baseline else { return }
+        arm = nil
+        guard current.token == currentToken else { return }
+        current.callback()
+    }
 
 
 
@@ -991,7 +1070,15 @@ final class MediaProbeController: NSObject {
         statsSettleTask?.cancel(); statsSettleTask = nil
         statsTimer?.invalidate(); statsTimer = nil
         echoTimer?.invalidate(); echoTimer = nil
+        // Incremental gathering state belongs to THIS peer connection: a
+        // cancelled probe must never keep posting candidates or notify a
+        // completion for the replaced peer.
+        trickleActive = false
+        gatheredCandidates = []
+        onLocalCandidate = nil
+        onGatheringComplete = nil
         gatheringObserver?.invalidate(); gatheringObserver = nil
+        freshMediaArm = nil
         if let cont = gatheringContinuation {
             gatheringContinuation = nil
             cont.resume(throwing: MediaError.closed)
@@ -1091,6 +1178,8 @@ final class MediaProbeController: NSObject {
 
 // MARK: - Peer connection delegate
 
+extension MediaProbeController: TrickleProbeCapable {}
+
 extension MediaProbeController: RTCPeerConnectionDelegate {
     func peerConnection(_ peerConnection: RTCPeerConnection, didChange stateChanged: RTCSignalingState) { }
 
@@ -1140,8 +1229,10 @@ extension MediaProbeController: RTCPeerConnectionDelegate {
     }
     func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceGatheringState) {
         Task { @MainActor in
+            guard peerConnection === self.peerConnection else { return }
             guard newState == .complete else { return }
             logGatheringSummary()
+            if trickleActive { onGatheringComplete?() }
             if let cont = gatheringContinuation {
                 gatheringContinuation = nil
                 gatheringObserver?.invalidate()
@@ -1153,8 +1244,14 @@ extension MediaProbeController: RTCPeerConnectionDelegate {
     }
     func peerConnection(_ peerConnection: RTCPeerConnection, didGenerate candidate: RTCIceCandidate) {
         Task { @MainActor in
+            guard peerConnection === self.peerConnection else { return }
             let type = Self.candidateType(from: candidate.sdp)
             candidatesByType[type, default: 0] += 1
+            guard self.trickleActive else { return }
+            let line = candidate.sdp.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard line.hasPrefix("candidate:") else { return }
+            self.gatheredCandidates.append(line)
+            self.onLocalCandidate?(line)
         }
     }
     func peerConnection(_ peerConnection: RTCPeerConnection, didRemove candidates: [RTCIceCandidate]) { }
@@ -1192,6 +1289,34 @@ extension MediaProbeController: RTCDataChannelDelegate {
 // MARK: - Test seam
 
 @MainActor
+/// Build-68 incremental (trickle) offer support. Declared as a separate
+/// capability so every existing `DirectProbeControlling` fake keeps working
+/// untouched: callers that want trickle check `as? TrickleProbeCapable`, and a
+/// gateway that never advertised `capabilities.iceTrickle` never sees it used.
+/// The SDP returned by an incremental offer plus how many gathered
+/// candidates already travel inside it.
+struct TrickleOffer {
+    let sdp: String
+    let gatheredBefore: Int
+}
+
+protocol TrickleProbeCapable: AnyObject {
+    /// Called (on the main actor) for every candidate gathered AFTER the
+    /// offer was produced. The sink posts them to the gateway.
+    var onLocalCandidate: ((String) -> Void)? { get set }
+    /// Called once when ICE gathering really completes.
+    var onGatheringComplete: (() -> Void)? { get set }
+    /// Candidates gathered so far, in gathering order.
+    var locallyGatheredCandidates: [String] { get }
+    /// True once this peer's ICE gathering really completed.
+    var gatheringFinished: Bool { get }
+    /// Produces the offer WITHOUT waiting for gathering: only the local
+    /// description has to exist. Throws like `makeOffer`.
+    func makeOfferTrickle(ice: ICEConfiguration) async throws -> TrickleOffer
+    /// Applies one gateway candidate delivered incrementally by the server.
+    func addRemoteCandidate(_ sdp: String)
+}
+
 protocol DirectProbeControlling: AnyObject {
     var onState: ((MediaState) -> Void)? { get set }
     var onMediaReady: (() -> Void)? { get set }
@@ -1266,6 +1391,18 @@ protocol DirectProbeControlling: AnyObject {
     /// Output-port override (speaker), matching the other transports.
     func setSpeakerphone(_ enabled: Bool) throws
     func setMuted(_ muted: Bool)
+    /// Build-50 fresh-media hook, ADVANCE-based and tokenized: the arm
+    /// baselines at the inbound packet counter NOW and fires only when a
+    /// LATER stats advance is observed (never an old packet); re-arming
+    /// replaces the baseline, and only the newest arm's token can fire.
+    /// This powers recurring standby proofs and the promoted-audio gate on
+    /// peers that already carry inbound media. Fakes default to a no-op.
+    func setRecoveryFreshMedia(_ callback: (() -> Void)?)
+    /// Build-50 hot standby: true once this peer adopted audio (a DEMOTED
+    /// peer stays adopted with its ADM suspended; re-promotion resumes via
+    /// `resumeAudioDeviceAfterFailedHandover`, never re-enters the guarded
+    /// `adopt`).
+    var isAdoptedPeer: Bool { get }
     func cancel()
     func closeTransport()
 }
@@ -1289,6 +1426,10 @@ extension DirectProbeControlling {
     func resumeAudioDeviceAfterFailedHandover() {}
     /// Fakes do not reroute audio.
     func setSpeakerphone(_ enabled: Bool) throws {}
+    /// Build-50: fakes default to discarding the recovery fresh-media hook.
+    func setRecoveryFreshMedia(_ callback: (() -> Void)?) {}
+    /// Fakes default to never-adopted (the standby re-adopt path never runs).
+    var isAdoptedPeer: Bool { false }
 }
 
 extension DirectProbeControlling {
@@ -1310,4 +1451,15 @@ extension DirectProbeControlling {
 
 extension MediaProbeController: DirectProbeControlling {
     var latestQualitySample: (rtt: TimeInterval, at: Date)? { echoStamps.last }
+    /// Build-50: tokenized, advance-based arm (see the type-body doc). Only
+    /// inbound packets arriving AFTER this call advance fires the callback;
+    /// re-arming replaces the baseline so a stale callback can never fire.
+    func setRecoveryFreshMedia(_ callback: (() -> Void)?) {
+        freshMediaToken &+= 1
+        if let callback {
+            freshMediaArm = (baseline: inboundAudioPackets, token: freshMediaToken, callback: callback)
+        } else {
+            freshMediaArm = nil
+        }
+    }
 }

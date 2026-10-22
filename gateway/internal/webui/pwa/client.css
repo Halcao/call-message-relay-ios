@@ -1,0 +1,293 @@
+/* CallRelay standalone PWA — iOS-native conventions, adaptive appearances.
+ * Outgoing SMS bubbles use Apple's own SMS green (user-confirmed), peer
+ * bubbles adaptive gray; dynamic type and safe areas respected. */
+:root {
+  --bg: #ffffff;
+  --fg: #000000;
+  --muted: rgba(60, 60, 67, 0.6);
+  --sep: rgba(60, 60, 67, 0.12);
+  --fill: rgba(120, 120, 128, 0.12);
+  --bubble-out: #34c759;          /* iOS systemGreen (SMS) */
+  --bubble-out-fg: #ffffff;
+  --bubble-in: #e9e9eb;           /* iOS systemGray5-ish */
+  --bubble-in-fg: #000000;
+  --accent: #007aff;
+  --danger: #ff3b30;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #000000;
+    --fg: #ffffff;
+    --muted: rgba(235, 235, 245, 0.6);
+    --sep: rgba(84, 84, 88, 0.6);
+    --fill: rgba(120, 120, 128, 0.18);
+    --bubble-out: #30d158;
+    --bubble-in: #26262a;
+    --bubble-in-fg: #ffffff;
+    --accent: #0a84ff;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+  font: -apple-system-body; font-family: -apple-system, "PingFang SC", sans-serif; }
+#app { max-width: 440px; margin: 0 auto; height: 100%; display: flex; flex-direction: column; }
+.hidden { display: none !important; }
+.muted { color: var(--muted); }
+.error { color: var(--danger); }
+.primary { background: var(--accent); color: #fff; border: 0; border-radius: 10px;
+  padding: 10px 18px; font-size: 17px; }
+button { font: inherit; color: inherit; }
+.brand { display: flex; align-items: center; gap: 10px; padding: 16px; }
+.logo { width: 40px; height: 40px; border-radius: 9px; }
+.card { margin: 12px 16px; padding: 16px; background: var(--fill); border-radius: 14px; }
+.card h2 { margin: 0 0 8px; font-size: 20px; }
+.row { display: flex; gap: 8px; margin: 10px 0; }
+input, select, textarea { font: inherit; color: var(--fg); background: var(--bg);
+  border: 1px solid var(--sep); border-radius: 10px; padding: 10px 12px; width: 100%; }
+details { margin-top: 14px; }
+details input { margin: 6px 0; }
+
+#topbar { display: flex; align-items: center; gap: 10px; padding: 10px 16px;
+  border-bottom: 1px solid var(--sep); }
+#topbar select { width: auto; flex: 1; }
+#conn-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+#conn-dot.on { background: var(--bubble-out); }
+#conn-dot.busy { background: #ff9500; }
+
+.tab { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; position: relative; }
+/* #main-view must continue the flex chain (block children of a flex column
+ * collapse to content height — the reviewed zero-height regression). */
+#main-view { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+/* Conversation/compose fill the whole tab viewport with the composer
+ * pinned to the bottom (review fix: no shrinking content column). */
+#tab-messages { min-height: 0; }
+#thread-view, #compose-view { position: absolute; inset: 0; background: var(--bg); z-index: 5; }
+#compose-view { z-index: 6; }
+
+/* Dialer. The keypad is sized against BOTH width and viewport height so the
+ * whole pad plus the call button fit a 390x844 phone AND a 1280x720 desktop
+ * window without the bottom rows or the tab bar clipping the pad. */
+#dial-display { min-height: 52px; display: flex; align-items: center; justify-content: center;
+  font-size: 34px; font-variant-numeric: tabular-nums; letter-spacing: 1px; padding: 6px 16px 0; }
+#tab-dialer { justify-content: space-evenly; }
+#keypad { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px;
+  padding: 6px 48px; max-width: 360px; width: 100%; margin: 0 auto; }
+.key { width: min(100%, 10vh, 84px); aspect-ratio: 1; border-radius: 50%; border: 0; background: var(--fill);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 1px; padding-top: 4px; margin: 0 auto; }
+.key .key-num { font-size: 28px; line-height: 1; }
+.key .key-sub { font-size: 9px; letter-spacing: 2px; color: var(--muted); min-height: 10px; }
+.key:active { background: var(--sep); }
+.key.ghost { background: transparent; font-size: 26px; }
+.dial-actions { display: flex; justify-content: space-between; align-items: center;
+  padding: 2px 48px calc(10px + env(safe-area-inset-bottom)); }
+.call-btn { width: 68px; height: 68px; border-radius: 50%; border: 0;
+  background: var(--bubble-out); color: #fff; display: flex; align-items: center; justify-content: center; }
+.call-btn:disabled { background: var(--fill); color: var(--muted); }
+
+.suggestions { margin: 4px 16px; background: var(--fill); border-radius: 12px; overflow: hidden; }
+.suggestion { display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 8px 12px; background: transparent; border: 0; text-align: left; }
+.suggestion .avatar { width: 30px; height: 30px; font-size: 13px; }
+.suggestion .s-name { font-size: 16px; }
+.suggestion .s-phone { font-size: 13px; color: var(--muted); }
+.suggestion .s-sub { font-size: 12px; color: var(--muted); }
+
+/* Messages */
+#thread-list { overflow-y: auto; flex: 1; }
+.thread-row { display: flex; gap: 12px; align-items: center; width: 100%;
+  padding: 10px 16px; background: transparent; border: 0; border-bottom: 1px solid var(--sep);
+  text-align: left; }
+.thread-row .t-body { flex: 1; min-width: 0; }
+.thread-row .t-name { font-size: 16px; }
+.thread-row .t-preview { font-size: 14px; color: var(--muted); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.thread-row .t-time { font-size: 13px; color: var(--muted); }
+.thread-row .t-unread { background: var(--accent); color: #fff; border-radius: 10px;
+  font-size: 12px; padding: 1px 7px; }
+
+.avatar { width: 40px; height: 40px; border-radius: 50%; background: var(--sep);
+  color: var(--muted); display: flex; align-items: center; justify-content: center;
+  font-weight: 600; flex: none; }
+.avatar.large { width: 84px; height: 84px; font-size: 34px; }
+
+#thread-view, #compose-view { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+#thread-header, #compose-header { display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; border-bottom: 1px solid var(--sep); }
+#thread-line { width: auto; max-width: 150px; font-size: 14px; padding: 5px 8px; flex: none; }
+#thread-header button, #compose-header button { background: none; border: 0;
+  font-size: 26px; color: var(--accent); padding: 4px 8px; }
+#compose-header { justify-content: space-between; font-size: 17px; }
+#compose-header .link { font-size: 17px; }
+.thread-peer { flex: 1; display: flex; align-items: center; gap: 10px; min-width: 0; }
+.thread-peer span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#thread-messages { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 8px 12px; }
+.date-sep { text-align: center; color: var(--muted); font-size: 12px; margin: 12px 0 6px; }
+/* Outgoing stack: bubble plus a status line OUTSIDE/below it, right-aligned
+ * and muted (review fix: status must not sit as dark text inside the
+ * green bubble). */
+.msg { display: flex; margin: 2px 0; }
+.msg.out { justify-content: flex-end; }
+.msg.out .stack { display: flex; flex-direction: column; align-items: flex-end;
+  max-width: 76%; min-width: 0; }
+.msg.in .stack { max-width: 76%; min-width: 0; }
+.bubble { padding: 8px 14px; border-radius: 18px; font-size: 17px;
+  overflow-wrap: anywhere; word-break: break-word; white-space: pre-wrap;
+  display: block; max-width: 100%; }
+.msg.in .bubble { background: var(--bubble-in); color: var(--bubble-in-fg);
+  border-bottom-left-radius: 4px; }
+.msg.out .bubble { background: var(--bubble-out); color: var(--bubble-out-fg);
+  border-bottom-right-radius: 4px; }
+.msg .status { display: block; text-align: right; font-size: 12px; color: var(--muted);
+  margin-top: 2px; padding-right: 6px; }
+.msg .status.failed { color: var(--danger); }
+.msg .retry { color: var(--accent); background: none; border: 0; font-size: 12px; }
+
+#composer, .composer-row { display: flex; gap: 8px; align-items: flex-end;
+  padding: 8px 12px calc(8px + env(safe-area-inset-bottom)); border-top: 1px solid var(--sep); }
+#composer-input, #compose-body { flex: 1; border-radius: 20px; resize: none; max-height: 120px; }
+.send-btn { width: 34px; height: 34px; border-radius: 50%; border: 0;
+  background: var(--fill); color: var(--muted); font-size: 18px; flex: none; }
+.send-btn.ready { background: var(--accent); color: #fff; }
+.compose-row { display: flex; align-items: center; gap: 10px; padding: 10px 16px;
+  border-bottom: 1px solid var(--sep); }
+.compose-row label { color: var(--muted); width: 62px; flex: none; }
+#compose-body { margin: 12px 16px; width: auto; border-radius: 14px; }
+
+#tabbar { display: flex; border-top: 1px solid var(--sep);
+  padding-bottom: env(safe-area-inset-bottom); background: var(--bg); min-height: 52px; }
+.tabbtn { flex: 1; border: 0; background: none; padding: 6px 0 4px; color: var(--muted);
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  min-height: 44px; font-size: 11px; }
+.tabbtn span { font-size: 11px; }
+.tabbtn.active { color: var(--accent); }
+
+/* Call */
+#call-view { position: fixed; inset: 0; background: var(--bg); z-index: 20;
+  display: flex; align-items: center; justify-content: center; }
+.call-card { text-align: center; max-width: 420px; width: 100%; padding: 24px;
+  display: flex; flex-direction: column; align-items: center; }
+#call-peer { font-size: 28px; font-weight: 600; margin: 14px 0 4px; }
+.call-controls { display: flex; justify-content: center; gap: 26px; margin-top: 34px; }
+.cbtn { width: 66px; height: 66px; border-radius: 50%; border: 0; background: var(--fill);
+  font-size: 26px; display: flex; align-items: center; justify-content: center; }
+.cbtn small { font-size: 11px; position: absolute; margin-top: 84px; color: var(--muted); }
+.cbtn.accept { background: var(--bubble-out); color: #fff; }
+.cbtn.hangup { background: var(--danger); color: #fff; }
+.cbtn.on { background: #ffffff; color: var(--fg); }
+
+#toast { position: fixed; left: 50%; bottom: 96px; transform: translateX(-50%);
+  background: rgba(30,30,32,.92); color: #fff; padding: 10px 16px; border-radius: 12px;
+  max-width: 80%; font-size: 14px; z-index: 30; }
+@media (prefers-color-scheme: dark) { #toast { background: rgba(235,235,245,.92); color: #000; } }
+
+/* SMS management (native Edit mode parity) */
+.topbar-action { background: none; border: 0; color: var(--accent); font-size: 16px;
+  padding: 6px 6px; flex: none; }
+.sms-editbar { display: flex; justify-content: space-between; align-items: center;
+  padding: 8px 16px; border-top: 1px solid var(--sep); background: var(--bg); flex: none; }
+.sms-editbar button { background: none; border: 0; color: var(--accent); font-size: 16px;
+  padding: 8px 4px; }
+.sms-editbar button.danger { color: var(--danger); }
+.sms-editbar button:disabled { color: var(--muted); }
+.thread-row.selected { background: var(--fill); }
+.thread-check { width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--sep);
+  flex: none; display: flex; align-items: center; justify-content: center;
+  color: #fff; font-size: 13px; line-height: 1; }
+.thread-row.selected .thread-check { background: var(--accent); border-color: var(--accent); }
+.confirm-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 40;
+  display: flex; align-items: center; justify-content: center; padding: 24px; }
+.confirm-card { background: var(--bg); color: var(--fg); border-radius: 14px; padding: 18px;
+  max-width: 320px; width: 100%; }
+.confirm-card p { margin: 6px 0 16px; color: var(--muted); font-size: 14px; }
+.confirm-card .actions { display: flex; justify-content: flex-end; gap: 10px; }
+.confirm-card .actions button { background: none; border: 0; color: var(--accent);
+  font-size: 16px; padding: 8px; }
+.confirm-card .actions button.danger { color: var(--danger); }
+
+/* Contacts (principal-scoped gateway address book) */
+#tab-contacts { display: flex; flex-direction: column; overflow-y: auto; flex: 1; }
+#contacts-toolbar { display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+  border-bottom: 1px solid var(--sep); position: sticky; top: 0; background: var(--bg); z-index: 2; }
+#contacts-search { flex: 1; min-width: 0; }
+#contacts-toolbar .topbar-action { white-space: nowrap; }
+.contact-row { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+  border-bottom: 1px solid var(--sep); }
+.contact-row .c-body { flex: 1; min-width: 0; }
+.contact-row .c-name { font-size: 16px; }
+.contact-row .c-phone { font-size: 13px; margin-top: 2px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.contact-row .c-source { display: inline-block; margin-top: 3px; font-size: 11px;
+  color: var(--accent); border: 1px solid currentColor; border-radius: 6px; padding: 0 4px; }
+.contact-row .c-actions { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end;
+  max-width: 46%; }
+.contact-row .c-actions button { background: none; border: 0; color: var(--accent);
+  font-size: 13px; padding: 6px 4px; }
+.contact-row .c-actions button.danger { color: var(--danger); }
+.contacts-empty { text-align: center; }
+#contacts-preview { margin: 10px 12px; padding: 12px; border: 1px solid var(--sep);
+  border-radius: 12px; background: var(--fill); }
+.preview-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+#contacts-preview-summary { font-size: 12px; text-align: right; }
+#contacts-preview-list { margin-top: 8px; max-height: 220px; overflow-y: auto; }
+.preview-row { display: flex; flex-direction: column; padding: 4px 0; font-size: 13px; }
+.preview-row .preview-changes { font-size: 11px; }
+.preview-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 10px; }
+.preview-actions button { background: none; border: 0; color: var(--accent); font-size: 15px; padding: 6px; }
+.preview-actions button.primary { font-weight: 600; }
+#contacts-note { padding: 8px 14px 14px; font-size: 12px; }
+
+/* Build-55 rules & recordings panel (key-scoped). */
+#rules-view {
+  position: fixed;
+  inset: 0;
+  background: var(--bg);
+  overflow-y: auto;
+  z-index: 40;
+}
+#rules-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line, #ddd);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+}
+#rules-bar strong { flex: 1; }
+#rules-status { color: var(--muted, #888); font-size: 13px; }
+#rules-body { padding: 12px 16px 48px; }
+#rules-body h3 { margin: 18px 0 6px; font-size: 15px; }
+#rules-body ul { list-style: none; margin: 0; padding: 0; }
+#rules-body ul li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line, #eee);
+  font-size: 14px;
+}
+#rules-body ul li span { flex: 1; word-break: break-all; }
+#rules-body button {
+  border: 1px solid var(--line, #ccc);
+  background: none;
+  color: var(--accent);
+  border-radius: 8px;
+  padding: 4px 10px;
+  font-size: 13px;
+}
+#rules-body button.danger { color: #d33; }
+.rules-add { display: flex; gap: 8px; margin: 8px 0; }
+.rules-add input, .rules-add select { flex: 1; min-width: 0; }
+#rules-import-text { width: 100%; box-sizing: border-box; margin: 6px 0; }
+#rules-toggles label { display: block; margin: 8px 0; }
+.hint { color: var(--muted, #888); font-size: 12px; margin: 4px 0 0; }
+#rules-unsupported {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(255, 165, 0, 0.12);
+  color: #a60;
+  font-size: 13px;
+  margin-bottom: 8px;
+}

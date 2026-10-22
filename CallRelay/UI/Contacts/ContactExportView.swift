@@ -54,7 +54,7 @@ private struct ContactExportContent: View {
             }
             if service.access.canRead {
                 Section {
-                    Label("在系统「通讯录」里清理、合并或导入后，此处会自动刷新；App 不维护第二份通讯录。",
+                    Label("在系统「通讯录」中清理、合并或导入后，此处会自动刷新。",
                           systemImage: "arrow.triangle.2.circlepath")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -241,7 +241,7 @@ private struct ContactExportContent: View {
             // access changes between loading and exporting).
             let outcome = try await service.exportVCard(selectedGroups: chosen)
             shareURL = outcome.url
-            exportNote = "已生成 \(outcome.count) 条联系人的 vCard，系统通讯录未改动。可直接合并回系统通讯录。"
+            exportNote = "已生成 \(outcome.count) 条联系人文件，系统通讯录未改动。"
         } catch {
             exportNote = "导出失败：\(error.localizedDescription)"
         }

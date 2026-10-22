@@ -149,10 +149,19 @@ enum SpamPreset: String, CaseIterable, Codable {
 struct SpamPolicy {
     var rules: [SpamRule]
     var enabledPresets: Set<SpamPreset>
+    /// Master switches (骚扰拦截). Both DEFAULT TRUE here so direct policy
+    /// users/tests keep the historical rule behavior; SpamFilterStore always
+    /// passes its persisted switches, which default OFF, so the app itself
+    /// never rejects anything until the owner enables the channel.
+    var callBlockingEnabled: Bool
+    var smsBlockingEnabled: Bool
 
-    init(rules: [SpamRule] = [], enabledPresets: Set<SpamPreset> = []) {
+    init(rules: [SpamRule] = [], enabledPresets: Set<SpamPreset> = [],
+         callBlockingEnabled: Bool = true, smsBlockingEnabled: Bool = true) {
         self.rules = rules
         self.enabledPresets = enabledPresets
+        self.callBlockingEnabled = callBlockingEnabled
+        self.smsBlockingEnabled = smsBlockingEnabled
     }
 
     // MARK: SMS
@@ -172,6 +181,10 @@ struct SpamPolicy {
         for rule in enabledRules(of: .whitelistKeyword) where body.localizedCaseInsensitiveContains(rule.value) {
             return .allow(reason: rule.label.isEmpty ? "信任关键词" : rule.label)
         }
+
+        // 1b. SMS interception off: nothing below can move a message to the
+        // junk folder (explicit trust above still applies).
+        guard smsBlockingEnabled else { return .unknown }
 
         // 2. Explicit owner block rules (exact number / prefix / body).
         for rule in enabledRules(of: .senderExact) where matchesPeer(rule.value, keys: peerKeys) {
@@ -229,6 +242,17 @@ struct SpamPolicy {
         return false
     }
 
+    /// True when an ENABLED explicit owner sender block (exact number or
+    /// number prefix) matches this peer. Contact trust must NOT override
+    /// these; the owner's explicit block wins.
+    func hasSenderBlock(peer rawPeer: String) -> Bool {
+        let peer = rawPeer.trimmingCharacters(in: .whitespacesAndNewlines)
+        let keys = Set(PhoneNormalizer.canonicalKeys(peer))
+        for rule in enabledRules(of: .senderExact) where matchesPeer(rule.value, keys: keys) { return true }
+        for rule in enabledRules(of: .numberPrefix) where matchesPrefix(rule.value, peer: peer, keys: keys) { return true }
+        return false
+    }
+
     // MARK: Calls
 
     /// Evaluate an inbound call peer against owner block rules and imported
@@ -243,6 +267,9 @@ struct SpamPolicy {
         for rule in enabledRules(of: .whitelistSender) where matchesPeer(rule.value, keys: keys) {
             return .allow
         }
+        // Call interception off: trusted numbers above still resolve, but no
+        // block rule or list silences the call.
+        guard callBlockingEnabled else { return .allow }
         for rule in enabledRules(of: .senderExact) where matchesPeer(rule.value, keys: keys) {
             return .reject(reason: reason(rule, fallback: "已拦截号码"))
         }

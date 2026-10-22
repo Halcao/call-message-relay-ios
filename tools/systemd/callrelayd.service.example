@@ -1,0 +1,26 @@
+# EXAMPLE — CallRelay unified daemon service.
+# Install as /etc/systemd/system/callrelayd.service (adjust paths), then:
+#   systemctl daemon-reload && systemctl enable --now callrelayd
+#
+# The daemon binds loopback only and restarts worker units via systemctl;
+# production hosts run it as root for that control (plus /run access). To
+# harden, switch to a dedicated user with a polkit/systemd rule allowing
+# `systemctl restart callrelay-worker@*` (see README in tools/systemd/).
+[Unit]
+Description=CallRelay unified gateway (v2 API, console, media mixer, voicemail)
+Wants=network-online.target
+After=network-online.target callrelay-worker@1.service callrelay-worker@2.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+UMask=0077
+Environment=GOMAXPROCS=2
+ExecStart=/opt/callrelay/bin/callrelayd --config /etc/callrelay/unified.yaml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

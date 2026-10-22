@@ -141,25 +141,32 @@ final class WSPlaybackLatencyModelTests: XCTestCase {
         let drops: Int
         let gapSteps: Int
         let depthMaxFrames: Int
+        let finalDepthFrames: Int
+        let completionBatchMax: Int
         let meanAgeMs: Double
         let p95AgeMs: Double
         let maxAgeMs: Double
 
         var description: String {
-            String(format: "%@ arrivals=%d scheduled=%d conceal=%d trims=%d drops=%d gapSteps=%d depthMax=%d ageMs[mean=%.1f p95=%.1f max=%.1f]",
+            String(format: "%@ arrivals=%d scheduled=%d conceal=%d trims=%d drops=%d gapSteps=%d depthMax=%d finalDepth=%d batchMax=%d ageMs[mean=%.1f p95=%.1f max=%.1f]",
                    name, arrivals, scheduled, concealments, trims, drops, gapSteps, depthMaxFrames,
-                   meanAgeMs, p95AgeMs, maxAgeMs)
+                   finalDepthFrames, completionBatchMax, meanAgeMs, p95AgeMs, maxAgeMs)
         }
     }
 
     /// Runs one scenario on a fresh scheduler. `delivery(step)` returns how
-    /// many frames arrive at that 20 ms step. Ages are collected from
-    /// `warmupSteps` onward so startup is excluded.
+    /// many frames arrive at that 20 ms step; `completionQuantum(step)`
+    /// returns how often the virtual sink DELIVERS its due completions — 0
+    /// delivers every step (the 20 ms engine cycle), a larger value models a
+    /// render cycle that consumes several buffers in one pull (the driver of
+    /// the build-67 playout fix). Ages are collected from `warmupSteps`
+    /// onward so startup is excluded.
     @discardableResult
     private func run(name: String,
                      steps: Int,
                      warmupSteps: Int = 20,
                      hopDelay: TimeInterval = 0,
+                     completionQuantum: (Int) -> TimeInterval = { _ in 0 },
                      delivery: (Int) -> Int) -> ScenarioResult {
         var virtualNow: TimeInterval = 0
         let scheduler = WSPlaybackScheduler(uptimeProvider: { virtualNow })
@@ -177,11 +184,18 @@ final class WSPlaybackLatencyModelTests: XCTestCase {
         var arrivals = 0
         var depthMax = 0
         var lastArrival: TimeInterval = 0
+        var nextCompletionDelivery: TimeInterval = -1
         for step in 0..<steps {
             let t = Double(step) * 0.02
             virtualNow = t
             sink.now = t
-            sink.deliverDueCompletions(at: t)
+            let quantum = completionQuantum(step)
+            if quantum <= 0 {
+                sink.deliverDueCompletions(at: t)
+            } else if nextCompletionDelivery < 0 || t >= nextCompletionDelivery - 1e-9 {
+                sink.deliverDueCompletions(at: t)
+                nextCompletionDelivery = t + quantum
+            }
             // Completion-driven drain: the scheduler may schedule queued
             // frames here; consume their arrival stamps from the mirror.
             let playedBeforePump = sink.scheduleCount
@@ -215,11 +229,17 @@ final class WSPlaybackLatencyModelTests: XCTestCase {
         }
         sink.gapWindowEnd = lastArrival
         // Drain the tail completions so in-flight accounting settles.
+        let tailQuantum = completionQuantum(max(0, steps - 1))
         for step in steps..<(steps + 10) {
             let t = Double(step) * 0.02
             virtualNow = t
             sink.now = t
-            sink.deliverDueCompletions(at: t)
+            if tailQuantum <= 0 {
+                sink.deliverDueCompletions(at: t)
+            } else if nextCompletionDelivery < 0 || t >= nextCompletionDelivery - 1e-9 {
+                sink.deliverDueCompletions(at: t)
+                nextCompletionDelivery = t + tailQuantum
+            }
             let playedBeforePump = sink.scheduleCount
             scheduler.pump()
             var pumpTimes: [TimeInterval] = []
@@ -237,11 +257,14 @@ final class WSPlaybackLatencyModelTests: XCTestCase {
         }.sorted()
         let mean = ages.isEmpty ? 0 : ages.reduce(0, +) / Double(ages.count)
         let p95 = ages.isEmpty ? 0 : ages[min(ages.count - 1, Int(Double(ages.count) * 0.95))]
+        let finalDepth = scheduler.totalBufferedFrames
         let result = ScenarioResult(
             name: name, arrivals: arrivals, scheduled: played.count,
             concealments: scheduler.concealedFrames,
             trims: scheduler.trimmedFrames, drops: scheduler.droppedFrames,
             gapSteps: sink.snapshotGapSteps(), depthMaxFrames: depthMax,
+            finalDepthFrames: finalDepth,
+            completionBatchMax: scheduler.maxCompletionBatch,
             meanAgeMs: mean, p95AgeMs: p95, maxAgeMs: ages.last ?? 0)
         print("LATENCY-MODEL \(result.description)")
         for event in sink.gapEvents.prefix(3) {
@@ -370,5 +393,79 @@ final class WSPlaybackLatencyModelTests: XCTestCase {
         XCTAssertLessThanOrEqual(result.gapSteps, 0, "sustained 12-frame batches must stay covered")
         XCTAssertLessThanOrEqual(result.trims, 1, "sustained batches must not trim speech")
         XCTAssertLessThanOrEqual(result.depthMaxFrames, 14)
+    }
+
+    // MARK: Build-67: sink completion batching (bounded adaptive runway)
+    //
+    // The player drains its whole runway when a render cycle pulls several
+    // buffers at once; the runway is now sized from the MEASURED sink
+    // completion burst (production seam), never from an assumed engine
+    // quantum. Modeled BEFORE this build with a 100-150 ms completion
+    // quantum (the build-39 policy sized the runway by the network jitter
+    // target alone): 1200-800 of 1500 frames reached the player with
+    // 299-699 trims in 30 s — the same "~half the downlink discarded,
+    // ~26 buffer-schedules/s" shape the 0.3.55(65) field export shows
+    // (1532 arrivals, 690 trims, 28.5 s). The numbers asserted below are
+    // the POST-fix model results; the causal trigger on the handset is not
+    // claimed — the fix measures the real cadence at runtime and leaves a
+    // smooth single-buffer cadence untouched.
+
+    /// A ~150 ms completion burst: the runway must cover one cycle, the
+    /// player must stay fed, and live speech must not be trimmed away.
+    func testModelSlowCompletionBurstKeepsThePlayerFed() {
+        let result = run(name: "steady-150ms-render", steps: 1500,
+                         completionQuantum: { _ in 0.15 }) { _ in 1 }
+        XCTAssertGreaterThanOrEqual(result.scheduled, result.arrivals - 30,
+                                    "the runway must cover one measured completion burst")
+        XCTAssertLessThanOrEqual(result.trims, 30,
+                                 "batched completions must not trim live speech every cycle")
+        XCTAssertLessThanOrEqual(result.depthMaxFrames, 13,
+                                 "the latency ceiling must not grow past the adaptive maximum + 1")
+        XCTAssertLessThanOrEqual(result.gapSteps, 40, "the player must not starve every cycle")
+        XCTAssertGreaterThanOrEqual(result.completionBatchMax, 4,
+                                    "the measured completion burst must be visible in evidence")
+    }
+
+    /// A 100 ms completion burst (the field trace's input cadence, used here
+    /// only as a scenario size): the player stays fed and almost no audio is
+    /// discarded.
+    func testModelBatchedCompletionsKeepThePlayerFed() {
+        let result = run(name: "steady-100ms-render", steps: 1500,
+                         completionQuantum: { _ in 0.1 }) { _ in 1 }
+        XCTAssertGreaterThanOrEqual(result.scheduled, result.arrivals - 20,
+                       "the runway must cover the measured completion burst")
+        XCTAssertLessThanOrEqual(result.trims, 25,
+                                 "no live speech may be trimmed when the runway covers the cycle")
+        XCTAssertLessThanOrEqual(result.depthMaxFrames, 13)
+        XCTAssertLessThanOrEqual(result.gapSteps, 30)
+    }
+
+    /// A smooth single-buffer cadence keeps the adaptive floor exactly as
+    /// before: the engine-follow must add NO latency on a well-behaved
+    /// device (no gratuitous buffer growth).
+    func testModelSmoothRendererKeepsTheEstablishedLatencyFloor() {
+        let result = run(name: "steady-20ms-render", steps: 1500,
+                         completionQuantum: { _ in 0.02 }) { _ in 1 }
+        XCTAssertEqual(result.trims, 0)
+        XCTAssertLessThanOrEqual(result.depthMaxFrames, 6,
+                                 "the smooth-delivery floor must stay the adaptive target")
+        XCTAssertLessThanOrEqual(result.finalDepthFrames, 4,
+                                 "the runway must not creep above the floor for single completions")
+        XCTAssertLessThanOrEqual(result.p95AgeMs, 40, "smooth-delivery local age must stay near one frame")
+        XCTAssertEqual(result.completionBatchMax, 1, "single completions must not raise the runway")
+    }
+
+    /// The measured burst decays: a large completion burst for a few
+    /// seconds, then a consumer that settles back to single completions. The
+    /// runway must return to the adaptive floor and no speech may be trimmed
+    /// in the transition.
+    func testModelRenderBatchDecayReturnsToTheAdaptiveFloor() {
+        let result = run(name: "render-batch-decay", steps: 1500,
+                         completionQuantum: { step in step < 200 ? 0.1 : 0.02 }) { _ in 1 }
+        XCTAssertGreaterThanOrEqual(result.scheduled, result.arrivals - 20,
+                                    "the settling consumer must still feed every frame")
+        XCTAssertLessThanOrEqual(result.trims, 25)
+        XCTAssertLessThanOrEqual(result.finalDepthFrames, 6,
+                                 "the runway must decay back toward the floor, not hold latency")
     }
 }

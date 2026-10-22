@@ -1,0 +1,292 @@
+package sms
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"callrelay/gateway/internal/db"
+	"callrelay/gateway/internal/id"
+	"callrelay/gateway/internal/modem"
+)
+
+type Modem interface {
+	SendSMS(context.Context, string, modem.SMSPayload) (modem.SMSID, error)
+}
+
+type InboxModem interface {
+	ListSMS(context.Context, modem.SMSCursor) ([]modem.RawSMS, modem.SMSCursor, error)
+	DeleteSMS(context.Context, string) error
+}
+
+// TP-MTI message-type bits (GSM 03.40 §9.2.3) of the first TPDU octet, after
+// the SMSC-address length octet. The modem storage lists EVERY stored PDU:
+// inbound SMS-DELIVER (0x00), copies of OUR outgoing SMS-SUBMIT (0x01, e.g.
+// produced by AT+CMGW store-only dry-run sends or the modem's own sent
+// storage), and SMS-STATUS-REPORT delivery receipts (0x02). Only 0x00 is an
+// actual incoming message; the others must never become inbound records.
+const (
+	tpMTIDeliver      = 0x00
+	tpMTISubmit       = 0x01
+	tpMTIStatusReport = 0x02
+)
+
+// tpduMessageType extracts the TP-MTI direction bits of the first TPDU octet.
+// ok is false when the PDU is too short to carry an SMSC length + first octet.
+func tpduMessageType(rawPDU []byte) (mti byte, ok bool) {
+	if len(rawPDU) < 2 {
+		return 0, false
+	}
+	offset := 1 + int(rawPDU[0])
+	if offset >= len(rawPDU) {
+		return 0, false
+	}
+	return rawPDU[offset] & 0x03, true
+}
+
+// dryRunReporter is implemented by modems that can report whether SMS
+// submissions are store-only (AT+CMGW) instead of real sends (AT+CMGS).
+type dryRunReporter interface {
+	DryRun() bool
+}
+
+type Engine struct {
+	Database  *db.DB
+	Modem     Modem
+	Assembler *MultipartAssembler
+	Now       func() time.Time
+}
+
+func NewEngine(database *db.DB, modemClient Modem) *Engine {
+	return &Engine{Database: database, Modem: modemClient, Assembler: NewMultipartAssembler(), Now: time.Now}
+}
+
+// Ingest decodes one modem PDU. A nil result means a multipart message is
+// still waiting for another segment or the PDU was already seen.
+func (e *Engine) Ingest(ctx context.Context, raw modem.RawSMS) (*db.Message, error) {
+	pduHash := sha256.Sum256(raw.RawPDU)
+	hash := hex.EncodeToString(pduHash[:])
+	exists, err := e.Database.SMSSegmentExistsByPDUHash(ctx, hash)
+	if err != nil {
+		return nil, err
+	}
+	if exists {
+		return nil, nil
+	}
+	mti, mtiOK := tpduMessageType(raw.RawPDU)
+	if !mtiOK {
+		return nil, fmt.Errorf("%w: truncated PDU header", ErrInvalidPDU)
+	}
+	switch mti {
+	case tpMTISubmit, tpMTIStatusReport:
+		// Stored copy of one of OUR outgoing submissions (SMS dry-run writes
+		// them into MT via AT+CMGW; some firmware also mirrors sent SMS into
+		// the combined storage) or a delivery receipt. Neither is an incoming
+		// message: returning (nil, nil) keeps Run's contract — the modem
+		// storage entry is deleted and nothing is recorded or pushed.
+		return nil, nil
+	}
+	decoded, err := DecodePDU(hex.EncodeToString(raw.RawPDU))
+	if err != nil {
+		return nil, err
+	}
+	receivedAt := e.Now()
+	segmentID, err := id.New("seg_", 16)
+	if err != nil {
+		return nil, err
+	}
+	if err := e.Database.InsertSMSSegment(ctx, db.SMSSegment{
+		ID: segmentID, Sender: decoded.Sender, ConcatRef: decoded.ConcatRef, PartNo: decoded.PartNo,
+		TotalParts: decoded.TotalParts, RawPDU: raw.RawPDU, PDUHash: hash, ReceivedAt: receivedAt,
+	}); err != nil {
+		return nil, err
+	}
+	body := decoded.Body
+	encoding := decoded.Encoding
+	var completed *LogicalMessage
+	if decoded.TotalParts > 1 {
+		pending, listErr := e.Database.ListPendingSMSSegments(ctx, decoded.Sender, decoded.ConcatRef, decoded.TotalParts)
+		if listErr != nil {
+			return nil, listErr
+		}
+		for _, stored := range pending {
+			storedDecoded, decodeErr := DecodePDU(hex.EncodeToString(stored.RawPDU))
+			if decodeErr != nil {
+				continue
+			}
+			completed, err = e.Assembler.Add(Segment{Sender: storedDecoded.Sender, ConcatRef: storedDecoded.ConcatRef, PartNo: storedDecoded.PartNo, TotalParts: storedDecoded.TotalParts, Body: storedDecoded.Body, Encoding: storedDecoded.Encoding, RawPDU: stored.RawPDU, ReceivedAt: stored.ReceivedAt})
+			if err != nil {
+				return nil, err
+			}
+			if completed != nil {
+				break
+			}
+		}
+		if completed == nil {
+			return nil, nil
+		}
+		body = completed.Body
+		encoding = completed.Encoding
+	}
+	messageID, err := id.New("msg_", 16)
+	if err != nil {
+		return nil, err
+	}
+	threadKey := decoded.Sender
+	message := db.Message{ID: messageID, ThreadKey: threadKey, Direction: "inbound", Peer: decoded.Sender, Body: body, Encoding: string(encoding), Status: "sent", CreatedAt: receivedAt, ModemStorage: raw.ModemStorage, ModemIndex: &raw.ModemIndex, PDUHash: hash}
+	sequence, err := e.Database.InsertMessage(ctx, message)
+	if err != nil {
+		return nil, err
+	}
+	if completed == nil {
+		if err := e.Database.LinkSMSSegment(ctx, hash, messageID); err != nil {
+			return nil, err
+		}
+	} else {
+		for _, segment := range completed.Segments {
+			segmentHash := sha256.Sum256(segment.RawPDU)
+			if err := e.Database.LinkSMSSegment(ctx, hex.EncodeToString(segmentHash[:]), messageID); err != nil {
+				return nil, err
+			}
+		}
+	}
+	message.SyncSeq = sequence
+	return &message, nil
+}
+
+func (e *Engine) Send(ctx context.Context, to, body string) (*db.Message, error) {
+	if e.Modem == nil {
+		return nil, fmt.Errorf("SMS modem is unavailable")
+	}
+	concatRef := uint8(e.Now().UnixNano())
+	segments, err := EncodeSubmitSegments(to, body, concatRef)
+	if err != nil {
+		return nil, err
+	}
+	messageID, err := id.New("msg_", 16)
+	if err != nil {
+		return nil, err
+	}
+	now := e.Now()
+	message := db.Message{ID: messageID, ThreadKey: to, Direction: "outbound", Peer: to, Body: body, Encoding: string(segments[0].Encoding), Status: "queued", CreatedAt: now}
+	sequence, err := e.Database.InsertMessage(ctx, message)
+	if err != nil {
+		return nil, err
+	}
+	message.SyncSeq = sequence
+
+	for _, segment := range segments {
+		_, sendErr := e.Modem.SendSMS(ctx, to, modem.SMSPayload{Body: segment.Body, Encoding: string(segment.Encoding), PDU: segment.PDU, PartNo: segment.PartNo, Total: segment.Total})
+		if sendErr != nil {
+			if errors.Is(sendErr, modem.ErrSMSSubmissionUnknown) {
+				message.Status = "submitted"
+				if updatedSeq, updateErr := e.Database.UpdateMessageStatus(ctx, message.ID, message.Status); updateErr != nil {
+					return &message, fmt.Errorf("record uncertain SMS submission: %w", updateErr)
+				} else {
+					message.SyncSeq = updatedSeq
+				}
+				slog.Warn("SMS submission result unknown after modem accepted PDU", "message_id", message.ID, "part", segment.PartNo, "total_parts", segment.Total, "error", sendErr)
+				return &message, nil
+			}
+			message.Status = "failed"
+			if updatedSeq, updateErr := e.Database.UpdateMessageStatus(ctx, message.ID, message.Status); updateErr != nil {
+				return &message, fmt.Errorf("record failed SMS submission: %w", updateErr)
+			} else {
+				message.SyncSeq = updatedSeq
+			}
+			slog.Warn("SMS PDU submission failed", "message_id", message.ID, "part", segment.PartNo, "total_parts", segment.Total, "error", sendErr)
+			return &message, fmt.Errorf("SMS submit failed: %w", sendErr)
+		}
+		message.Status = "submitted"
+		if updatedSeq, updateErr := e.Database.UpdateMessageStatus(ctx, message.ID, message.Status); updateErr != nil {
+			return &message, fmt.Errorf("record SMS submission: %w", updateErr)
+		} else {
+			message.SyncSeq = updatedSeq
+		}
+	}
+	// Truthful terminal status: a store-only (dry-run) submission never
+	// reached the network, so it must never be reported as "sent".
+	if reporter, ok := e.Modem.(dryRunReporter); ok && reporter.DryRun() {
+		message.Status = "submitted"
+		if updatedSeq, updateErr := e.Database.UpdateMessageStatus(ctx, message.ID, message.Status); updateErr != nil {
+			return &message, fmt.Errorf("record dry-run SMS status: %w", updateErr)
+		} else {
+			message.SyncSeq = updatedSeq
+		}
+		return &message, nil
+	}
+	message.Status = "sent"
+	if updatedSeq, updateErr := e.Database.UpdateMessageStatus(ctx, message.ID, message.Status); updateErr != nil {
+		return &message, fmt.Errorf("record SMS sent status: %w", updateErr)
+	} else {
+		message.SyncSeq = updatedSeq
+	}
+	return &message, nil
+}
+
+// Run polls the modem inbox, consumes complete messages, and deletes only
+// successfully decoded/inserted storage entries. A crash before deletion is
+// safe because PDU hashes make the next poll idempotent.
+func (e *Engine) Run(ctx context.Context, interval time.Duration, onMessage func(*db.Message)) error {
+	inbox, ok := e.Modem.(InboxModem)
+	if !ok {
+		return fmt.Errorf("modem does not support SMS inbox polling")
+	}
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	var cursor modem.SMSCursor
+	poll := func() error {
+		e.Assembler.Prune(e.Now())
+		_ = e.Database.PrunePendingSMSSegments(ctx, e.Now().Add(-MultipartRetention))
+		// Bound every modem exchange so an unresponsive AT response can
+		// never wedge the shared serial port (and with it call setup).
+		// Observed 2026-09-06: ListSMS's AT+CPMS="MT" read blocked
+		// forever on the engine's permanent context — the i/o lock never
+		// released and every dial froze at "waiting for answered".
+		pollCtx, pollCancel := context.WithTimeout(ctx, 15*time.Second)
+		defer pollCancel()
+		messages, next, err := inbox.ListSMS(pollCtx, cursor)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// transient timeout/AT error: skip this round, keep cursor
+			return err
+		}
+		for _, raw := range messages {
+			delCtx, delCancel := context.WithTimeout(ctx, 10*time.Second)
+			message, ingestErr := e.Ingest(delCtx, raw)
+			if ingestErr != nil {
+				delCancel()
+				continue
+			}
+			if message != nil && onMessage != nil {
+				onMessage(message)
+			}
+			if raw.ModemIndex > 0 {
+				_ = inbox.DeleteSMS(delCtx, fmt.Sprint(raw.ModemIndex))
+			}
+			delCancel()
+		}
+		cursor = next
+		return nil
+	}
+	if err := poll(); err != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			_ = poll()
+		}
+	}
+}

@@ -1,0 +1,25 @@
+# Optional Bark notification bridge — gateway configuration example.
+#
+# Copy this block into /etc/callrelay/unified.yaml (services/callrelayd).
+# Disabled by default: with bark.enabled false every Bark endpoint returns
+# CB-BARK-DISABLED and no notification is ever sent.
+#
+# Security policy enforced by callrelayd:
+#   * public destinations must use https;
+#   * http is accepted only with allow_private AND only when the resolved
+#     destination is actually private/loopback/link-local (checked at dial);
+#   * device keys travel in the POST body, are never returned/logged, and
+#     redirects are refused (no key forwarding);
+#   * delivery requires the documented Bark {"code":200} response.
+bark:
+  # Master switch for the optional self-hosted bridge.
+  enabled: false
+  # Deliberate LAN self-host permission. The device must ALSO opt in per
+  # device through PUT /api/v2/devices/{id}/bark; both switches are required
+  # before a private address (or any http address) is accepted.
+  allow_private: false
+  # One Bark HTTP request may take at most this long (default 10s).
+  timeout: 10s
+  # A still-ringing call older than this is suppressed as stale before an
+  # incoming notification is sent (default 60s).
+  max_call_age: 60s

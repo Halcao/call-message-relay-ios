@@ -18,6 +18,9 @@ final class AppModel: ObservableObject {
     @Published var audioStatus: String?
     /// Live Auto/Direct/Relay routing snapshot for the active call.
     @Published var routeState: CallRouteState?
+    /// Build-50 hot-standby snapshot for the audio-routes settings (nil when
+    /// the gateway offers no standby or no call is live).
+    @Published var hotStandbyState: HotStandbyController.HotStandbyState?
     /// Per-path measured status for the connection UI (idle preflight + live
     /// call samples, each keeping its own timestamp). Never crosses paths.
     @Published private(set) var routeDiagnostics = RouteDiagnostics()
@@ -29,6 +32,20 @@ final class AppModel: ObservableObject {
     @Published var routeNoticeOffersAuto = false
     /// Persisted default route mode for the bound gateway (Settings picker).
     @Published var preferredRouteMode: MediaRouteMode = .auto
+    // MARK: Multi-path direct transport (build 61)
+    /// Persisted direct-transport preference for the bound gateway
+    /// (自动 / QUIC 直连 / 现有直连); only meaningful when the gateway
+    /// advertises QUIC (`directTransportChoicesAvailable`).
+    @Published var preferredDirectTransport: DirectTransportChoice = .auto
+    /// True once the gateway's ICE capability advertises the QUIC DATAGRAM
+    /// transport (gates the 直连方式 chooser and the 当前路径 stats).
+    @Published var directTransportChoicesAvailable = false
+    /// Freshest per-candidate measured stats, published by the coordinator's
+    /// route-selection glue; the route UI renders 未测量 for missing entries.
+    @Published var routeCandidateStats: [RouteCandidateKind: RouteCandidateSample] = [:]
+    /// The candidate the route-selection policy currently carries; nil until
+    /// the first decision (UI renders gracefully without it).
+    @Published var chosenRouteKind: RouteCandidateKind?
     @Published var recents: [CallRecord] = []
     @Published var gatewayName: String = ""
     @Published var pairingError: String?
@@ -71,6 +88,12 @@ final class AppModel: ObservableObject {
     /// One-shot token: when set, the Messages list pushes VoicemailView
     /// (Shortcuts "open voicemail" handoff). Consumed by the view.
     @Published var pendingVoicemailToken: UUID?
+    /// One-shot conversation key from a tapped SMS alert notification: when
+    /// set, the Messages tab opens that conversation once the thread list is
+    /// loaded. The FULL `threadKey` from the APNs payload is used (never the
+    /// truncated preview); routing only happens after the gatewayId is
+    /// confirmed to match this pairing.
+    @Published var pendingSMSConversationKey: String?
     /// Unified gateway lines authorized for this device (v2 only). Every
     /// assignment republishes the Shortcuts-facing line catalog (principal-
     /// scoped) and persists a MINIMAL snapshot (id + display name only, no
@@ -127,6 +150,20 @@ final class AppModel: ObservableObject {
     /// this to stop playback of the removed clip; nil until the first delete.
     @Published private(set) var lastDeletedVoicemailId: String?
 
+    // MARK: Manual call recording
+    /// Key-scoped recordings known to this device; refreshed on
+    /// `recording.*` events and when the recordings UI appears.
+    @Published var recordings: [RecordingRecord] = []
+    /// User-facing notice for the last failed recording action; nil otherwise.
+    @Published var recordingNotice: String?
+    /// True while a start/stop tap awaits the gateway's confirmation. The UI
+    /// shows a pending state; the recording indicator itself only ever follows
+    /// server-confirmed state.
+    @Published private(set) var recordingRequestPending = false
+    /// Id of the most recently deleted recording (local or remote event); the
+    /// recordings UI observes this to stop playback of the removed clip.
+    @Published private(set) var lastDeletedRecordingId: String?
+
     enum AppTab: String { case keypad, contacts, messages, recents, settings }
 
     /// Prefill request for the Messages compose sheet.
@@ -174,7 +211,13 @@ final class AppModel: ObservableObject {
     private let bindingStore: BindingStore
     private var pairingService: PairingService?
 
-    private var api: GatewayAPI?
+    /// Internal (not private) so the build-55 feature extensions in other
+    /// files can issue key-scoped requests without widening it to views.
+    var api: GatewayAPI?
+    /// Native gateway administrator console (independent session, own
+    /// Keychain item and origin). One instance per process; the screens bind
+    /// to it through the environment.
+    let adminCenter = AdminCenter()
     private var eventStream: EventStream?
     /// Foreground direct-path preflight (created per gateway binding).
     private var routePreflight: RoutePreflightController?
@@ -191,6 +234,12 @@ final class AppModel: ObservableObject {
 
     let spamFilter: SpamFilterStore
     let contacts: ContactsService
+    /// Key-scoped gateway harassment policy (build 55). `support == .unavailable`
+    /// means the paired gateway predates the feature: the LOCAL rules keep
+    /// working and the UI says so instead of pretending.
+    let harassment = HarassmentStore()
+    /// Recording configuration/auto preference reported by the gateway.
+    let recordingConfig = RecordingConfigStore()
     private(set) var cloudSync: CloudSyncEngine?
     private var foregroundObserver: NSObjectProtocol?
     private var backgroundObserver: NSObjectProtocol?
@@ -214,7 +263,9 @@ final class AppModel: ObservableObject {
     /// fresh its `createdAt` looks or whether it carries a timestamp at all.
     private var terminalCallIds: Set<String> = []
     private var lastSyncSeq: Int64 = 0
-    private var sessionGeneration: UInt64 = 0
+    /// Internal so feature extensions can fence async results to the current
+    /// pairing session (a re-pair must never surface an old session's data).
+    private(set) var sessionGeneration: UInt64 = 0
     /// True once this session auto-selected a first-pairing default, so a
     /// later refresh can never override a user choice or re-pick silently.
     private var didAutoSelectDefault = false
@@ -257,12 +308,17 @@ final class AppModel: ObservableObject {
     var eventAuthRetryDelay: TimeInterval = 5
     /// Current gateway scope id for history isolation in optional sync.
     private var currentGatewayScope: String?
+    /// Durable scoped history cache of the active live session. Teardown
+    /// FLUSHES it (pending writes settle) but NEVER purges it: normal
+    /// disconnect/reconnect/re-pair rehydrates the same scope. Purge happens
+    /// only on unpair/binding removal/known revocation/mismatch.
+    private var liveHistoryStore: GatewayHistoryStore?
     /// Per-conversation outgoing line preference, scoped to the paired
     /// gateway (nil in demo/unpaired state).
     private var threadLineStore: ThreadLinePreferenceStore?
 
-    private let defaults: UserDefaults
-    private enum DefaultsKey {
+    let defaults: UserDefaults
+    enum DefaultsKey {
         static let demo = "callrelay.demoMode"
         static let contactWhitelist = "callrelay.contactWhitelist"
     }
@@ -436,6 +492,10 @@ final class AppModel: ObservableObject {
         }
         if LaunchArguments.enablesDemoSpamPresets {
             for preset in SpamPreset.allCases { resolvedFilter.enable(preset: preset) }
+            // Build-55 master switches default OFF; the fixture flag means
+            // "show spam filtering on", so the visual fixtures keep working.
+            resolvedFilter.setSMSBlocking(true, notifyGateway: false)
+            resolvedFilter.setCallBlocking(true, notifyGateway: false)
         }
         observeLifecycle()
 #if PWA_BRIDGE
@@ -450,6 +510,17 @@ final class AppModel: ObservableObject {
                 self?.inbox?.reevaluateAll()
                 self?.syncRulesIfEnabled()
             }
+            .store(in: &cancellables)
+
+        // Build-55 sub-stores are held by AppModel; forward their changes so
+        // any view observing the model also re-renders on policy updates.
+        harassment.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+        recordingConfig.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
 
         // PushKit must be live before the app finishes launching: a VoIP push
@@ -506,6 +577,7 @@ final class AppModel: ObservableObject {
             Task { @MainActor in
                 self?.routePreflight?.appDidEnterBackground()
                 self?.relayIdleProbe?.appDidEnterBackground()
+                self?.inbox?.actionSyncEnteredBackground()
             }
         }
     }
@@ -521,6 +593,7 @@ final class AppModel: ObservableObject {
             return
         }
         // Immediate reconnect attempt + snapshot reconciliation.
+        inbox?.wakeActionSync()
         eventStream?.kick()
         lineRunner?.kick()
         recentsRunner?.kick()
@@ -565,8 +638,31 @@ final class AppModel: ObservableObject {
     func bootstrap() {
         // Screenshot fixtures for the batched visual review: deterministic,
         // offline, launch-argument gated (never reachable in normal use).
+        #if DEBUG
+        if LaunchArguments.isManagementPreview || LaunchArguments.isManagementLoginPreview {
+            // Paired-mode surfaces PLUS the synthetic administrator console:
+            // the entry appears exactly as a paired user sees it. The console
+            // is bound to an in-memory synthetic origin only — no Keychain
+            // write, no network, no credentials.
+            enablePairedFixture()
+            api = DemoGatewayAPI()
+            if case .success(let previewOrigin) = GatewayOrigin.validate(
+                "https://preview.invalid", apiVersion: "v2") {
+                adminCenter.bind(origin: previewOrigin, gatewayId: "preview-gateway")
+                // Screenshot fixture: the synthetic gateway is the build-68
+                // shape, so its capability is known without a probe.
+                adminCenter.setAdminAvailabilityForTesting(.available)
+            }
+            return
+        }
+        #endif
+        if LaunchArguments.isHarassmentGatewayPreview {
+            enableHarassmentGatewayPreview()
+            return
+        }
         if LaunchArguments.isRoutePreview || LaunchArguments.isRouteSettingsPreview
-            || LaunchArguments.isSignalBarsPreview {
+            || LaunchArguments.isSignalBarsPreview || LaunchArguments.isRecordingPreview
+            || LaunchArguments.isRecordingListPreview || LaunchArguments.isConferenceRecordingPreview {
             enableVisualReviewFixture()
             return
         }
@@ -699,6 +795,11 @@ final class AppModel: ObservableObject {
     /// cleared so they can never look actionable, and the owner gets an
     /// explicit reconnect/re-pair prompt. Transient failures never call this.
     func markAuthLost(_ message: String) {
+        // Known credential revocation invalidates this scope's durable
+        // history (root addendum): purge before fencing in-memory state.
+        if let binding = bindingStore.current() {
+            purgeScopedHistory(binding: binding, tokenStore: tokenStore)
+        }
         authRecoveryRequired = true
         authRecoveryMessage = message
         authorizedLines = []
@@ -708,16 +809,36 @@ final class AppModel: ObservableObject {
         numberEditLine = nil
         lineNumberNotice = nil
         voicemails = []
+        recordings = []
+        recordingNotice = nil
+        recordingRequestPending = false
+        lastDeletedRecordingId = nil
+        harassment.reset()
+        recordingConfig.reset()
+        // The administrator console is scoped to the pairing being removed:
+        // its session is dropped with it (the device's own admin session
+        // Keychain item is cleared only through the management screen or an
+        // explicit logout, never silently by an unrelated unpair).
+        adminCenter.bind(origin: nil, gatewayId: nil)
         lineListState = .unavailable(message)
         (driver as? LiveCallDriver)?.setDefaultLineId(nil)
         if case .online = linePhase { linePhase = .offline(message) }
     }
 
     func unpair() {
+        // Unpair REMOVES the binding: purge this scope's durable history
+        // FIRST (before the token/binding are cleared) so no snapshot
+        // outlives the pairing it belongs to. A late write is fenced by the
+        // store's purge flag, so teardown/invalidate cannot resurrect it.
+        if let binding = bindingStore.current() {
+            purgeScopedHistory(binding: binding, tokenStore: tokenStore)
+        }
         teardownLive()
         PairingService(identities: identities, tokens: tokenStore, bindings: bindingStore).unpair()
         // Shortcuts line snapshot belongs to the pairing being removed.
         clearIntentLineSnapshot()
+        liveHistoryStore = nil
+        pendingSMSConversationKey = nil
         linePhase = .unpaired
         recents = []
         activeCall = nil
@@ -728,6 +849,12 @@ final class AppModel: ObservableObject {
         outgoingPick = nil
         selectedLineFilter = nil
         voicemails = []
+        recordings = []
+        recordingNotice = nil
+        recordingRequestPending = false
+        lastDeletedRecordingId = nil
+        harassment.reset()
+        recordingConfig.reset()
         repairPresented = false
         pairingError = nil
     }
@@ -744,6 +871,7 @@ final class AppModel: ObservableObject {
 
     func enterDemo(persist: Bool = true) {
         teardownLive()
+        adminCenter.bind(origin: nil, gatewayId: nil)
         if persist { defaults.set(true, forKey: DefaultsKey.demo) }
         isDemo = true
         let gateway = DemoGatewayAPI()
@@ -847,7 +975,100 @@ final class AppModel: ObservableObject {
                 rttSeconds: 0.028, notice: nil, offersAutoFallback: false)
         } else if LaunchArguments.isRouteSettingsPreview {
             preferredRouteMode = .auto
+        } else if LaunchArguments.isRecordingListPreview {
+            recordings = Self.syntheticRecordingPreview()
+        } else if LaunchArguments.isRecordingPreview {
+            demoSimulateIncoming()
+            demoAnswer()
+            // The demo driver publishes the answered call; inject the
+            // server-confirmed recording state and the synthetic recordings
+            // list after that publication so the fixture renders both the
+            // in-call indicator and the RecordingsView list.
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 600_000_000)
+                if var state = activeCall {
+                    state.recordingId = "rec_preview_active"
+                    state.recordingState = "recording"
+                    state.recordingDurationMs = 75_000
+                    activeCall = state
+                }
+                recordings = Self.syntheticRecordingPreview()
+            }
+        } else if LaunchArguments.isConferenceRecordingPreview {
+            demoSimulateIncoming()
+            demoAnswer()
+            // Deterministic hosted-conference fixture: the server-confirmed
+            // conference recording state plus two fictional members. Offline;
+            // no gateway, credentials or audio.
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 600_000_000)
+                let now = Date().unixMilliseconds
+                let legs = [
+                    CallRecord(
+                        id: "demo:conf_zhangsan", gatewayID: DemoConstants.gatewayId, lineID: "line1",
+                        direction: .outbound, peer: "张三", state: .active,
+                        startedAt: now - 95_000, connectedAt: now - 90_000, endedAt: nil, endReason: nil,
+                        recordingId: nil, recordingState: nil, recordingDurationMs: nil
+                    ),
+                    CallRecord(
+                        id: "demo:conf_lisi", gatewayID: DemoConstants.gatewayId, lineID: "line2",
+                        direction: .inbound, peer: "李四", state: .active,
+                        startedAt: now - 60_000, connectedAt: now - 55_000, endedAt: nil, endReason: nil,
+                        recordingId: nil, recordingState: nil, recordingDurationMs: nil
+                    ),
+                ]
+                CallGroupStore.shared.update(
+                    held: [],
+                    conference: ConferenceRecord(
+                        id: "demo:conf_preview", hostDeviceId: "demo-device", state: "active",
+                        createdAt: now - 100_000, graceDeadline: nil, legs: legs,
+                        recordingId: "rec_conf_preview", recordingState: "recording",
+                        recordingDurationMs: 75_000
+                    ),
+                    heldLegIDs: []
+                )
+                if var state = activeCall {
+                    state.recordingId = "rec_conf_preview"
+                    state.recordingState = "recording"
+                    state.recordingDurationMs = 75_000
+                    activeCall = state
+                }
+                recordings = Self.syntheticRecordingPreview()
+            }
         }
+    }
+
+    /// Screenshot-fixture data only: fictional 张三/李四 recordings. Never
+    /// reachable without the launch argument and never touches a gateway.
+    nonisolated static func syntheticRecordingPreview() -> [RecordingRecord] {
+        let now = Date().unixMilliseconds
+        return [
+            RecordingRecord(
+                id: "rec_preview_1", callId: "demo:zhangsan", lineId: "line1",
+                lineName: "主卡", direction: "outbound", peer: "张三",
+                state: "ready", durationMs: 65_000, sizeBytes: 1_040_044,
+                createdAt: now - 3_600_000, keyId: "demo-key"
+            ),
+            RecordingRecord(
+                id: "rec_preview_2", callId: "demo:lisi", lineId: "line1",
+                lineName: "主卡", direction: "inbound", peer: "李四",
+                state: "ready", durationMs: 12_000, sizeBytes: 192_044,
+                createdAt: now - 7_200_000, keyId: "demo-key"
+            ),
+            RecordingRecord(
+                id: "rec_preview_3", callId: "demo:zhangsan2", lineId: "line2",
+                lineName: "流量卡", direction: "outbound", peer: "张三",
+                state: "failed", failureCode: "storage_error",
+                failureReason: "存储卡不可用", createdAt: now - 86_400_000, keyId: "demo-key"
+            ),
+            RecordingRecord(
+                id: "rec_preview_conf", callId: "demo:conf_preview", lineId: "line1",
+                lineName: "主卡", direction: "outbound", peer: "张三、李四",
+                state: "ready", durationMs: 214_000, sizeBytes: 3_424_044,
+                createdAt: now - 600_000, keyId: "demo-key",
+                kind: "conference", conferenceId: "demo:conf_preview"
+            ),
+        ]
     }
 
     /// Screenshot/UI-test only: renders the live paired-mode line surfaces
@@ -861,6 +1082,15 @@ final class AppModel: ObservableObject {
         defaultLineId = "line1"
         lineListState = .loaded
         linePhase = .online(authorizedLines[0].status)
+    }
+
+    /// Screenshot fixture only: a synthetic harassment-CAPABLE gateway so the
+    /// supported branch (key-shared toggles, gateway lists, block history and
+    /// the explicit 导入现有规则 action) renders offline. Never reachable
+    /// without the launch argument; no network and no credentials.
+    func enableHarassmentGatewayPreview() {
+        enablePairedFixture()
+        api = DemoGatewayAPI()
     }
 
     // MARK: External call entry points (Intents / tel:)
@@ -1150,12 +1380,74 @@ final class AppModel: ObservableObject {
             return externalDialReason
         }
         if authorizedLines.allSatisfy({ !$0.permissions.dial }) {
-            return "当前配对密钥没有任何线路的外呼权限；请在网关上授权后再试，App 不会改用蜂窝电话呼出。"
+            return "当前没有可外呼的线路，请在网关为本机授权后再试。"
         }
-        return "当前没有可用的外呼线路（线路未启用、未注册或语音不可用）。请稍后重试或在设置中查看；App 不会改用其他号码或蜂窝电话呼出。"
+        return "当前没有可用的外呼线路，请稍后重试或在设置中查看。"
     }
 
     // MARK: Live wiring
+
+    /// The validated origin of the CURRENT binding: the administrator
+    /// console client must only ever talk to the gateway this app is paired
+    /// with, and it must never reuse the device bearer token path.
+    var gatewayOrigin: GatewayOrigin? {
+        guard let binding = bindingStore.current() else { return nil }
+        switch GatewayOrigin.validate(
+            binding.endpoint, allowLoopbackHTTP: binding.allowLoopbackHTTP,
+            apiVersion: binding.apiVersion
+        ) {
+        case .success(let origin): return origin
+        case .failure: return nil
+        }
+    }
+
+    /// The unified (v2) gateway is the only one with the administrator JSON
+    /// API; the management entry is capability-gated on this rather than
+    /// offering a row that cannot work.
+    /// The management entry is gated on the DISCOVERED capability, never on
+    /// the wire version: a pre-68 v2 gateway answers the admin route with 404
+    /// (verified live), so a version check alone would offer a dead entry.
+    var supportsNativeManagement: Bool {
+        #if DEBUG
+        if LaunchArguments.isManagementPreview { return true }
+        #endif
+        return !isDemo && bindingStore.current() != nil
+            && adminCenter.adminAvailability == .available
+    }
+
+    /// The gateway answered 404/405/501 for the admin route: show the honest
+    /// upgrade reason instead of an entry that cannot work.
+    var nativeManagementUnsupported: Bool {
+        !isDemo && bindingStore.current() != nil
+            && adminCenter.adminAvailability == .unsupported
+    }
+
+    /// Starts (or repeats) the unauthenticated capability probe off the UI
+    /// path. Safe to call on every appearance: it never blocks and never
+    /// downgrades an existing "available" result to "unknown".
+    func refreshNativeManagementAvailability() {
+        guard !isDemo, bindingStore.current() != nil else { return }
+        let origin = gatewayOrigin
+        Task { await adminCenter.refreshAdminAvailability(origin: origin) }
+    }
+
+    /// Rebinds the administrator console to the current gateway (or clears it
+    /// when unpaired/demo). Called on every live start, unpair and demo entry.
+    func bindAdminCenter() {
+        if isDemo || bindingStore.current() == nil {
+            adminCenter.bind(origin: nil, gatewayId: nil)
+            return
+        }
+        let binding = bindingStore.current()
+        adminCenter.bind(origin: gatewayOrigin, gatewayId: binding?.gatewayId)
+    }
+
+    /// Screenshot fixtures set the availability directly (no network).
+    #if DEBUG
+    func setNativeManagementAvailabilityForFixture(_ availability: AdminAPIAvailability) {
+        adminCenter.setAdminAvailabilityForTesting(availability)
+    }
+    #endif
 
     private func startLive(binding: GatewayBinding) {
         isDemo = false
@@ -1176,37 +1468,148 @@ final class AppModel: ObservableObject {
         }
 
         gatewayName = binding.gatewayName ?? binding.gatewayId
+        adminCenter.bind(origin: origin, gatewayId: binding.gatewayId)
         preferredRouteMode = MediaRoutePreferenceStore.shared.mode(for: binding.gatewayId)
+        preferredDirectTransport = DirectTransportPreferenceStore.shared.choice(for: binding.gatewayId)
+        directTransportChoicesAvailable = false
+        chosenRouteKind = nil
+        routeCandidateStats = [:]
         linePhase = .connecting
         let launchGeneration = sessionGeneration
         reconciling = false
 
-        // Verify the anonymous identity BEFORE opening any token-bearing REST
-        // or WebSocket connection. A gateway id/fingerprint mismatch blocks all
-        // credentialed traffic rather than silently presenting another host.
-        let probe = HTTPGatewayAPI(origin: origin, tokens: tokenStore)
+        // Cold-start hydrate BEFORE any network: build the scoped durable
+        // session (API + inbox + recents) and render from disk immediately,
+        // so call records, conversations and already-loaded message bodies
+        // appear even when the gateway or the network is unavailable. The
+        // session is identity-GATED: it can render cached data but NO
+        // credentialed request leaves the device until the identity probe
+        // below verifies this exact gateway. Cross-gateway restore is
+        // prevented by scope construction (canonical API base + gatewayId +
+        // deviceId), and a known mismatch/revocation purges the scope.
+        let session = makeLiveSession(origin: origin, binding: binding)
+        session.http.requireIdentityVerification()
+        self.liveHistoryStore = session.historyStore
+
+        // Verify the anonymous identity BEFORE enabling any live operation.
+        // A gateway id/fingerprint mismatch blocks all credentialed traffic
+        // rather than silently presenting another host.
         Task {
-            let verification = await GatewayIdentityVerifier(api: probe)
+            let verification = await GatewayIdentityVerifier(api: session.probe)
                 .verify(expectedGatewayId: binding.gatewayId, expectedFingerprint: binding.fingerprint)
             guard launchGeneration == sessionGeneration else { return }
             switch verification {
             case .verified:
                 guard launchGeneration == self.sessionGeneration else { return }
-                self.activateLive(origin: origin, binding: binding)
+                session.http.markIdentityVerified()
+                self.activateLive(origin: origin, binding: binding, session: session)
             case .mismatched:
+                // KNOWN identity mismatch invalidates this scope: the cached
+                // history belonged to a gateway claiming this address before
+                // — never keep rendering it against a host that proved to be
+                // someone else.
+                self.purgeScopedHistory(binding: binding, tokenStore: self.tokenStore)
+                self.sessionGeneration += 1
+                session.inbox.invalidate()
+                // The generation check above guarantees these still belong to
+                // THIS (now revoked) session; drop both live references.
+                self.inbox = nil
+                self.api = nil
+                self.gatewayRecents = []
+                self.mergeRecentsForDisplay()
                 self.linePhase = .offline("网关身份与配对时不一致，已阻止连接以防冒用。请重新配对。")
                 AppLog.network.error("gateway identity mismatch; credentialled paths blocked")
             case .unreachable:
-                // Do not leak tokens to an unverifiable host; surface offline and
-                // let the owner retry from Settings.
+                // Do not leak tokens to an unverifiable host; surface offline.
+                // The HYDRATED display stays: this is exactly the offline
+                // cold-start case the durable cache exists for.
                 self.linePhase = .offline("无法验证网关身份，请检查网络后重试。")
             }
         }
     }
 
-    private func activateLive(origin: GatewayOrigin, binding: GatewayBinding) {
+    /// The durable pieces of one live pairing session, built synchronously so
+    /// display can hydrate before the identity probe answers.
+    private struct LiveSession {
+        let http: HTTPGatewayAPI
+        let probe: HTTPGatewayAPI
+        let inbox: MessageInbox
+        let historyStore: GatewayHistoryStore?
+    }
+
+    private func makeLiveSession(origin: GatewayOrigin, binding: GatewayBinding) -> LiveSession {
         let tokens = tokenStore
-        let http = HTTPGatewayAPI(origin: origin, tokens: tokens)
+        let scope = HistoryScope.identifier(
+            origin: origin, gatewayID: binding.gatewayId, deviceID: tokens.tokens()?.deviceId)
+        let historyStore = GatewayHistoryStore(scopeIdentifier: scope)
+        // A corrupt or version-mismatched snapshot is treated as no cache at
+        // all; validators only ever live inside the snapshot file, so there
+        // is no torn state to clear separately.
+        let http = HTTPGatewayAPI(origin: origin, tokens: tokens, historyStore: historyStore)
+        let outboxStore = OutboxStore(scopeIdentifier: binding.gatewayId)
+        let messages = MessageInbox(
+            api: http, filter: spamFilter, outboxStore: outboxStore,
+            tombstoneScope: binding.gatewayId, historyStore: historyStore,
+            actionStore: SMSActionStore(scopeIdentifier: scope)
+        )
+        messages.conversationIsForeground = { UIApplication.shared.applicationState == .active }
+        messages.transportIsV2 = binding.apiVersion == "v2"
+        messages.isEventStreamHealthy = { [weak self] in self?.eventState == .open }
+        messages.lineReady = { [weak self] in self?.isSMSLineUsable ?? false }
+        messages.gatewayQuarantineAvailable = { [weak self] in
+            self?.harassment.support == .supported
+        }
+        messages.lineReadyForEntry = { [weak self] lineID in self?.lineCanSendSMS(lineID) ?? false }
+        messages.lineIdProvider = { [weak self] in self?.defaultLineId }
+        messages.authorizedLineIDsProvider = { [weak self] in self?.authorizedLines.map(\.id) ?? [] }
+        threadLineStore = ThreadLinePreferenceStore.shared.scope(for: binding.gatewayId)
+        messages.lineIdForThread = { [weak self] threadKey in self?.preferredLine(for: threadKey) }
+        messages.isTrustedContact = { [weak self] peer in self?.isTrustedContact(peer) ?? false }
+        // Recents hydrate from the same scoped snapshot BEFORE the first
+        // listCalls GET: the Recents tab renders at once, offline-safe.
+        if let snapshot = historyStore?.snapshotForHydrate() {
+            gatewayRecents = snapshot.calls
+            callsSnapshotSettled = true
+        } else {
+            gatewayRecents = []
+            callsSnapshotSettled = false
+        }
+        mergeRecentsForDisplay()
+        self.api = http
+        self.inbox = messages
+        messages.setLineFilter(selectedLineFilter)
+        return LiveSession(http: http, probe: http, inbox: messages, historyStore: historyStore)
+    }
+
+    /// Purge the durable history scope (unpair / binding removal / known
+    /// credential revocation / verified identity mismatch). Ordinary
+    /// teardown is NOT unpair and never calls this.
+    private func purgeScopedHistory(binding: GatewayBinding, tokenStore: TokenStore) {
+        guard let origin = try? GatewayOrigin.validate(
+            binding.endpoint, allowLoopbackHTTP: binding.allowLoopbackHTTP,
+            apiVersion: binding.apiVersion).get() else { return }
+        // No durable scope existed (unbound device) => nothing on disk to purge.
+        guard let scope = HistoryScope.identifier(
+            origin: origin, gatewayID: binding.gatewayId, deviceID: tokenStore.tokens()?.deviceId)
+        else { return }
+        inbox?.purgeSMSActions()
+        SMSActionStore(scopeIdentifier: scope)?.purge()
+        let hash = SHA256Lite.hex(Data(scope.utf8)).prefix(20)
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let file = base.appendingPathComponent("CallRelay/history/history-\(hash).json")
+        // Purge through the live instance when it matches (flag + queue),
+        // and always make sure the file itself is gone.
+        if let store = liveHistoryStore, store.fileURL == file {
+            store.purge()
+        } else {
+            try? FileManager.default.removeItem(at: file)
+        }
+    }
+
+    private func activateLive(origin: GatewayOrigin, binding: GatewayBinding,
+                              session: LiveSession) {
+        let tokens = tokenStore
+        let http = session.http
         api = http
         // Readiness starts from THIS gateway's stored delivery evidence; the
         // previous gateway's state must never bleed into the new row.
@@ -1228,11 +1631,18 @@ final class AppModel: ObservableObject {
         }
         gatewayName = binding.gatewayName ?? binding.gatewayId
         preferredRouteMode = MediaRoutePreferenceStore.shared.mode(for: binding.gatewayId)
+        preferredDirectTransport = DirectTransportPreferenceStore.shared.choice(for: binding.gatewayId)
+        directTransportChoicesAvailable = false
+        chosenRouteKind = nil
+        routeCandidateStats = [:]
         currentGatewayScope = GatewayScope.identifier(gatewayID: binding.gatewayId)
         pushPolicy = PushReceptionPolicy(expectedGatewayId: binding.gatewayId)
 
         let monitor = NetworkMonitor()
         networkMonitor = monitor
+        monitor.$isReachable.removeDuplicates().sink { [weak self] reachable in
+            if reachable { self?.inbox?.wakeActionSync() }
+        }.store(in: &cancellables)
         monitor.start()
 
         // Persist the resume cursor per gateway+installation so an app
@@ -1252,6 +1662,7 @@ final class AppModel: ObservableObject {
                 guard let self, streamGeneration == self.sessionGeneration else { return }
                 self.eventState = state
                 if state == .open {
+                    self.inbox?.wakeActionSync()
                     self.eventAuthRecoveryKicks = 0
                     Task { @MainActor in
                         guard streamGeneration == self.sessionGeneration else { return }
@@ -1321,7 +1732,26 @@ final class AppModel: ObservableObject {
         live.setDefaultLineId(binding.defaultLineId)
         live.onCallKitIssue = { [weak self] issue in self?.callKitIssue = issue }
         live.onAnswerFailed = { [weak self] message in self?.lastError = message }
+        live.onRecordingNotice = { [weak self] message in
+            Task { @MainActor in
+                guard let self else { return }
+                self.recordingNotice = message
+            }
+        }
         bindDriver(live)
+        // Build-61: the coordinator's multi-path route decisions publish here
+        // (当前路径 stats + redacted diagnostics record).
+        live.bindRouteSelectionGlue(
+            publish: { [weak self] decision, samples, at in
+                self?.publishRouteSelection(decision, samples: samples, at: at)
+            },
+            availability: { [weak self] ice in
+                self?.updateDirectTransportAvailability(ice: ice)
+            }
+        )
+        // Build-62: the enrollment binding is the QUIC pin-trust anchor.
+        live.bindGatewayTrust(
+            gatewayId: binding.gatewayId, fingerprint: binding.fingerprint)
 
         // Foreground direct-path preflight (no call, no mic, no audio
         // session): keeps fresh reachability/RTT measurements so dial and
@@ -1361,20 +1791,10 @@ final class AppModel: ObservableObject {
         RouteMeasurementMemory.restore(into: &routeDiagnostics,
                                        scope: GatewayScope.identifier(gatewayID: binding.gatewayId))
 
-        let outboxStore = OutboxStore(scopeIdentifier: binding.gatewayId)
-        let messages = MessageInbox(
-            api: http, filter: spamFilter, outboxStore: outboxStore,
-            tombstoneScope: binding.gatewayId
-        )
-        messages.lineReady = { [weak self] in self?.isSMSLineUsable ?? false }
-        messages.lineReadyForEntry = { [weak self] lineID in self?.lineCanSendSMS(lineID) ?? false }
-        messages.lineIdProvider = { [weak self] in self?.defaultLineId }
-        messages.authorizedLineIDsProvider = { [weak self] in self?.authorizedLines.map(\.id) ?? [] }
-        threadLineStore = ThreadLinePreferenceStore.shared.scope(for: binding.gatewayId)
-        messages.lineIdForThread = { [weak self] threadKey in self?.preferredLine(for: threadKey) }
-        messages.isTrustedContact = { [weak self] peer in self?.isTrustedContact(peer) ?? false }
-        inbox = messages
-        messages.setLineFilter(selectedLineFilter)
+        // Reuse the hydrated inbox built synchronously in startLive (it has
+        // already rendered any durable snapshot offline): enabling the session
+        // must NEVER discard the hydrated display by rebuilding the inbox.
+        let messages = session.inbox
         messages.start()
 
         startPolling()
@@ -1426,8 +1846,15 @@ final class AppModel: ObservableObject {
         callKit = nil
         driver = nil
         api = nil
+        // Teardown settles (inbox.invalidate flushes) and releases the store
+        // reference — it does NOT purge. The scoped disk snapshot survives an
+        // ordinary disconnect/reconnect/teardown so the next verified (or
+        // offline) session of the SAME gateway+device rehydrates instantly.
         inbox?.invalidate()
         inbox = nil
+        liveHistoryStore = nil
+        callsSnapshotSettled = false
+        pendingSMSConversationKey = nil
         currentGatewayScope = nil
         cloudSync = nil
         cloudRecents = []
@@ -1448,6 +1875,12 @@ final class AppModel: ObservableObject {
         numberEditLine = nil
         lineNumberNotice = nil
         voicemails = []
+        recordings = []
+        recordingNotice = nil
+        recordingRequestPending = false
+        lastDeletedRecordingId = nil
+        harassment.reset()
+        recordingConfig.reset()
         lineListState = .unknown
         authRecoveryRequired = false
         authRecoveryMessage = nil
@@ -1492,6 +1925,12 @@ final class AppModel: ObservableObject {
             Task { @MainActor in
                 guard let self, boundGeneration == self.sessionGeneration else { return }
                 self.audioStatus = message
+            }
+        }
+        driver.onHotStandbyState = { [weak self] state in
+            Task { @MainActor in
+                guard let self, boundGeneration == self.sessionGeneration else { return }
+                self.hotStandbyState = state
             }
         }
         driver.onRouteState = { [weak self] state in
@@ -1697,9 +2136,26 @@ final class AppModel: ObservableObject {
         // Only the same session's owner may release the flag: an old pass
         // finishing after an unpair/re-bind must not clear a newer pass.
         defer { if gen == sessionGeneration { reconciling = false } }
+        // A gap (stream reconnect, foreground return, boot activation) means
+        // cached-but-proven-fresh pages may have missed changes while we were
+        // away (including the NOT-broadcast read marks): mark them stale so
+        // each open conversation gets exactly one bounded conditional page
+        // revalidation below / on next open, never a forced whole-history
+        // download of retained older pages or cursors.
+        inbox?.markLoadedPagesStale()
         await inbox?.reconcile()
         guard gen == sessionGeneration else { return }
         _ = await refreshRecents()
+        guard gen == sessionGeneration else { return }
+        // Revalidate the OPEN conversation immediately (root tap case: a cold
+        // SMS-alert jump can open a page while the session was still gated;
+        // activation/gap must retry it now instead of waiting for the 20 s
+        // poll). Conditional + generation-guarded inside the inbox; a 304 or
+        // hydrate-driven path never re-marks reads — only this user-visible
+        // open conversation marks its own unreads.
+        if let key = inbox?.openThreadKey {
+            await inbox?.refreshOpenThread(key)
+        }
         guard gen == sessionGeneration else { return }
         await reconcileActiveCalls()
     }
@@ -1709,12 +2165,52 @@ final class AppModel: ObservableObject {
         await refreshRecents()
     }
 
+    /// True when this session holds a USABLE calls snapshot (hydrated from
+    /// the durable store or settled by a full body). It distinguishes a
+    /// legitimate empty call history (a committed `[]` body + its validator →
+    /// 304 is the correct answer, keep showing empty) from a missing cache
+    /// (never committed → a 304 cannot be trusted and one full fetch runs).
+    private var callsSnapshotSettled = false
+
     @discardableResult
     private func refreshRecents() async -> Bool {
         guard let api else { return false }
+        let captured = sessionGeneration
         do {
-            gatewayRecents = try await api.listCalls(limit: 100)
-            mergeRecentsForDisplay()
+            // CONDITIONAL history GET: an unchanged repeat (even after a cold
+            // restart) answers 304 and transfers zero body bytes — the exact
+            // behavior the durable cache + persisted validator exist to
+            // provide. `.notModified` keeps the hydrated copy (never a
+            // failure); only a changed body replaces + re-persists.
+            let outcome = try await api.listCallsConditional(limit: 100)
+            guard captured == sessionGeneration else { return false }
+            switch outcome {
+            case .changed(let calls, let validator):
+                var updates: [String: String?] = [:]
+                if let validator { updates[validator.key] = validator.etag }
+                // A live call event may have landed WHILE this list GET was
+                // in flight; its newer state must not be rolled back by the
+                // pre-event copy (root review). Reconcile per call id with
+                // the session's terminal-state proof.
+                gatewayRecents = Self.reconcileCallList(server: calls, local: gatewayRecents,
+                                                        terminalIds: terminalCallIds)
+                callsSnapshotSettled = true
+                mergeRecentsForDisplay(persist: true, validatorUpdates: updates)
+            case .notModified:
+                if !callsSnapshotSettled {
+                    // A 304 arrived with NO usable body this session
+                    // (should not happen with atomic body+validator commits;
+                    // converge with one unconditional fetch instead).
+                    let fresh = try await api.listCalls(limit: 100)
+                    guard captured == sessionGeneration else { return false }
+                    gatewayRecents = Self.reconcileCallList(server: fresh, local: gatewayRecents,
+                                                            terminalIds: terminalCallIds)
+                    callsSnapshotSettled = true
+                    mergeRecentsForDisplay(persist: true, validatorUpdates: [:])
+                }
+                // else: settled snapshot (possibly a legitimate EMPTY call
+                // history) stays displayed; zero bytes transferred.
+            }
             return true
         } catch {
             AppLog.network.notice("recents refresh failed")
@@ -1722,10 +2218,46 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Merges a list-calls response over the local copy WITHOUT letting a
+    /// stale (pre-event) response resurrect a call the session already knows
+    /// is terminal: a server copy that still shows such a call unfinished is
+    /// older than the event and the LOCAL terminal record wins.
+    static func reconcileCallList(server: [CallRecord], local: [CallRecord],
+                                  terminalIds: Set<String>) -> [CallRecord] {
+        guard !terminalIds.isEmpty else { return server }
+        var localByID: [String: CallRecord] = [:]
+        for record in local { localByID[record.id] = record }
+        return server.map { incoming in
+            if !incoming.isFinished, terminalIds.contains(incoming.id),
+               let known = localByID[incoming.id], known.isFinished {
+                return known
+            }
+            return incoming
+        }
+    }
+
+    /// Merge a live call event record into the gateway recents + durable
+    /// scoped snapshot. This is display-state only; it NEVER routes through
+    /// CallCoordinator/CallKit and never re-rings (hydrate and event merge are
+    /// read/display, alerts come only from the live event/push path).
+    private func mergeCallRecordFromEvent(_ call: CallRecord) {
+        if let index = gatewayRecents.firstIndex(where: { $0.id == call.id }) {
+            gatewayRecents[index] = call
+        } else {
+            gatewayRecents.insert(call, at: 0)
+        }
+        mergeRecentsForDisplay()
+        liveHistoryStore?.mergeCall(call, savedAt: Date())
+        liveHistoryStore?.flush()
+    }
+
     /// Merge live gateway calls with read-only CloudKit-restored calls for the
     /// current scope. Restored ids are prefixed so they can never collide with
-    /// a real gateway id or be sent back to the gateway.
-    private func mergeRecentsForDisplay() {
+    /// a real gateway id or be sent back to the gateway. `persist` writes the
+    /// gateway calls (not the cloud-restored copies) to the durable scoped
+    /// snapshot together with the validator that guarded them.
+    private func mergeRecentsForDisplay(persist: Bool = false,
+                                        validatorUpdates: [String: String?] = [:]) {
         let liveIDs = Set(gatewayRecents.map(\.id))
         let restored = cloudRecents.filter { synced in
             guard let scope = currentGatewayScope,
@@ -1734,6 +2266,10 @@ final class AppModel: ObservableObject {
             return !liveIDs.contains(raw)
         }.compactMap(Self.cloudCallRecord)
         recents = (gatewayRecents + restored).sorted { $0.startedAt > $1.startedAt }
+        if persist, let store = liveHistoryStore {
+            store.recordCalls(gatewayRecents, validatorUpdates: validatorUpdates, savedAt: Date())
+            store.flush()
+        }
     }
 
     private static func cloudCallRecord(_ synced: SyncedCall) -> CallRecord? {
@@ -1897,9 +2433,64 @@ final class AppModel: ObservableObject {
         driver?.selectRouteMode(mode)
     }
 
+    // MARK: Multi-path direct transport (build 61)
+
+    /// Persists the direct-transport preference (自动 / QUIC / 现有直连) for
+    /// the bound gateway.
+    ///
+    /// SEAM(coordinator): enforcement on a LIVE call (forced QUIC vs existing
+    /// WebRTC direct vs auto multi-path) is wired by the call coordinator's
+    /// route-selection glue, which maps this choice onto
+    /// `MultiPathAdvisor.evaluate(forcedTransport:)`; until that wiring
+    /// lands, a live call keeps its pinned route and the choice applies like
+    /// any deferred preference (same contract as pinned route-mode changes).
+    func setDirectTransportChoice(_ choice: DirectTransportChoice) {
+        preferredDirectTransport = choice
+        if let gatewayID = bindingStore.current()?.gatewayId {
+            DirectTransportPreferenceStore.shared.setChoice(choice, for: gatewayID)
+        }
+    }
+
+    /// Records the gateway's QUIC advertisement from the ICE capability so
+    /// the 直连方式 chooser and 当前路径 stats appear only where QUIC exists.
+    /// Called by the coordinator glue once the `/ice` config is fetched.
+    func updateDirectTransportAvailability(ice: ICEConfiguration) {
+        directTransportChoicesAvailable = ice.advertisesQUICMedia
+    }
+
+    /// Publishes one multi-path route-selection decision: the per-candidate
+    /// stats and the chosen kind feed the route UI, and a redacted record
+    /// (transport metrics only — no IPs, no tokens, no network-epoch strings)
+    /// is appended to the diagnostics export's `route_selection` section.
+    /// `at` is injectable so tests stay deterministic.
+    func publishRouteSelection(_ decision: RouteSelectionDecision,
+                               samples: [RouteCandidateKind: RouteCandidateSample],
+                               at: Date = Date()) {
+        routeCandidateStats = samples
+        chosenRouteKind = decision.chosen
+        DiagnosticsStore.shared.recordRouteSelection(
+            RouteSelectionRecord(at: at, decision: decision, samples: samples))
+    }
+
     func dismissRouteNotice() {
         routeNotice = nil
         routeNoticeOffersAuto = false
+    }
+
+    /// Syncs the build-48 directional denoise switches to the bound gateway
+    /// (per-device PATCH). Local persistence already happened in the store;
+    /// an offline/failed sync is retried implicitly on the next settings
+    /// change and applied via media-attach parameters. The active call picks
+    /// the change up live through the WSS denoise control message.
+    func updateDenoisePreference(uplink: Bool?, downlink: Bool?) async {
+        guard let api else { return }
+        do {
+            try await api.setDenoisePreferences(uplink: uplink, downlink: downlink)
+        } catch {
+            AppLog.network.notice("denoise preference sync failed: \(error)")
+        }
+        // Live apply to the active call, if any.
+        driver?.setDenoiseLive(uplink: uplink, downlink: downlink)
     }
 
     /// One-tap recovery from a forced-direct failure: switch to auto.
@@ -1920,10 +2511,14 @@ final class AppModel: ObservableObject {
                 inbox?.apply(eventMessage: message)
                 enqueueCloudMessage(message)
             }
+        case .threadRead:
+            if let data = event.data, let read = try? JSONDecoder().decode(ThreadReadPayload.self, from: data) {
+                inbox?.applyReadBoundary(key: read.key, at: read.throughCreatedAt, id: read.throughID)
+            }
         case .threadDeleted:
             // Another device deleted the conversation: converge locally.
             if let deletion = event.threadDeletion() {
-                inbox?.applyThreadDeleted(key: deletion.key, deletedAt: deletion.deletedAt)
+                inbox?.applyThreadDeleted(key: deletion.key, deletedAt: deletion.deletedAt, throughID: deletion.throughID)
             }
         case .callIncoming:
             if let call = event.call() { handleIncoming(call, eventCreatedAt: event.createdDate) }
@@ -1936,8 +2531,17 @@ final class AppModel: ObservableObject {
                     terminalCallIds.insert(call.id)
                 }
                 enqueueCloudCall(call)
+                // Events carry the full record: merge + persist it locally so
+                // the Recents tab converges and survives restart WITHOUT a
+                // whole-history re-download.
+                mergeCallRecordFromEvent(call)
             }
-            Task { await refreshRecents() }
+            // Bounded CONDITIONAL revalidation keeps server truth (a changed
+            // list costs one 200; unchanged costs a 304). Skipped only when
+            // the list was never loaded (bootstrap path handles it).
+            if !gatewayRecents.isEmpty {
+                Task { await refreshRecents() }
+            }
         case .gatewayRestarting:
             lastError = "网关正在重启，稍后自动恢复。"
         default:
@@ -1950,6 +2554,20 @@ final class AppModel: ObservableObject {
                 } else {
                     Task { await refreshVoicemails() }
                 }
+            } else if event.rawType.hasPrefix("recording.") {
+                // Key-scoped lifecycle events: update the in-call indicator
+                // (for this call/conference) and converge the recordings list.
+                if let recording = event.recording() {
+                    if recording.isConference {
+                        (driver as? LiveCallDriver)?.applyConferenceRecording(recording)
+                    }
+                    applyRecordingEvent(recording)
+                }
+                Task { await refreshRecordings() }
+            } else if event.rawType.hasPrefix("conference.") {
+                // Host-scoped conference lifecycle (recording state refresh,
+                // split/end convergence): let the live coordinator reconcile.
+                (driver as? LiveCallDriver)?.ingest(event: event)
             }
         }
     }
@@ -1981,7 +2599,7 @@ final class AppModel: ObservableObject {
                 defaultLineId = nil
                 temporaryDialLineId = nil
                 outgoingPick = nil
-                lineListState = .empty("此设备当前没有已授权的线路。请在网关的配对密钥中授权线路，或重新配对。")
+                lineListState = .empty("当前没有已授权的线路，请在网关为本机授权，或重新配对。")
                 (driver as? LiveCallDriver)?.setDefaultLineId(nil)
                 return
             }
@@ -2287,6 +2905,25 @@ final class AppModel: ObservableObject {
         await reconcileActiveCalls()
     }
 
+    #if DEBUG
+    /// Tests: attach a scoped durable store to a configureForTesting session
+    /// (the live path builds it inside makeLiveSession).
+    func setHistoryStoreForTesting(_ store: GatewayHistoryStore?) {
+        liveHistoryStore = store
+    }
+    var testingCallsSnapshotSettled: Bool { callsSnapshotSettled }
+    /// Tests: run the production gap path (stale marking + open-thread
+    /// revalidation) deterministically.
+    func testingReconcileAfterGap() async {
+        await reconcileAfterGap()
+    }
+    /// Tests: point the session's display object at a prebuilt inbox (the
+    /// live path builds it inside makeLiveSession).
+    func injectInboxForTesting(_ messages: MessageInbox) {
+        inbox = messages
+    }
+    #endif
+
     /// Feeds one decoded event through the production handler in tests.
     func testingHandleEvent(_ event: GatewayEvent) {
         handle(event: event)
@@ -2343,15 +2980,154 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: Manual call recording
+
+    func refreshRecordings() async {
+        guard let api else {
+            // Demo/visual fixtures have no REST surface; never clobber the
+            // offline fixture list. Only a real unpaired session clears it.
+            if !isDemo { recordings = [] }
+            return
+        }
+        // Fence the result to the current pairing session: a logout/re-pair
+        // while the fetch is in flight must never surface another gateway's
+        // (or another key's) recordings.
+        let gen = sessionGeneration
+        guard let list = try? await api.listRecordings() else { return }
+        guard gen == sessionGeneration else { return }
+        recordings = list
+    }
+
+    func recordingData(_ id: String) async -> Data? {
+        guard let api else { return nil }
+        let gen = sessionGeneration
+        let data = try? await api.recordingAudio(id: id)
+        guard gen == sessionGeneration else { return nil }
+        return data
+    }
+
+    func hasRecording(callId: String) -> Bool {
+        recordings.contains { $0.callId == callId }
+    }
+
+    /// Authorized delete with an optimistic local removal; the list reloads
+    /// so external deletes converge too. Results are fenced to the session.
+    @discardableResult
+    func deleteRecording(_ id: String) async -> Bool {
+        guard let api else {
+            recordingNotice = String(localized: "尚未连接网关。")
+            return false
+        }
+        let gen = sessionGeneration
+        do {
+            try await api.deleteRecording(id: id)
+            guard gen == sessionGeneration else { return false }
+            recordingNotice = nil
+            recordings.removeAll { $0.id == id }
+            lastDeletedRecordingId = id
+            await refreshRecordings()
+            return true
+        } catch {
+            guard gen == sessionGeneration else { return false }
+            recordingNotice = String(localized: "删除录音失败，请稍后重试。")
+            DiagnosticsStore.shared.log("recording", "delete failed id=\(id): \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// Manual start: the gateway is authoritative. The pending flag disables
+    /// the control until the response arrives; the indicator appears only from
+    /// the confirmed API/event state. A response from a previous session is
+    /// discarded.
+    func startCallRecording() async {
+        guard let api, let call = activeCall, !recordingRequestPending else { return }
+        let gen = sessionGeneration
+        recordingRequestPending = true
+        recordingNotice = nil
+        defer { recordingRequestPending = false }
+        do {
+            let record = try await api.startCallRecording(callId: call.gatewayCallId)
+            guard gen == sessionGeneration else { return }
+            applyRecording(record)
+            await refreshRecordings()
+        } catch {
+            guard gen == sessionGeneration else { return }
+            recordingNotice = (error as? APIError)?.friendlyMessage ?? String(localized: "无法开始录音。")
+        }
+    }
+
+    func stopCallRecording() async {
+        guard let api, let call = activeCall, !recordingRequestPending else { return }
+        let gen = sessionGeneration
+        recordingRequestPending = true
+        recordingNotice = nil
+        defer { recordingRequestPending = false }
+        do {
+            let record = try await api.stopCallRecording(callId: call.gatewayCallId)
+            guard gen == sessionGeneration else { return }
+            applyRecording(record)
+            await refreshRecordings()
+        } catch {
+            guard gen == sessionGeneration else { return }
+            recordingNotice = (error as? APIError)?.friendlyMessage ?? String(localized: "无法停止录音。")
+        }
+    }
+
+    func toggleCallRecording() async {
+        if activeCall?.isRecording == true {
+            await stopCallRecording()
+        } else {
+            await startCallRecording()
+        }
+    }
+
+    /// Applies one server record to the surfaced call when it belongs to it.
+    private func applyRecording(_ record: RecordingRecord) {
+        guard var call = activeCall, call.gatewayCallId == record.callId else { return }
+        call.recordingId = record.id
+        call.recordingState = record.state
+        call.recordingDurationMs = record.durationMs
+        activeCall = call
+    }
+
+    private func applyRecordingEvent(_ record: RecordingRecord) {
+        applyRecording(record)
+        // A prior 1:1 segment finalizes asynchronously after a merge: once the
+        // server confirms it is ready, replace the "stopped" note with the
+        // truthful saved confirmation.
+        if record.state == "ready", !record.isConference, driver?.conferenceRecord != nil {
+            recordingNotice = String(localized: "之前的录音已保存。")
+        }
+        if record.state == "failed" {
+            recordingNotice = String(localized: "录音未完成，已停止。")
+        }
+        if record.state == "deleted" {
+            lastDeletedRecordingId = record.id
+            recordings.removeAll { $0.id == record.id }
+        }
+    }
+
     /// Deletes one SMS conversation for every paired device: the gateway
     /// records a tombstone (history hidden, never destroyed), broadcasts
     /// `thread.deleted`, and this device drops its local copy immediately.
     @discardableResult
     func deleteThread(_ key: String) async -> Bool {
+        // Build-67 responsiveness: the inbox owns the pending-intent flow
+        // (row hides immediately; the durable tombstone lands only after the
+        // gateway accepted; a rejection restores the row). Without a live
+        // inbox there is nothing to reflect locally, so the call is still
+        // made and reported honestly.
+        if let inbox {
+            let ok = await inbox.deleteThread(key)
+            if !ok {
+                DiagnosticsStore.shared.log("messages", "thread delete failed key=\(key)")
+                lastError = String(localized: "删除对话失败，请稍后重试。")
+            }
+            return ok
+        }
         guard let api else { return false }
         do {
             try await api.deleteThread(threadKey: key)
-            inbox?.applyThreadDeleted(key: key)
             return true
         } catch {
             DiagnosticsStore.shared.log("messages", "thread delete failed key=\(key): \(error.localizedDescription)")
@@ -2360,12 +3136,27 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Bulk conversation delete for the list's Edit mode. Sequential so a
-    /// failure cannot be lost in a fan-out: each accepted delete is applied
-    /// locally immediately, each rejected key stays visible and is reported.
+    /// Bulk conversation delete for the list's Edit mode. Every selected row
+    /// is marked pending BEFORE the first network call (the whole selection
+    /// hides at once — waiting for each sequential round-trip made later
+    /// rows look unresponsive), then each key is submitted ONCE and settled
+    /// honestly: an accepted delete is applied locally, a rejected key
+    /// returns to the list and is reported.
     func deleteThreads(_ keys: [String]) async -> BulkOperationResult {
+        if let inbox {
+            let result = await inbox.deleteThreads(keys)
+            if !result.failed.isEmpty {
+                DiagnosticsStore.shared.log("messages", "bulk thread delete failed=\(result.failed.count)")
+                lastError = result.succeeded.isEmpty
+                    ? String(localized: "删除失败，请检查网络后重试。")
+                    : String(localized: "部分对话未能删除，请重试。")
+            }
+            return result
+        }
         var result = BulkOperationResult()
-        for key in keys {
+        var seen = Set<String>()
+        let unique = keys.filter { seen.insert($0).inserted }
+        for key in unique {
             if await deleteThread(key) {
                 result.succeeded.append(key)
             } else {
@@ -2385,6 +3176,13 @@ final class AppModel: ObservableObject {
         set {
             defaults.set(newValue, forKey: DefaultsKey.contactWhitelist)
             inbox?.reevaluateAll()
+            // Quarantine-capable gateway: the switch is shared per key. The
+            // session generation and API are captured at the user action so a
+            // delayed task can never write an old session's preference to a
+            // newly paired key.
+            let gen = sessionGeneration
+            let api = self.api
+            Task { await pushContactWhitelistToGateway(newValue, gen: gen, api: api) }
         }
     }
 
@@ -2772,8 +3570,10 @@ final class AppModel: ObservableObject {
             break
         case .label(let reason):
             screenedCallNotice = ScreenedCallNotice(peer: handle, reason: reason)
+            spamFilter.recordScreening(peer: handle, kind: "call", action: "label", reason: reason)
         case .reject(let reason):
             screenedCallNotice = ScreenedCallNotice(peer: handle, reason: reason)
+            spamFilter.recordScreening(peer: handle, kind: "call", action: "reject", reason: reason)
             await silenceIncoming(gatewayId: gatewayId, generation: generation)
         }
     }
@@ -2811,20 +3611,45 @@ final class AppModel: ObservableObject {
         return alertPermission
     }
 
-    /// Routes a standard-notification payload: remembers the alert, switches
-    /// to Settings (where the status row lives) and refreshes the live
-    /// gateway view. Non-alert payloads are ignored here (VoIP payloads are
-    /// handled exclusively by PushKit).
+    /// Routes a standard-notification payload. Two disjoint shapes:
+    /// * service `line_alert` → remember the alert, switch to Settings and
+    ///   refresh the live gateway view (unchanged exclusive behavior);
+    /// * SMS alert (category `CALLRELAY_SMS`, complete `threadKey` +
+    ///   `messageId`) → jump to the Messages tab and open THAT conversation,
+    ///   but only after the payload's `gatewayId` matches the stored pairing.
+    ///   The bounded `peer`/`preview` fields are never used as message data
+    ///   (they are truncated push presentation only). Other payloads are
+    ///   ignored here (VoIP payloads are handled exclusively by PushKit).
     func handleServiceNotification(userInfo: [AnyHashable: Any]) {
-        guard let payload = ServiceAlertPayload.parse(userInfo: userInfo) else { return }
-        lastServiceAlert = payload
-        pendingServiceAlert = payload
-        selectedTab = .settings
-        DiagnosticsStore.shared.log("push", "service alert \(payload.alert.rawValue) line=\(payload.lineId ?? "-")")
-        Task {
-            await refreshAlertPermission()
-            await refreshNotificationStatus()
+        if let payload = ServiceAlertPayload.parse(userInfo: userInfo) {
+            lastServiceAlert = payload
+            pendingServiceAlert = payload
+            selectedTab = .settings
+            DiagnosticsStore.shared.log("push", "service alert \(payload.alert.rawValue) line=\(payload.lineId ?? "-")")
+            Task {
+                await refreshAlertPermission()
+                await refreshNotificationStatus()
+            }
+            return
         }
+        if let route = SMSAlertRoute.parse(userInfo: userInfo) {
+            guard route.belongs(toGatewayID: bindingStore.current()?.gatewayId) else {
+                // Foreign or unidentifiable gateway: never open a
+                // conversation against a gateway the device is not paired to.
+                DiagnosticsStore.shared.log("push", "sms alert tap ignored: gateway mismatch")
+                return
+            }
+            selectedTab = .messages
+            pendingSMSConversationKey = route.threadKey
+            DiagnosticsStore.shared.log("push", "sms alert tap routed to conversation")
+        }
+    }
+
+    /// One-shot consumption of the SMS-alert conversation jump (mirrors the
+    /// pendingCompose/pendingVoicemailToken pattern).
+    func consumePendingSMSConversation() -> String? {
+        defer { pendingSMSConversationKey = nil }
+        return pendingSMSConversationKey
     }
 
     func clearPendingServiceAlert() {

@@ -1,0 +1,60 @@
+# Gateway CI: true-CGO compile + focused tests on the stable linux/amd64
+# runner, linking the SYSTEM Opus/SpeexDSP development packages (the
+# linux,amd64 cgo directives in gateway/internal/{opus,speexpp}). Vendored
+# archives (darwin-arm64, linux-arm64-musl) are verified by local cross
+# builds per docs/self-hosting.md; no optional runner labels are assumed
+# here.
+name: gateway
+
+on:
+  push:
+    paths:
+      - "gateway/**"
+      - "tools/**"
+      - ".github/workflows/gateway.yml"
+  pull_request:
+    paths:
+      - "gateway/**"
+      - "tools/**"
+      - ".github/workflows/gateway.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-amd64-cgo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: gateway/go.mod
+          cache: true
+          cache-dependency-path: gateway/go.sum
+      - name: Install system audio libraries (CGO link targets)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libopus-dev libspeexdsp-dev
+      - name: Verify line registry and preparation scripts
+        run: |
+          source Scripts/build-env.sh
+          python3 -m unittest discover -s tools -p 'test_*.py'
+      - name: Build all packages with CGO enabled
+        working-directory: gateway
+        run: CGO_ENABLED=1 go build -trimpath ./...
+      - name: Vet
+        working-directory: gateway
+        run: CGO_ENABLED=1 go vet ./...
+      - name: Focused tests (config, store, api, runtime, codec wrappers)
+        working-directory: gateway
+        run: >
+          CGO_ENABLED=1 go test -count=1 -timeout 15m
+          ./internal/unified/config
+          ./internal/unified/store
+          ./internal/unified/api
+          ./internal/unified/runtime
+          ./internal/opus
+          ./internal/speexpp
+          ./internal/sms

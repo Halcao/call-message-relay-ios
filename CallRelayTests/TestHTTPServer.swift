@@ -18,6 +18,23 @@ final class TestHTTPServer: @unchecked Sendable {
     private var queued: Canned?
     private var captured: URLRequest?
     private var capturedBody: Data?
+    private var requestCountValue = 0
+    private var totalTransferredBodyBytesValue = 0
+    private var lastCachePolicyValue: URLRequest.CachePolicy?
+
+    var requestCount: Int {
+        withLock { Optional(requestCountValue) } ?? 0
+    }
+    /// Sum of response BODY bytes served so far — a 304 (empty body)
+    /// contributes exactly zero, which is what the conditional-refresh
+    /// measurements assert.
+    var totalTransferredBodyBytes: Int {
+        withLock { Optional(totalTransferredBodyBytesValue) } ?? 0
+    }
+    var lastIfNoneMatch: String? {
+        withLock { captured?.value(forHTTPHeaderField: "If-None-Match") }
+    }
+    var lastCachePolicy: URLRequest.CachePolicy? { withLock { lastCachePolicyValue } }
 
     init() {}
 
@@ -85,7 +102,15 @@ final class TestHTTPServer: @unchecked Sendable {
             }
             body = data
         }
-        lock.lock(); captured = request; capturedBody = body; lock.unlock()
+        lock.lock()
+        captured = request; capturedBody = body
+        requestCountValue += 1
+        lastCachePolicyValue = request.cachePolicy
+        lock.unlock()
+    }
+
+    fileprivate func recordServedBody(_ bytes: Int) {
+        lock.lock(); totalTransferredBodyBytesValue += bytes; lock.unlock()
     }
 
     fileprivate final class MockProtocol: URLProtocol {
@@ -107,13 +132,18 @@ final class TestHTTPServer: @unchecked Sendable {
                 client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
                 return
             }
+            // A 304 transfers no body; count exactly what is loaded so the
+            // conditional-refresh byte measurement is honest.
+            owner.recordServedBody(canned.status == 304 ? 0 : canned.body.count)
             var headers = canned.headers
             headers["Content-Type"] = "application/json"
             if let url = request.url,
                let response = HTTPURLResponse(url: url, statusCode: canned.status,
-                                               httpVersion: "HTTP/1.1", headerFields: headers) {
+                                              httpVersion: "HTTP/1.1", headerFields: headers) {
                 client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-                client?.urlProtocol(self, didLoad: canned.body)
+                if canned.status != 304 {
+                    client?.urlProtocol(self, didLoad: canned.body)
+                }
             }
             client?.urlProtocolDidFinishLoading(self)
         }

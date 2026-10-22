@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "lines": {
+    "line1": {
+      "moduleKey": "sha256:0123456789abcdef",
+      "usbPath": "/sys/devices/platform/.../usb1/1-1/1-1:1.2",
+      "workerPort": 9701,
+      "internalPort": 9801,
+      "dataDir": "/var/lib/cellbridge/line1",
+      "firmware": "example-firmware-label",
+      "state": "active",
+      "numberSource": "sim",
+      "phoneMasked": "+120****0101",
+      "simHash": "sha256:0123456789abcdef",
+      "updatedAt": 1760000000000,
+      "tty": "/dev/serial/by-id/usb-EXAMPLE-MODEM-A-if02-port0"
+    },
+    "line2": {
+      "moduleKey": "sha256:1111111111111111",
+      "usbPath": "/sys/devices/platform/.../usb1/1-2/1-2:1.2",
+      "workerPort": 9702,
+      "internalPort": 9802,
+      "dataDir": "/var/lib/cellbridge/line2",
+      "firmware": "example-firmware-label",
+      "state": "active",
+      "numberSource": "none",
+      "phoneMasked": "",
+      "simHash": "",
+      "updatedAt": 1760000000000,
+      "tty": "/dev/serial/by-id/usb-EXAMPLE-MODEM-B-if02-port0"
+    }
+  },
+  "pending": {}
+}

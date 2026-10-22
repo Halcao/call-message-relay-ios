@@ -15,12 +15,15 @@ final class MediaReconnectionTests: XCTestCase {
     }
 
     private func makeCoordinator(api: FakeGatewayAPI, media: FakeMediaSession,
-                                 window: TimeInterval = 0.4)
+                                 window: TimeInterval = 0.4,
+                                 createsNewSessions: Bool = false)
     -> (CallCoordinator, FakeCallKit, PhaseProbe) {
         let callKit = FakeCallKit()
         let registry = CallIdentityRegistry()
+        let provider = FakeMediaProvider(session: media)
+        provider.createsNewSessions = createsNewSessions
         let coordinator = CallCoordinator(
-            api: api, callKit: callKit, mediaProvider: FakeMediaProvider(session: media),
+            api: api, callKit: callKit, mediaProvider: provider,
             registry: registry, transport: "tailnet", mediaRecoveryWindow: window
         )
         let probe = PhaseProbe()
@@ -41,23 +44,47 @@ final class MediaReconnectionTests: XCTestCase {
         return uuid
     }
 
-    func testICEDisconnectThatRecoversStaysActiveAndNeverRedials() async throws {
+    func testICEDisconnectThatRecoversWithFreshMediaStaysActiveAndNeverRedials() async throws {
+        // Build-48 recovery creates a fresh media session per attempt and
+        // clears only on fresh inbound media on that attempt.
         let api = FakeGatewayAPI()
         let media = FakeMediaSession()
-        let (coordinator, callKit, probe) = makeCoordinator(api: api, media: media)
+        let (coordinator, callKit, probe) = makeCoordinator(api: api, media: media,
+                                                             createsNewSessions: true)
         let uuid = await connectOutgoing(coordinator, api, media, probe)
 
         let dialsBefore = api.dials.count
         media.onState?(.disconnected)
-        try? await Task.sleep(nanoseconds: 100_000_000)
-        // The same peer connection recovers: no failure, no new dial/close.
-        media.onState?(.connected)
-        try? await Task.sleep(nanoseconds: 700_000_000)
+        // A fresh candidate session is attached (same call id, no new dial).
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(api.dials.count, dialsBefore, "recovery must never place a new call")
+        // Prove fresh inbound media on the replacement session.
+        let replacement = coordinator.debugLatestDirectRecoverySession as? FakeMediaSession
+        replacement?.debugFireFreshMedia()
+        try? await Task.sleep(nanoseconds: 400_000_000)
 
         XCTAssertTrue(callKit.ended.isEmpty)
-        XCTAssertEqual(api.dials.count, dialsBefore, "ICE recovery must never place a new call")
-        XCTAssertEqual(media.closeCount, 0)
+        XCTAssertEqual(api.dials.count, dialsBefore)
         XCTAssertTrue(probe.endedReasons.isEmpty)
+        _ = uuid
+    }
+
+    func testFailedStateEntersRecoveryInsteadOfImmediateEnd() async throws {
+        let api = FakeGatewayAPI()
+        let media = FakeMediaSession()
+        let (coordinator, callKit, probe) = makeCoordinator(api: api, media: media,
+                                                             createsNewSessions: true)
+        let uuid = await connectOutgoing(coordinator, api, media, probe)
+        // Previously `.failed` ended immediately; now it enters the window.
+        media.onState?(.failed)
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertTrue(callKit.ended.isEmpty, "a failed transport must recover within 45s")
+        // Fresh media on the candidate settles the call.
+        if let replacement = coordinator.debugLatestDirectRecoverySession as? FakeMediaSession {
+            replacement.debugFireFreshMedia()
+        }
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertTrue(callKit.ended.isEmpty)
         _ = uuid
     }
 

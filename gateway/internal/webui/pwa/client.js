@@ -1,0 +1,1320 @@
+/* CallRelay standalone PWA client — dialer, SMS, in-browser calls.
+ *
+ * Transport mirrors the native app exactly: v2 HTTPS APIs (cookie session)
+ * + the WSS PCMU media socket. Foreground-only by design: the service
+ * worker never holds media; a notification tap brings this page forward,
+ * and the mic is requested from the answer/dial user gesture. No fake
+ * system-call UI, no background autoconnect claims.
+ */
+(function () {
+  'use strict';
+
+  var S = window.CallRelaySession;
+  var AU = window.CallRelayAudio;
+  var TL = window.CallRelayThreadLogic;
+  var CL = window.CallRelayContactsLogic;
+  var $ = function (id) { return document.getElementById(id); };
+  var el = function (tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) { node.className = cls; }
+    if (text !== undefined) { node.textContent = text; }
+    return node;
+  };
+
+  var FIXTURE = /[?&]fixture=1/.test(location.search);
+  var params = new URLSearchParams(location.search);
+
+  /* Fixture-only demo audio: no mic, no AudioContext — review can exercise
+   * the full call flow without permissions (clearly marked demo mode). */
+  function DemoPlayer() {}
+  DemoPlayer.prototype.start = function () { return Promise.resolve(this); };
+  DemoPlayer.prototype.feed = function () {};
+  DemoPlayer.prototype.stop = function () {};
+  function DemoCapture() {}
+  DemoCapture.prototype.start = function () { return Promise.resolve(this); };
+  DemoCapture.prototype.stop = function () {};
+  function demoMic() {
+    return Promise.resolve({ getTracks: function () { return []; } });
+  }
+
+  var state = {
+    session: null,            // /api/v2/device body
+    lines: [],
+    defaultLineId: '',
+    threadLinePrefs: {},      // threadKey -> lineId (UI preference, localStorage OK)
+    peers: [],                // history peers for suggestions (no contacts access)
+    threads: [],
+    openThreadKey: null,
+    call: null,               // active call controller
+    events: null,
+    dialNumber: '',
+    smsEditing: false,
+    smsSelected: {},          // stable thread key -> true
+    smsBusy: false,
+    contacts: [],             // principal-scoped address book (gateway)
+    contactsHasMore: false,   // honest truncation flag for the list page
+    contactsQuery: '',
+    contactsPreview: null,    // pending vCard text while previewing an import
+    contactsAccess: null,     // last list error (for the empty-state hint)
+  };
+
+  try { state.threadLinePrefs = JSON.parse(localStorage.getItem('cr_thread_lines') || '{}'); } catch (e) { /* ignore */ }
+  function saveLinePrefs() {
+    try { localStorage.setItem('cr_thread_lines', JSON.stringify(state.threadLinePrefs)); } catch (e) { /* ignore */ }
+  }
+
+  function toast(text) {
+    var node = $('toast');
+    node.textContent = text;
+    node.classList.remove('hidden');
+    clearTimeout(toast.timer);
+    toast.timer = setTimeout(function () { node.classList.add('hidden'); }, 3200);
+  }
+
+  /* Native-style destructive confirmation (no browser confirm() so the
+   * wording and destructive role match the in-app pattern). */
+  function confirmDialog(title, message, confirmLabel, onConfirm) {
+    var backdrop = el('div', 'confirm-backdrop');
+    var card = el('div', 'confirm-card');
+    card.appendChild(el('strong', null, title));
+    card.appendChild(el('p', null, message));
+    var actions = el('div', 'actions');
+    var cancel = el('button', null, '取消');
+    cancel.type = 'button';
+    cancel.addEventListener('click', function () { document.body.removeChild(backdrop); });
+    var confirm = el('button', 'danger', confirmLabel || '确认');
+    confirm.type = 'button';
+    confirm.addEventListener('click', function () {
+      document.body.removeChild(backdrop);
+      onConfirm();
+    });
+    actions.appendChild(cancel);
+    actions.appendChild(confirm);
+    card.appendChild(actions);
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+  }
+
+  /* ---------------- boot ---------------- */
+
+  function boot() {
+    wirePairing();
+    wireTabs();
+    wireDialer();
+    wireMessages();
+    wireContacts();
+    // Fixture-only: force the pairing screen so the no-App primary flow is
+    // reviewable in the preview (the fixture otherwise auto-enters main).
+    if (FIXTURE && params.get('pair') === '1') {
+      $('pair-view').classList.remove('hidden');
+      return;
+    }
+    S.current().then(function (session) {
+      if (session) { enterMain(session); }
+      else { $('pair-view').classList.remove('hidden'); }
+    }).catch(function () {
+      $('pair-view').classList.remove('hidden');
+      toast('无法连接网关');
+    });
+  }
+
+  function wirePairing() {
+    $('bind-form').addEventListener('submit', function (event) {
+      event.preventDefault();
+      var code = $('bind-code').value.trim();
+      if (!code) { return; }
+      S.bind(code).then(function (scope) {
+        if (scope !== 'client') {
+          showPairError('此绑定码仅开启通知。请在 App 中选择“浏览器客户端”绑定码以使用拨打/短信。');
+        }
+        return S.current();
+      }).then(function (session) {
+        if (session) { enterMain(session); }
+      }).catch(function (err) {
+        showPairError(err.message || '绑定失败');
+      });
+    });
+    $('enroll-btn').addEventListener('click', function () {
+      S.enrollStandalone($('enroll-key').value, $('enroll-name').value).then(function () {
+        return S.current();
+      }).then(function (session) {
+        if (session) { enterMain(session); }
+      }).catch(function (err) {
+        showPairError(err.message || '配对失败');
+      });
+    });
+  }
+
+  function showPairError(message) {
+    var node = $('pair-error');
+    node.textContent = message;
+    node.classList.remove('hidden');
+  }
+
+  function enterMain(session) {
+    state.session = session;
+    $('pair-view').classList.add('hidden');
+    $('main-view').classList.remove('hidden');
+    refreshLines().then(function () {
+      refreshPeers();
+      refreshContacts();
+      connectEvents();
+      return refreshThreads();
+    }).then(function () {
+      // Fixture-only review hook: deep-link straight into a conversation.
+      if (FIXTURE && params.get('autopen') === 'thread' && state.threads.length) {
+        showTab('messages');
+        var t = state.threads[0];
+        if (t) { openThread(t.key, t.peer); }
+      }
+      // Fixture-only review hook: open a specific tab (used by the rendered
+      // headless check to capture the contacts preview surface).
+      if (FIXTURE && params.get('autotab')) {
+        showTab(params.get('autotab'));
+      }
+    });
+    // 通知点击/前台打开直达通话：?call=<gatewayCallId>
+    var params = new URLSearchParams(location.search);
+    var callId = params.get('call');
+    if (callId) {
+      history.replaceState(null, '', FIXTURE ? location.pathname + '?fixture=1' : location.pathname);
+      openCallScreen(callId, { incoming: true });
+    }
+  }
+
+  function refreshLines() {
+    return S.api('/api/v2/device').then(function (body) {
+      state.session = body;
+      // Build-49: scope denoise preferences to THIS enrolled device (hash
+      // of the id only; the raw id never enters the storage key).
+      if (window.CallRelayDenoise && body && body.device && body.device.id) {
+        window.CallRelayDenoise.setScope(body.device.id);
+      }
+      state.defaultLineId = body.device.defaultLineId || '';
+      state.lines = (body.lines || []).filter(function (l) { return l.enabled; });
+      fillLinePicker($('line-picker'), preferredLine(''), state.lines);
+      fillLinePicker($('compose-from'), null, state.lines.filter(function (l) { return l.permissions.sendSms; }));
+      return state.lines;
+    }).catch(function (err) {
+      if (err.status === 401) {
+        // Session revoked: drop the dead enrollment's denoise scope before
+        // reloading into the pairing flow.
+        if (window.CallRelayDenoise) { window.CallRelayDenoise.clear(); }
+        location.reload();
+      }
+    });
+  }
+
+  function fillLinePicker(select, selected, lines) {
+    select.textContent = '';
+    lines.forEach(function (line) {
+      var opt = el('option');
+      opt.value = line.id;
+      opt.textContent = line.name + (line.phoneNumber ? ' · ' + line.phoneNumber : '');
+      select.appendChild(opt);
+    });
+    if (selected) { select.value = selected; }
+  }
+
+  function smsLines() {
+    return state.lines.filter(function (l) { return l.permissions.sendSms; });
+  }
+
+  /* Default line for a context, in order: the explicit authorized
+   * conversation preference, the EXISTING thread's own line (thread.lineId
+   * or the prefix of its validated canonical `lineId:peer` key — so a line2
+   * conversation with no saved preference never composes from the global
+   * line1), then the authorized global default / first permitted line.
+   * Every candidate is checked against the currently permitted lines, so an
+   * unavailable or unauthorized SIM is never silently selected. New-compose
+   * passes no thread and therefore keeps the global-default behaviour. */
+  function preferredLine(threadKey, permitted, threadView) {
+    var thread = threadView || (threadKey ? { key: threadKey } : null);
+    return TL.preferredLine({
+      pref: state.threadLinePrefs[threadKey] || '',
+      thread: thread,
+      globalDefault: state.defaultLineId,
+      permitted: permitted || state.lines,
+    });
+  }
+
+  /* ---------------- events (foreground only) ---------------- */
+
+  function connectEvents() {
+    if (state.events) { state.events.close(); state.events = null; }
+    var scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+    var ws = new WebSocket(scheme + '://' + location.host + '/api/v2/events');
+    state.events = ws;
+    ws.onopen = function () {
+      $('conn-dot').className = 'on';
+      checkRingingSnapshot();
+    };
+    ws.onclose = function () {
+      $('conn-dot').className = 'busy';
+      setTimeout(connectEvents, 4000);
+    };
+    ws.onmessage = function (event) {
+      var msg;
+      try { msg = JSON.parse(event.data); } catch (e) { return; }
+      handleEvent(msg);
+    };
+  }
+
+  function handleEvent(msg) {
+    var type = msg.type || '';
+    if (type.indexOf('message') === 0) {
+      refreshThreads();
+      if (state.openThreadKey) { refreshThread(state.openThreadKey); }
+      return;
+    }
+    if (type.indexOf('call.') === 0) {
+      if (state.call) {
+        state.call.onEvent(msg);
+        return;
+      }
+      var incoming = window.CallRelayCallEvents.parseIncomingCallEvent(
+        msg, state.call ? state.call.callId : null);
+      if (incoming) { openCallScreen(incoming.id, { incoming: true, peer: incoming.peer }); }
+    }
+  }
+
+  /* Authorized ringing snapshot on boot/reconnect: the events stream is
+   * permission-filtered server-side; a cold foreground reload still needs
+   * to surface an already-ringing call. */
+  function checkRingingSnapshot() {
+    if (state.call) { return Promise.resolve(); }
+    return S.api('/api/v2/calls').then(function (body) {
+      if (state.call) { return; }
+      var calls = body.calls || body || [];
+      var ringing = calls.filter(function (c) {
+        // Gateway states are snake_case (`incoming_ringing`); camelCase is
+        // kept for older fixtures.
+        return (c.state === 'incomingRinging' || c.state === 'incoming_ringing') && c.direction === 'inbound';
+      })[0];
+      if (ringing) {
+        openCallScreen(ringing.id, { incoming: true, peer: ringing.peer || '' });
+      }
+    }).catch(function () { /* transient */ });
+  }
+
+  /* ---------------- dialer ---------------- */
+
+  var KEYS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#'];
+
+  function wireDialer() {
+    var pad = $('keypad');
+    var SUBS = { '2': 'ABC', '3': 'DEF', '4': 'GHI', '5': 'JKL', '6': 'MNO', '7': 'PQRS', '8': 'TUV', '9': 'WXYZ', '0': '+' };
+    KEYS.forEach(function (key) {
+      var btn = el('button', 'key');
+      btn.appendChild(el('span', 'key-num', key));
+      if (SUBS[key]) { btn.appendChild(el('span', 'key-sub', SUBS[key])); }
+      btn.setAttribute('aria-label', key === '*' ? '星号' : key === '#' ? '井号' : key);
+      btn.addEventListener('click', function () { dialAppend(key); });
+      if (key === '0') {
+        btn.addEventListener('contextmenu', function (event) {
+          event.preventDefault();
+          dialAppend('+');
+        });
+      }
+      pad.appendChild(btn);
+    });
+    $('dial-delete').addEventListener('click', function () {
+      state.dialNumber = state.dialNumber.slice(0, -1);
+      renderDial();
+    });
+    $('dial-call').addEventListener('click', function () {
+      var to = state.dialNumber.trim();
+      if (!to) { return; }
+      startCall(to, preferredLine(''));
+    });
+  }
+
+  function dialAppend(key) {
+    if (state.dialNumber.length < 32) {
+      state.dialNumber += key;
+      renderDial();
+    }
+  }
+
+  function renderDial() {
+    $('dial-display').textContent = state.dialNumber || ' ';
+    $('dial-call').disabled = !state.dialNumber.trim();
+    renderSuggestions($('dial-suggestions'), state.dialNumber, function (peer) {
+      state.dialNumber = peer;
+      renderDial();
+    });
+  }
+
+  /* Suggestions come from the principal-scoped gateway contacts (name,
+   * number and the pinyin/T9 search key synced from the phone) plus local
+   * history peers. Exact number self-dismisses. */
+  function renderSuggestions(container, query, onPick) {
+    var matches = [];
+    var seen = {};
+    function add(peer, name, isNameMatch) {
+      if (!peer || seen[peer] || matches.length >= 4) { return; }
+      seen[peer] = true;
+      matches.push({ peer: peer, name: name || peer, isNameMatch: Boolean(isNameMatch) });
+    }
+    if (CL) {
+      CL.suggestions(state.contacts, query, 6).forEach(function (hit) {
+        add(hit.phone, hit.name, hit.isNameMatch);
+      });
+    }
+    var q = query.replace(/\D/g, '');
+    if (q) {
+      state.peers.forEach(function (peer) {
+        var digits = peer.replace(/\D/g, '');
+        if (digits.indexOf(q) >= 0 && digits !== q) {
+          add(peer, peerName(peer) || peer, false);
+        }
+      });
+    }
+    container.textContent = '';
+    if (!matches.length) { container.classList.add('hidden'); return; }
+    matches.forEach(function (match) {
+      var btn = el('button', 'suggestion');
+      var avatar = el('span', 'avatar', (match.name || '?').charAt(0));
+      var body = el('span');
+      body.appendChild(el('div', 's-name', match.name));
+      body.appendChild(el('div', 's-phone', match.peer));
+      btn.appendChild(avatar);
+      btn.appendChild(body);
+      btn.addEventListener('click', function () { onPick(match.peer); });
+      container.appendChild(btn);
+    });
+    container.classList.remove('hidden');
+  }
+
+  function refreshPeers() {
+    return Promise.all([
+      S.api('/api/v2/threads').catch(function () { return []; }),
+      S.api('/api/v2/calls?limit=50').catch(function () { return []; }),
+    ]).then(function (results) {
+      var set = {};
+      results[0].forEach(function (t) { set[t.peer] = true; });
+      (results[1].calls || results[1] || []).forEach(function (c) { set[c.peer] = true; });
+      state.peers = Object.keys(set);
+    });
+  }
+
+  function peerName(peer) {
+    if (CL) {
+      var contact = CL.contactForPhone(state.contacts, peer);
+      if (contact) { return CL.displayName(contact); }
+    }
+    var thread = state.threads.filter(function (t) { return t.peer === peer; })[0];
+    return thread ? thread.displayName || peer : null;
+  }
+
+  /* ---------------- SMS ---------------- */
+
+  function wireMessages() {
+    $('line-picker').addEventListener('change', function () {
+      var lineId = $('line-picker').value;
+      state.defaultLineId = lineId;
+      refreshThreads();
+      // Persist the default line to THIS device on the gateway (the same
+      // authorized endpoint the native app uses), so other clients and a
+      // later session see the same default. A failure is reported and the
+      // local selection stays for this session.
+      var deviceId = state.session && state.session.device && state.session.device.id;
+      if (!deviceId || !lineId) { return; }
+      S.api('/api/v2/devices/' + encodeURIComponent(deviceId) + '/preferences', {
+        method: 'PUT',
+        body: { defaultLineId: lineId },
+      }).then(function () {
+        toast('默认线路已保存');
+      }).catch(function (err) {
+        toast('默认线路保存失败：' + (err.message || '请重试'));
+      });
+    });
+    $('thread-back').addEventListener('click', function () {
+      state.openThreadKey = null;
+      $('thread-view').classList.add('hidden');
+      $('thread-list').classList.remove('hidden');
+      $('tabbar').classList.remove('hidden');
+      $('topbar').classList.remove('hidden');
+    });
+    $('thread-call').addEventListener('click', function () {
+      var thread = currentThread();
+      if (thread) {
+        startCall(thread.peer, preferredLine(thread.key, state.lines, thread));
+      }
+    });
+    $('composer-input').addEventListener('input', renderSendReady);
+    $('composer-send').addEventListener('click', sendFromComposer);
+    $('compose-cancel').addEventListener('click', closeCompose);
+    $('compose-to').addEventListener('input', function () {
+      renderSuggestions($('compose-suggestions'), $('compose-to').value, function (peer) {
+        $('compose-to').value = peer;
+        $('compose-suggestions').classList.add('hidden');
+      });
+    });
+    $('compose-send').addEventListener('click', sendFromCompose);
+    $('compose-body').addEventListener('input', function () {
+      $('compose-send').style.color = $('compose-body').value.trim() && $('compose-to').value.trim() ? 'var(--accent)' : 'var(--muted)';
+    });
+    var newBtn = el('button', 'tabbtn', '＋');
+    newBtn.setAttribute('aria-label', '新建短信');
+    newBtn.style.flex = '0 0 64px';
+    newBtn.addEventListener('click', openCompose);
+    $('tabbar').appendChild(newBtn);
+
+    // SMS management: native Edit mode (multi-select / select-all / bulk
+    // mark-read / bulk delete) plus the explicit per-conversation menu.
+    $('messages-edit').addEventListener('click', function () {
+      setSmsEditing(!state.smsEditing);
+    });
+    $('messages-select-all').addEventListener('click', toggleSelectAll);
+    $('sms-mark-read').addEventListener('click', function () {
+      confirmDialog('标记为已读？', '将选中的 ' + selectedKeys().length + ' 个对话标记为已读。',
+        '标记已读', function () { bulkMarkRead(); });
+    });
+    $('sms-delete').addEventListener('click', function () {
+      confirmDialog('删除选中的 ' + selectedKeys().length + ' 个对话？',
+        '删除后所有绑定设备将不再显示这些对话历史。', '删除对话', function () { bulkDelete(); });
+    });
+    $('thread-menu').addEventListener('click', function () {
+      var thread = currentThread();
+      if (!thread) { return; }
+      confirmDialog('删除与 ' + (thread.displayName || thread.peer) + ' 的对话？',
+        '删除后所有绑定设备将不再显示这段对话历史。', '删除对话', function () {
+          deleteThreads([thread.key]);
+        });
+    });
+  }
+
+  /* ---------------- SMS edit mode ---------------- */
+
+  function selectedKeys() {
+    return state.threads.map(function (t) { return t.key; })
+      .filter(function (key) { return state.smsSelected[key]; });
+  }
+
+  function setSmsEditing(on) {
+    state.smsEditing = Boolean(on);
+    if (!state.smsEditing) { state.smsSelected = {}; }
+    $('messages-edit').textContent = state.smsEditing ? '完成' : '编辑';
+    $('messages-select-all').classList.toggle('hidden', !state.smsEditing);
+    $('sms-editbar').classList.toggle('hidden', !state.smsEditing);
+    renderThreadList();
+  }
+
+  function toggleSelectAll() {
+    var keys = state.threads.map(function (t) { return t.key; });
+    var all = keys.length > 0 && keys.every(function (k) { return state.smsSelected[k]; });
+    state.smsSelected = {};
+    if (!all) { keys.forEach(function (k) { state.smsSelected[k] = true; }); }
+    $('messages-select-all').textContent = all ? '全选' : '取消全选';
+    renderThreadList();
+  }
+
+  function updateEditBar() {
+    var count = selectedKeys().length;
+    $('sms-delete').textContent = count ? ('删除 (' + count + ')') : '删除';
+    $('sms-mark-read').disabled = count === 0 || state.smsBusy;
+    $('sms-delete').disabled = count === 0 || state.smsBusy;
+  }
+
+  /* Marks one conversation's inbound unread messages read (the same
+   * per-message authorized endpoint the native app uses); the gateway
+   * broadcasts message.updated so other devices converge. */
+  function markThreadRead(key, silent) {
+    return S.api('/api/v2/messages?threadKey=' + encodeURIComponent(key) + '&limit=100')
+      .then(function (page) {
+        var unread = (page.messages || page || []).filter(function (m) {
+          return m.direction === 'inbound' && m.status !== 'read' && m.id;
+        });
+        var chain = Promise.resolve();
+        unread.forEach(function (m) {
+          chain = chain.then(function () {
+            return S.api('/api/v2/messages/' + encodeURIComponent(m.id) + '/read',
+              { method: 'POST' })
+              .catch(function (err) {
+                if (!silent) { throw err; }
+              });
+          });
+        });
+        return chain.then(function () { return unread.length; });
+      });
+  }
+
+  function bulkMarkRead() {
+    if (state.smsBusy) { return; }
+    var keys = selectedKeys();
+    if (!keys.length) { return; }
+    state.smsBusy = true;
+    updateEditBar();
+    var ok = 0;
+    var failed = 0;
+    var chain = Promise.resolve();
+    keys.forEach(function (key) {
+      chain = chain.then(function () {
+        return markThreadRead(key).then(function () { ok += 1; })
+          .catch(function () { failed += 1; });
+      });
+    });
+    chain.then(function () {
+      state.smsBusy = false;
+      state.smsSelected = {};
+      setSmsEditing(false);
+      return refreshThreads();
+    }).then(function () {
+      if (failed) {
+        toast('已标记 ' + ok + ' 个对话，' + failed + ' 个失败，请重试。');
+      } else {
+        toast('已将 ' + ok + ' 个对话标记为已读。');
+      }
+    });
+  }
+
+  function deleteThreads(keys) {
+    if (state.smsBusy || !keys.length) { return; }
+    state.smsBusy = true;
+    updateEditBar();
+    var ok = 0;
+    var failed = 0;
+    var chain = Promise.resolve();
+    keys.forEach(function (key) {
+      chain = chain.then(function () {
+        return S.api('/api/v2/threads/' + encodeURIComponent(key), { method: 'DELETE' })
+          .then(function () {
+            ok += 1;
+            // Remove only AFTER the gateway accepted the tombstone.
+            state.threads = state.threads.filter(function (t) { return t.key !== key; });
+            delete state.smsSelected[key];
+            if (state.openThreadKey === key) {
+              state.openThreadKey = null;
+              $('thread-view').classList.add('hidden');
+              $('thread-list').classList.remove('hidden');
+              $('tabbar').classList.remove('hidden');
+              $('topbar').classList.remove('hidden');
+            }
+          })
+          .catch(function () { failed += 1; });
+      });
+    });
+    chain.then(function () {
+      state.smsBusy = false;
+      renderThreadList();
+      updateEditBar();
+      if (!failed) { setSmsEditing(false); }
+      return refreshThreads();
+    }).then(function () {
+      if (failed) {
+        toast(ok ? ('已删除 ' + ok + ' 个对话，' + failed + ' 个删除失败，请重试。')
+                 : '删除失败，请检查网络后重试。');
+      } else {
+        toast('已删除 ' + ok + ' 个对话。');
+      }
+    });
+  }
+
+  function renderSendReady() {
+    var ready = $('composer-input').value.trim().length > 0;
+    $('composer-send').classList.toggle('ready', ready);
+  }
+
+  function currentThread() {
+    return state.threads.filter(function (t) { return t.key === state.openThreadKey; })[0] || null;
+  }
+
+  function refreshThreads() {
+    return S.api('/api/v2/threads').then(function (threads) {
+      state.threads = threads || [];
+      renderThreadList();
+      refreshPeers();
+    }).catch(function () { /* transient */ });
+  }
+
+  function renderThreadList() {
+    var list = $('thread-list');
+    list.textContent = '';
+    // Selection uses stable thread keys; a refresh/arrival race can only
+    // drop keys that are no longer visible, never shift an action.
+    var visible = {};
+    state.threads.forEach(function (t) { visible[t.key] = true; });
+    Object.keys(state.smsSelected).forEach(function (key) {
+      if (!visible[key]) { delete state.smsSelected[key]; }
+    });
+    updateEditBar();
+    if (!state.threads.length) {
+      list.appendChild(el('p', 'muted', '暂无短信。点右下角 ＋ 新建。')).style.padding = '20px';
+      return;
+    }
+    state.threads.forEach(function (thread) {
+      var selected = Boolean(state.smsEditing && state.smsSelected[thread.key]);
+      var btn = el('button', 'thread-row' + (selected ? ' selected' : ''));
+      if (state.smsEditing) {
+        btn.appendChild(el('span', 'thread-check', selected ? '✓' : ''));
+      } else {
+        btn.appendChild(el('span', 'avatar', (thread.displayName || thread.peer).charAt(0)));
+      }
+      var body = el('span', 't-body');
+      var name = el('div', 't-name', thread.displayName || thread.peer);
+      var last = thread.lastMessage || {};
+      var preview = (last.direction === 'outbound' ? '✓ ' : '') + (last.body || '');
+      body.appendChild(name);
+      body.appendChild(el('div', 't-preview', preview));
+      btn.appendChild(body);
+      btn.appendChild(el('span', 't-time', formatTime(last.createdAt)));
+      if (thread.unreadCount > 0) {
+        btn.appendChild(el('span', 't-unread', String(Math.min(thread.unreadCount, 99))));
+      }
+      btn.addEventListener('click', function () {
+        if (state.smsEditing) {
+          if (state.smsSelected[thread.key]) { delete state.smsSelected[thread.key]; }
+          else { state.smsSelected[thread.key] = true; }
+          renderThreadList();
+          return;
+        }
+        openThread(thread.key, thread.peer);
+      });
+      list.appendChild(btn);
+    });
+  }
+
+  function openThread(key, peer) {
+    state.openThreadKey = key;
+    $('thread-list').classList.add('hidden');
+    $('compose-view').classList.add('hidden');
+    $('thread-view').classList.remove('hidden');
+    // Conversation hides the global tab bar + global line picker (native
+    // Messages convention); the line lives in this header instead.
+    $('tabbar').classList.add('hidden');
+    $('topbar').classList.add('hidden');
+    var threadView = state.threads.filter(function (t) { return t.key === key; })[0] || null;
+    fillLinePicker($('thread-line'),
+      preferredLine(key, smsLines(), threadView), smsLines());
+    // A manual pick is a CONVERSATION preference: it survives the canonical
+    // re-open after a cross-line send, so the next message keeps this line.
+    $('thread-line').onchange = function () {
+      state.threadLinePrefs[key] = $('thread-line').value;
+      saveLinePrefs();
+    };
+    $('thread-name').textContent = peerName(peer) || peer;
+    $('thread-avatar').textContent = (peerName(peer) || peer).charAt(0);
+    // Opening a conversation marks its inbound unread messages read, exactly
+    // like the native app (per-message authorized endpoint; failures stay
+    // unread and silent so the badge remains honest).
+    refreshThread(key).then(function () {
+      return markThreadRead(key, true);
+    }).then(function () {
+      return refreshThreads();
+    });
+  }
+
+  function refreshThread(key) {
+    return S.api('/api/v2/messages?threadKey=' + encodeURIComponent(key) + '&limit=100')
+      .then(function (page) {
+        renderMessages(page.messages || page || []);
+      }).catch(function () { /* keep existing rows */ });
+  }
+
+  function renderMessages(messages) {
+    var box = $('thread-messages');
+    box.textContent = '';
+    var lastDate = '';
+    (messages || []).forEach(function (msg) {
+      var date = new Date(msg.createdAt);
+      var day = date.toLocaleDateString();
+      if (day !== lastDate) {
+        box.appendChild(el('div', 'date-sep',
+          date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })));
+        lastDate = day;
+      }
+      var wrap = el('div', 'msg ' + (msg.direction === 'outbound' ? 'out' : 'in'));
+      var stack = el('div', 'stack');
+      var bubble = el('div', 'bubble', msg.body);
+      stack.appendChild(bubble);
+      if (msg.direction === 'outbound') {
+        var status = el('span', 'status ' + (msg.status === 'failed' ? 'failed' : ''),
+          statusText(msg.status));
+        stack.appendChild(status);
+        if (msg.status === 'failed') {
+          var retry = el('button', 'retry', '重试');
+          retry.addEventListener('click', function () { resendFailed(msg); });
+          stack.appendChild(retry);
+        }
+      }
+      wrap.appendChild(stack);
+      box.appendChild(wrap);
+    });
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function statusText(status) {
+    switch (status) {
+      case 'queued': return '排队中…';
+      case 'submitted': return '已提交';
+      case 'sent': return '已发送';
+      case 'failed': return '发送失败';
+      case 'read': return '已读';
+      default: return '';
+    }
+  }
+
+  var composerInFlight = false;
+  function sendFromComposer() {
+    var thread = currentThread();
+    if (!thread || composerInFlight) { return; }
+    var body = $('composer-input').value.trim();
+    if (!body) { return; }
+    // Capture the HEADER picker's actual value (a cross-line switch changes
+    // only this select, not state.defaultLineId).
+    var lineId = TL.chosenLine($('thread-line').value,
+      preferredLine(thread.key, smsLines(), thread));
+    composerInFlight = true;
+    $('composer-send').disabled = true;
+    postMessage(thread.peer, body, lineId).then(function (record) {
+      $('composer-input').value = '';
+      renderSendReady();
+      // The message lands on the selected line's canonical thread (the
+      // returned MessageView.threadKey is authoritative). Carry the chosen
+      // line to BOTH keys so the reopened conversation defaults to ITS OWN
+      // line — not the global default — and the next send stays on it.
+      var canonical = TL.canonicalKey(record, lineId, thread.peer);
+      TL.carryPreference(state.threadLinePrefs, thread.key, canonical, lineId);
+      saveLinePrefs();
+      if (canonical !== state.openThreadKey) {
+        return refreshThreads().then(function () { openThread(canonical, thread.peer); });
+      }
+      // Same key: re-sync the picker from the persisted preference too.
+      fillLinePicker($('thread-line'), lineId,
+        state.lines.filter(function (l) { return l.permissions.sendSms; }));
+      return refreshThread(canonical);
+    }).catch(function (err) {
+      toast(err.message || '发送失败');
+    }).then(function () {
+      composerInFlight = false;
+      $('composer-send').disabled = false;
+    });
+  }
+
+  function sendFromCompose() {
+    var to = $('compose-to').value.trim();
+    var body = $('compose-body').value.trim();
+    if (!to || !body) { return; }
+    var lineId = TL.chosenLine($('compose-from').value, preferredLine(to));
+    postMessage(to, body, lineId).then(function (record) {
+      closeCompose();
+      // Follow the returned canonical thread and persist the chosen line
+      // under ITS key so the header picker does not snap to the default.
+      var canonical = TL.canonicalKey(record, lineId, to);
+      TL.carryPreference(state.threadLinePrefs, canonical, canonical, lineId);
+      saveLinePrefs();
+      refreshThreads().then(function () { openThread(canonical, to); });
+    }).catch(function (err) {
+      toast(err.message || '发送失败');
+    });
+  }
+
+  function postMessage(to, body, lineId) {
+    return S.api('/api/v2/messages', {
+      method: 'POST',
+      headers: { 'Idempotency-Key': 'web-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10) },
+      body: { to: to, body: body, lineId: lineId || undefined },
+    });
+  }
+
+  function resendFailed(msg) {
+    // Retry the message's ORIGINAL line (MessageView.lineId); only records
+    // without provenance fall back to the conversation preference (which
+    // itself prefers the thread's own line over the global default).
+    var lineId = TL.retryLine(msg, preferredLine(msg.threadKey, smsLines()));
+    postMessage(msg.peer, msg.body, lineId).then(function () {
+      refreshThread(msg.threadKey);
+    }).catch(function (err) {
+      toast(err.message || '重试失败');
+    });
+  }
+
+  function openCompose() {
+    $('thread-list').classList.add('hidden');
+    $('thread-view').classList.add('hidden');
+    $('compose-view').classList.remove('hidden');
+    $('tabbar').classList.add('hidden');
+    $('topbar').classList.add('hidden');
+    fillLinePicker($('compose-from'), preferredLine(''), state.lines.filter(function (l) { return l.permissions.sendSms; }));
+    $('compose-to').focus();
+  }
+
+  function closeCompose() {
+    $('compose-view').classList.add('hidden');
+    $('thread-list').classList.remove('hidden');
+    $('tabbar').classList.remove('hidden');
+    $('topbar').classList.remove('hidden');
+  }
+
+  /* ---------------- contacts ---------------- */
+
+  function wireContacts() {
+    var searchTimer = null;
+    $('contacts-search').addEventListener('input', function () {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(function () {
+        state.contactsQuery = $('contacts-search').value.trim();
+        refreshContacts();
+      }, 250);
+    });
+    $('contacts-import').addEventListener('click', function () { $('contacts-file').click(); });
+    $('contacts-file').addEventListener('change', handleContactsFile);
+    $('contacts-export').addEventListener('click', exportContacts);
+    $('contacts-preview-cancel').addEventListener('click', hideContactsPreview);
+    $('contacts-preview-commit').addEventListener('click', commitContactsImport);
+  }
+
+  function refreshContacts() {
+    var path = '/api/v2/contacts?limit=1000';
+    if (state.contactsQuery) { path += '&query=' + encodeURIComponent(state.contactsQuery); }
+    return S.api(path).then(function (body) {
+      state.contacts = body.contacts || [];
+      state.contactsHasMore = Boolean(body.hasMore);
+      state.contactsAccess = null;
+      renderContacts();
+    }).catch(function (err) {
+      state.contactsAccess = err.status || -1;
+      renderContacts();
+    });
+  }
+
+  function renderContacts() {
+    var list = $('contacts-list');
+    var note = $('contacts-note');
+    list.textContent = '';
+    if (state.contactsAccess) {
+      list.appendChild(el('p', 'muted contacts-empty', state.contactsAccess === 401
+        ? '登录状态已失效，请重新打开页面。'
+        : '通讯录暂时无法加载，请稍后重试。')).style.padding = '20px';
+      note.classList.add('hidden');
+      return;
+    }
+    if (!state.contacts.length) {
+      list.appendChild(el('p', 'muted contacts-empty', state.contactsQuery
+        ? '没有匹配的联系人。'
+        : '暂无联系人。可导入 .vcf 文件，或在手机 App 中同步系统通讯录。')).style.padding = '20px';
+    }
+    state.contacts.forEach(function (contact) {
+      list.appendChild(contactRow(contact));
+    });
+    if (state.contactsHasMore) {
+      note.textContent = '联系人较多，仅显示前 1000 位；可用搜索查找其余联系人。';
+      note.classList.remove('hidden');
+    } else {
+      note.classList.add('hidden');
+    }
+  }
+
+  function contactRow(contact) {
+    var row = el('div', 'contact-row');
+    row.appendChild(el('span', 'avatar', (CL.displayName(contact) || '?').charAt(0)));
+    var body = el('span', 'c-body');
+    body.appendChild(el('div', 'c-name', CL.displayName(contact)));
+    var phones = CL.phoneValues(contact);
+    body.appendChild(el('div', 'c-phone muted', phones.length ? phones[0] : '无号码'));
+    if (contact.source === 'sync') {
+      body.appendChild(el('div', 'c-source', '手机同步'));
+    }
+    row.appendChild(body);
+    var actions = el('span', 'c-actions');
+    if (phones.length) {
+      var call = el('button', null, '呼叫');
+      call.type = 'button';
+      call.addEventListener('click', function () { startCall(phones[0], preferredLine('')); });
+      actions.appendChild(call);
+      var sms = el('button', null, '短信');
+      sms.type = 'button';
+      sms.addEventListener('click', function () { openComposeFor(phones[0]); });
+      actions.appendChild(sms);
+    }
+    var edit = el('button', null, '编辑');
+    edit.type = 'button';
+    edit.addEventListener('click', function () { openContactEditor(contact); });
+    actions.appendChild(edit);
+    var remove = el('button', 'danger', '删除');
+    remove.type = 'button';
+    remove.addEventListener('click', function () {
+      confirmDialog('删除联系人', '将从网关通讯录中删除「' + CL.displayName(contact) + '」，手机系统通讯录不受影响。', '删除', function () {
+        S.api('/api/v2/contacts/' + encodeURIComponent(contact.id), { method: 'DELETE' }).then(function () {
+          toast('已删除');
+          refreshContacts();
+        }).catch(function (err) { toast(err.message || '删除失败'); });
+      });
+    });
+    actions.appendChild(remove);
+    row.appendChild(actions);
+    return row;
+  }
+
+  function openComposeFor(phone) {
+    showTab('messages');
+    openCompose();
+    $('compose-to').value = phone;
+  }
+
+  function openContactEditor(contact) {
+    var backdrop = el('div', 'confirm-backdrop');
+    var card = el('div', 'confirm-card');
+    card.appendChild(el('strong', null, '编辑联系人'));
+    var nameInput = el('input');
+    nameInput.value = contact.displayName || '';
+    nameInput.placeholder = '姓名';
+    var phoneInput = el('input');
+    var phones = CL.phoneValues(contact);
+    phoneInput.value = phones.length ? phones[0] : '';
+    phoneInput.placeholder = '号码';
+    phoneInput.inputMode = 'tel';
+    card.appendChild(nameInput);
+    card.appendChild(phoneInput);
+    var error = el('p', 'error hidden');
+    card.appendChild(error);
+    var actions = el('div', 'actions');
+    var cancel = el('button', null, '取消');
+    cancel.type = 'button';
+    cancel.addEventListener('click', function () { document.body.removeChild(backdrop); });
+    var save = el('button', 'primary', '保存');
+    save.type = 'button';
+    save.addEventListener('click', function () {
+      var updated = {
+        displayName: nameInput.value.trim(),
+      };
+      var remaining = (contact.phones || []).slice(1);
+      if (phoneInput.value.trim()) {
+        updated.phones = [{ label: (contact.phones && contact.phones[0] && contact.phones[0].label) || 'CELL', value: phoneInput.value.trim() }];
+        remaining.forEach(function (phone) { updated.phones.push(phone); });
+      } else {
+        updated.phones = remaining;
+      }
+      S.api('/api/v2/contacts/' + encodeURIComponent(contact.id), { method: 'PUT', body: updated }).then(function () {
+        document.body.removeChild(backdrop);
+        toast('已保存');
+        refreshContacts();
+      }).catch(function (err) {
+        error.textContent = err.message || '保存失败';
+        error.classList.remove('hidden');
+      });
+    });
+    actions.appendChild(cancel);
+    actions.appendChild(save);
+    card.appendChild(actions);
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+  }
+
+  function handleContactsFile() {
+    var input = $('contacts-file');
+    var file = input.files && input.files[0];
+    input.value = '';
+    if (!file) { return; }
+    if (file.size > 512 * 1024) {
+      toast('文件过大：vCard 最大 512 KB');
+      return;
+    }
+    var reader = new FileReader();
+    reader.onload = function () { previewContactsImport(String(reader.result || '')); };
+    reader.onerror = function () { toast('读取文件失败'); };
+    reader.readAsText(file, 'utf-8');
+  }
+
+  function previewContactsImport(text) {
+    if (!text.trim()) { toast('文件内容为空'); return; }
+    S.api('/api/v2/contacts/import', { method: 'POST', body: { vcard: text, preview: true } }).then(function (result) {
+      state.contactsPreview = text;
+      $('contacts-preview-title').textContent = '导入预览';
+      var summary = CL.importSummary(result);
+      if (result.warnings && result.warnings.length) {
+        summary += '（' + result.warnings.slice(0, 2).join('；') + (result.warnings.length > 2 ? '…' : '') + '）';
+      }
+      $('contacts-preview-summary').textContent = summary;
+      var list = $('contacts-preview-list');
+      list.textContent = '';
+      (result.entries || []).slice(0, 200).forEach(function (entry) {
+        var row = el('div', 'preview-row');
+        row.appendChild(el('span', 'preview-text', CL.entryText(entry)));
+        if (entry.changes && entry.changes.length) {
+          row.appendChild(el('span', 'muted preview-changes', entry.changes.join('、')));
+        }
+        list.appendChild(row);
+      });
+      if ((result.entries || []).length > 200) {
+        list.appendChild(el('p', 'muted', '仅展示前 200 条，导入时会处理全部。'));
+      }
+      $('contacts-preview').classList.remove('hidden');
+    }).catch(function (err) {
+      toast(err.message || '解析失败');
+    });
+  }
+
+  function hideContactsPreview() {
+    state.contactsPreview = null;
+    $('contacts-preview').classList.add('hidden');
+  }
+
+  function commitContactsImport() {
+    if (!state.contactsPreview) { return; }
+    var text = state.contactsPreview;
+    S.api('/api/v2/contacts/import', { method: 'POST', body: { vcard: text } }).then(function (result) {
+      hideContactsPreview();
+      toast('导入完成：' + CL.importSummary(result));
+      refreshContacts();
+    }).catch(function (err) {
+      toast(err.message || '导入失败');
+    });
+  }
+
+  function exportContacts() {
+    fetch('/api/v2/contacts/export', { credentials: 'same-origin' }).then(function (resp) {
+      if (!resp.ok) { throw new Error('导出失败'); }
+      return resp.blob();
+    }).then(function (blob) {
+      var url = URL.createObjectURL(blob);
+      var link = el('a');
+      link.href = url;
+      link.download = 'callrelay-contacts.vcf';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
+    }).catch(function (err) { toast(err.message || '导出失败'); });
+  }
+
+  /* ---------------- calls ---------------- */
+
+  function startCall(to, lineId) {
+    ensureAudioSupport();
+    // Open the call screen and START gesture-phase audio preparation
+    // synchronously; the gateway call is created by CallFlow only after the
+    // microphone is ready (a denied mic must never dial). `null` callId is
+    // filled in from the dial response inside the flow.
+    openCallScreen(null, {
+      outgoing: true,
+      peer: to,
+      dial: function () {
+        var token = 'web-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+        return S.api('/api/v2/calls', {
+          method: 'POST',
+          headers: { 'Idempotency-Key': 'web-dial-' + token },
+          body: { to: to, lineId: lineId || undefined, clientCallId: token },
+        });
+      },
+    });
+  }
+
+  function ensureAudioSupport() {
+    var webrtcOK = Boolean(window.CallRelayWebRTC && window.CallRelayWebRTC.supported());
+    if (!webrtcOK && !AU.PcmuPlayer.supported()) {
+      toast('此浏览器不支持网页通话音频');
+    }
+    return webrtcOK;
+  }
+
+  /* Fixture-only engine so the WebRTC label/fallback paths are reviewable
+   * without a gateway or a real peer connection. `?media=webrtc` succeeds,
+   * `?media=fallback` fails once (the flow must then use WSS). */
+  function DemoWebRTC(failOnce) {
+    this.stream = { getTracks: function () { return []; }, getAudioTracks: function () { return []; } };
+    this.muted = false;
+    this.failOnce = Boolean(failOnce);
+  }
+  DemoWebRTC.prototype.prepare = function () { return Promise.resolve(this); };
+  DemoWebRTC.prototype.start = function () {
+    if (this.failOnce) { this.failOnce = false; return Promise.reject(new Error('fixture webrtc failure')); }
+    return Promise.resolve();
+  };
+  DemoWebRTC.prototype.setMuted = function (muted) { this.muted = Boolean(muted); };
+  DemoWebRTC.prototype.release = function () {};
+  DemoWebRTC.prototype.stop = function () {};
+
+  /* Browser-native WebRTC media factory (reuses the gateway's existing
+   * direct offer/answer path). Null when the browser lacks WebRTC — the
+   * flow then uses the WSS PCMU transport exactly as before. */
+  function makeWebRTCFactory() {
+    if (FIXTURE) {
+      var mode = params.get('media');
+      if (mode === 'webrtc') { return function () { return new DemoWebRTC(false); }; }
+      if (mode === 'fallback') { return function () { return new DemoWebRTC(true); }; }
+      return null;
+    }
+    if (!window.CallRelayWebRTC || !window.CallRelayWebRTC.supported()) { return null; }
+    return function (id) {
+      return new window.CallRelayWebRTC.WebRTCMedia({
+        api: function (method, path, body) { return S.api(path, { method: method, body: body }); },
+        callId: id,
+        getMic: function () {
+          return navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+          });
+        },
+      });
+    };
+  }
+
+  /* Call screen backed by CallFlow (ordering + teardown guarantees). */
+  var PHONE_UP = '<svg viewBox="0 0 24 24" width="30" height="30"><path fill="currentColor" d="M6.6 10.8c1.4 2.8 3.8 5.1 6.6 6.6l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C10.8 21 3 13.2 3 4c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.2.2 2.4.6 3.6.1.3 0 .7-.2 1l-2.3 2.2z"/></svg>';
+  var PHONE_DOWN = '<svg viewBox="0 0 24 24" width="30" height="30" style="transform:rotate(135deg)"><path fill="currentColor" d="M6.6 10.8c1.4 2.8 3.8 5.1 6.6 6.6l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C10.8 21 3 13.2 3 4c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.2.2 2.4.6 3.6.1.3 0 .7-.2 1l-2.3 2.2z"/></svg>';
+
+  function openCallScreen(callId, options) {
+    options = options || {};
+    var controls = $('call-controls');
+    controls.textContent = '';
+    $('call-view').classList.remove('hidden');
+    $('call-peer').textContent = options.peer || '…';
+    $('call-state').textContent = options.incoming ? '来电' : '正在呼叫…';
+    $('call-avatar').textContent = (options.peer || '?').charAt(0);
+
+    var flow = new window.CallRelayCallFlow.CallFlow({
+      callId: callId || '',
+      peer: options.peer || '',
+      incoming: Boolean(options.incoming),
+      dial: options.dial || null,
+      api: function (method, path, body) {
+        return S.api(path, { method: method, body: body });
+      },
+      makePlayer: FIXTURE ? function () { return new DemoPlayer(); }
+                          : function () { return new AU.PcmuPlayer(); },
+      makeCapture: FIXTURE ? function () { return new DemoCapture(); }
+                           : function () { return new AU.PcmuCapture(); },
+      getMic: FIXTURE ? demoMic : function () {
+        return navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+        });
+      },
+      makeWebRTC: makeWebRTCFactory(),
+      openSocket: function (id) {
+        var scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+        // Build-48: optional directional denoise policy (gateway applies it
+        // with SpeexDSP); older gateways ignore the unknown query params.
+        var query = window.CallRelayDenoise
+          ? '?' + window.CallRelayDenoise.query()
+          : '';
+        var ws = new WebSocket(scheme + '://' + location.host + '/api/v2/calls/' +
+          encodeURIComponent(id) + '/media' + query);
+        ws.binaryType = 'arraybuffer';
+        // Hot denoise state applies to every fresh media socket (the
+        // gateway also re-reads the per-device preferences server-side).
+        if (window.CallRelayDenoise) {
+          ws.addEventListener('open', function () {
+            window.CallRelayDenoise.control(ws);
+          });
+        }
+        return ws;
+      },
+      onState: renderCallView,
+    });
+    state.call = flow;
+
+    var PHASE_TEXT = {
+      ringing: '来电', dialing: '正在呼叫…', preparing: '准备音频…',
+      answering: '接听中…', connecting: '正在接通…', active: '通话中',
+      ended: '通话结束', failed: '媒体连接失败',
+    };
+
+    function renderCallView(view) {
+      if (view.peer) { $('call-peer').textContent = view.peer; }
+      var phaseText = PHASE_TEXT[view.phase] || view.phase;
+      if (view.error === 'mic-denied' || (view.error && view.error.indexOf('权限') >= 0)) {
+        phaseText = '麦克风不可用，无法接听';
+      }
+      $('call-state').textContent = phaseText;
+      controls.textContent = '';
+      if (view.phase === 'ended') {
+        setTimeout(closeCallScreen, 900);
+        return;
+      }
+      if (!view.canHangup) { return; }
+      if (view.canAccept && (view.phase === 'ringing' || view.phase === 'preparing')) {
+        var reject = el('button', 'cbtn hangup');
+        reject.innerHTML = PHONE_DOWN;
+        reject.setAttribute('aria-label', '拒绝');
+        reject.addEventListener('click', function () { flow.hangup('reject'); });
+        var accept = el('button', 'cbtn accept');
+        accept.innerHTML = PHONE_UP;
+        accept.setAttribute('aria-label', '接听');
+        accept.addEventListener('click', function () {
+          flow.accept().then(function (ok) {
+            if (!ok && state.call === flow) {
+              $('call-state').textContent = '接听未完成：请允许麦克风后重试，或拒绝';
+            }
+          });
+        });
+        controls.appendChild(reject);
+        controls.appendChild(accept);
+        return;
+      }
+      if (view.phase === 'active') {
+        var mute = el('button', 'cbtn' + (view.muted ? ' on' : ''), '');
+        mute.innerHTML = '<svg viewBox="0 0 24 24" width="24" height="24"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-3.1A7 7 0 0 0 19 11h-2z"/></svg>';
+        // Single source of truth: the flow view (re-emitted by setMuted)
+        // drives the label, so it updates immediately and can never claim a
+        // state the capture gate does not enforce.
+        mute.setAttribute('aria-label', view.muted ? '取消静音' : '静音');
+        mute.addEventListener('click', function () { flow.setMuted(!flow.muted); });
+        controls.appendChild(mute);
+      }
+      var hang = el('button', 'cbtn hangup');
+      hang.innerHTML = PHONE_DOWN;
+      hang.setAttribute('aria-label', '挂断');
+      hang.addEventListener('click', function () { flow.hangup(); });
+      controls.appendChild(hang);
+    }
+
+    function closeCallScreen() {
+      if (state.call !== flow) { return; }
+      state.call = null;
+      $('call-view').classList.add('hidden');
+      refreshThreads();
+    }
+
+    if (options.incoming) { flow.beginIncoming(); }
+    else {
+      flow.beginOutgoing().then(function () {
+        if (state.call === flow) { /* polling continues */ }
+      });
+    }
+  }
+
+  // Build-49 hot apply while a call is live on this page: forward the
+  // choice to the open media socket (the PATCH from the settings page is
+  // the primary channel; this is the same-page fast path).
+  if (typeof self !== 'undefined' && self.addEventListener) {
+    self.addEventListener('callrelay:denoise', function () {
+      var flow = state.call;
+      if (flow && flow.socket && flow.socket.readyState === 1 &&
+          window.CallRelayDenoise) {
+        window.CallRelayDenoise.control(flow.socket);
+      }
+    });
+  }
+
+  /* ---------------- tabs ---------------- */
+
+  function showTab(name) {
+    document.querySelectorAll('.tabbtn[data-tab]').forEach(function (b) {
+      b.classList.toggle('active', b.dataset.tab === name);
+    });
+    $('tab-dialer').classList.toggle('hidden', name !== 'dialer');
+    $('tab-messages').classList.toggle('hidden', name !== 'messages');
+    $('tab-contacts').classList.toggle('hidden', name !== 'contacts');
+    if (name === 'contacts') { refreshContacts(); }
+    // Edit mode is a conversation-list affordance: only on the messages tab,
+    // and it exits cleanly when switching away.
+    var onMessages = name === 'messages';
+    if (!onMessages && state.smsEditing) { setSmsEditing(false); }
+    $('messages-edit').classList.toggle('hidden', !onMessages || state.threads.length === 0);
+    $('messages-select-all').classList.toggle('hidden', !onMessages || !state.smsEditing);
+  }
+
+  function wireTabs() {
+    Array.prototype.forEach.call(document.querySelectorAll('.tabbtn[data-tab]'), function (btn) {
+      btn.addEventListener('click', function () { showTab(btn.dataset.tab); });
+    });
+  }
+
+  function formatTime(ms) {
+    if (!ms) { return ''; }
+    return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+
+  boot();
+}());

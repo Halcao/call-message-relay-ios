@@ -27,6 +27,68 @@ import AVFoundation
 final class WebSocketCallMedia: NSObject {
     var onState: ((MediaState) -> Void)?
     var onQuality: ((MediaQuality) -> Void)?
+    /// Fires on EVERY genuinely decoded inbound network frame (never for
+    /// Opus PLC/FEC concealment slots). Build-48 bounded recovery clears
+    /// only on this fresh-media proof, not on a socket `.connected` state.
+    /// Assigned on the main actor; the callback itself is dispatched back to
+    /// the main actor because frames arrive on a detached receive context.
+    var onInboundRealFrame: (() -> Void)? {
+        get {
+            inboundFrameLock.lock()
+            defer { inboundFrameLock.unlock() }
+            return inboundFrameCallback
+        }
+        set {
+            inboundFrameLock.lock()
+            inboundFrameCallback = newValue
+            inboundFrameLock.unlock()
+        }
+    }
+    private nonisolated(unsafe) var inboundFrameCallback: (() -> Void)?
+    private let inboundFrameLock = NSLock()
+
+    nonisolated private func emitInboundRealFrame() {
+        inboundFrameLock.lock()
+        let cb = inboundFrameCallback
+        inboundFrameLock.unlock()
+        guard let cb else { return }
+        Task { @MainActor in
+            // Build-62: the fresh-media proof timestamp (control/attach or
+            // `.connected` alone never counts — only a genuinely decoded
+            // inbound frame).
+            self.lastInboundRealFrameAt = Date()
+            cb()
+        }
+    }
+
+    /// Build-67 media-starvation evidence: an Opus payload that failed to
+    /// decode. Such a frame is NOT media liveness (no real-frame proof) and
+    /// previously vanished without a trace, so a sustained decode-failure
+    /// run was indistinguishable from "no frames on the wire". Bounded:
+    /// counter plus ONE log line per socket.
+    private let decodeFailureLock = NSLock()
+    private nonisolated(unsafe) var loggedDecodeFailure = false
+    nonisolated private func noteOpusDecodeFailure() {
+        DiagnosticsCensus.shared.increment("audio.wsOpusDecodeFailed")
+        decodeFailureLock.lock()
+        let first = !loggedDecodeFailure
+        loggedDecodeFailure = true
+        decodeFailureLock.unlock()
+        guard first else { return }
+        Task { @MainActor in
+            DiagnosticsStore.shared.log("audio", "wss opus decode failed (media frame dropped)")
+        }
+    }
+    /// When the LAST genuinely decoded inbound frame arrived (nil before
+    /// the first). Build-62 route-policy evidence.
+    private(set) var lastInboundRealFrameAt: Date?
+    /// True when a genuine inbound frame arrived within `window` — the
+    /// bidirectional media proof for route selection (silence simply leaves
+    /// the last stamp aging; it is never a failure signal).
+    func isInboundRealFrameFresh(within window: TimeInterval = 5, now: Date = Date()) -> Bool {
+        guard let at = lastInboundRealFrameAt else { return false }
+        return now.timeIntervalSince(at) <= window
+    }
 
     /// Audio graph seam, so a start failure is injectable deterministically
     /// (a simulator host may or may not start AVAudioEngine — tests must not
@@ -58,6 +120,16 @@ final class WebSocketCallMedia: NSObject {
         /// (privacy-safe numeric; nil when the last start succeeded or no
         /// start ran). Lightweight fakes default to nil.
         var lastStartFailureCode: Int? { get }
+        /// Live audio-input readiness for the exclusive promotion
+        /// handover (build-51): false while the retiring direct ADM's
+        /// asynchronous teardown still holds the input (a start now would
+        /// fail with WSAudioGraph code=1). Fakes default to always-ready.
+        func isInputReadyForStart() -> Bool
+        /// Route-change revalidation: re-check the live input format and
+        /// rebuild the capture pipeline when a route change altered it. The
+        /// production graph implements this; lightweight fakes default to a
+        /// no-op via the protocol extension.
+        func revalidateRoute()
     }
 
     /// Test seam over URLSessionWebSocketTask.
@@ -137,6 +209,9 @@ final class WebSocketCallMedia: NSObject {
 
     #if DEBUG
     func stateForTest() -> MediaState { currentState }
+    /// Test seam: emit the fresh-media proof as if a real inbound frame had
+    /// been decoded on this socket.
+    func fireInboundRealFrameForTest() { emitInboundRealFrame() }
     #endif
 
     // MARK: Send queue (single writer, bounded, drop-stale)
@@ -247,7 +322,18 @@ final class WebSocketCallMedia: NSObject {
         // frames must be handled inline (the production receive path hops
         // to the main actor asynchronously).
         if case .string(let text) = message {
-            handleControl(text)
+            handleControl(text, arrivedAt: Date())
+        } else {
+            handle(message)
+        }
+    }
+
+    func handleForTest(_ message: URLSessionWebSocketTask.Message, arrivedAt: Date) {
+        // Arrival-stamp seam: lets tests pin the receive-context stamp and
+        // prove the pong RTT/freshness anchor to it rather than to the
+        // main-actor handling time.
+        if case .string(let text) = message {
+            handleControl(text, arrivedAt: arrivedAt)
         } else {
             handle(message)
         }
@@ -315,6 +401,15 @@ final class WebSocketCallMedia: NSObject {
         socket = nil
         session?.invalidateAndCancel()
         session = nil
+        audioIO.stop()
+    }
+
+    /// Build-50 hot-standby demotion (relay side): stops the capture/playback
+    /// graph — the single audio owner moves to the promoted transport —
+    /// while KEEPING the authenticated socket alive for standby freshness,
+    /// ping RTT and the bounded silence pulse. Never closes the connection;
+    /// call `markHotStandby()` to arm the standby role first/after.
+    func suspendAudioForStandbyHandover() {
         audioIO.stop()
     }
 
@@ -414,6 +509,112 @@ final class WebSocketCallMedia: NSObject {
     func promoteAudioOwnership() {
         audioAllowed = true
         isStagedForHandover = false
+        setHotStandby(false)
+        stopStandbySilencePulse()
+    }
+
+    // MARK: Hot standby (build 50)
+
+    /// Fencing captured from the ready greeting: the session's primary role
+    /// epoch at attach time, and this socket's standby instance token when
+    /// the gateway accepted the attach into the standby slot.
+    private(set) var lastReadyEpoch: UInt64?
+    private(set) var lastReadyStandbyToken: String?
+
+    /// True while this socket is a persistent hot STANDBY transport: fully
+    /// attached and authenticated, receiving the mirrored downlink mix
+    /// (decoded for freshness, never rendered), sending at most a bounded
+    /// synthetic-silence uplink pulse. Exactly one of {primary, standby}
+    /// renders/owns audio at any instant — a standby NEVER opens a capture
+    /// graph and its socket lifecycle must not drive call-level media
+    /// failure (the `isStagedForHandover` fencing covers that).
+    /// Lock-backed: the nonisolated receive path reads it per frame.
+    var isHotStandby: Bool {
+        standbyLock.lock()
+        defer { standbyLock.unlock() }
+        return standbyModeFlag
+    }
+    private nonisolated(unsafe) var standbyModeFlag = false
+    private let standbyLock = NSLock()
+
+    /// Fires on every GENUINE inbound frame while in standby mode (the
+    /// hot-standby readiness proof — valid silent PCM counts; the mirrored
+    /// downlink mix is real media). PLC/FEC-concealed slots never fire it.
+    var onStandbyFreshMedia: (() -> Void)? {
+        get {
+            standbyLock.lock()
+            defer { standbyLock.unlock() }
+            return standbyFreshCallback
+        }
+        set {
+            standbyLock.lock()
+            defer { standbyLock.unlock() }
+            standbyFreshCallback = newValue
+        }
+    }
+    private nonisolated(unsafe) var standbyFreshCallback: (() -> Void)?
+
+    nonisolated private func emitStandbyFresh() {
+        standbyLock.lock()
+        let cb = standbyFreshCallback
+        standbyLock.unlock()
+        guard let cb else { return }
+        Task { @MainActor in cb() }
+    }
+
+    private func setHotStandby(_ value: Bool) {
+        standbyLock.lock()
+        standbyModeFlag = value
+        standbyLock.unlock()
+    }
+
+    /// Arms the persistent standby role: no audio ownership, non-fatal
+    /// lifecycle, freshness counting, and the bounded silence pulse that
+    /// proves the uplink path without a second mic injection.
+    func markHotStandby() {
+        audioAllowed = false
+        isStagedForHandover = true
+        setHotStandby(true)
+        startStandbySilencePulse()
+    }
+
+    /// Clears the standby role WITHOUT promoting audio ownership (the
+    /// socket is being dropped or replaced). Promotion uses
+    /// `promoteAudioOwnership()` instead.
+    func clearHotStandby() {
+        setHotStandby(false)
+        stopStandbySilencePulse()
+    }
+
+    private var standbySilenceTimer: Timer?
+
+    /// Bounded uplink readiness probe: one SILENT frame per second through
+    /// this socket's own encoder — never from the mic, never audible, and
+    /// cheap. The gateway decodes it for standby freshness and discards it
+    /// (single-uplink invariant preserved server-side).
+    private func startStandbySilencePulse() {
+        stopStandbySilencePulse()
+        standbySilenceTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self, self.isHotStandby, self.connected else { return }
+            self.enqueueStandbySilenceFrame()
+        }
+        // Fire one immediately so a freshly-armed standby proves its uplink
+        // within the first second.
+        enqueueStandbySilenceFrame()
+    }
+
+    private func stopStandbySilencePulse() {
+        standbySilenceTimer?.invalidate()
+        standbySilenceTimer = nil
+    }
+
+    private func enqueueStandbySilenceFrame() {
+        // Reuse the live outbound encode path: identical codec, seq16
+        // framing and sequence space as real uplink (a silence slot is an
+        // ordinary media slot; the gateway decodes it for standby freshness
+        // and discards it — the single-uplink invariant holds server-side).
+        guard let frame = encodeOutbound([Int16](repeating: 0, count: 160)) else { return }
+        outbound.enqueue(frame)
     }
 
     /// Route-change revalidation: the real graph re-checks the live input
@@ -458,8 +659,22 @@ final class WebSocketCallMedia: NSObject {
                 if let data = text.data(using: .utf8),
                    let control = try? JSONDecoder().decode(WSMediaControl.self, from: data),
                    control.type == "ready" {
+                    // Build-61 (protocol §3): the QUIC standby greeting rides
+                    // this authenticated control plane; it is never THIS
+                    // socket's own media ready — surface it and keep waiting.
+                    if control.transport == "quic" {
+                        onTransportControl?(control)
+                        continue
+                    }
                     try adoptCodec(control.codec == "opus" ? .opus : .pcmu,
                                    framed: control.fmt == "seq16")
+                    // Build-50 fencing: capture the attach-time role epoch
+                    // and, for a standby accept, the instance token. A
+                    // greeting WITHOUT `standby` on a standby-requested
+                    // attach means an old server replaced the primary — the
+                    // coordinator detects that via its primary's loss.
+                    lastReadyEpoch = control.epoch
+                    lastReadyStandbyToken = control.standby == true ? control.token : nil
                     return true
                 }
             case .data:
@@ -535,6 +750,19 @@ final class WebSocketCallMedia: NSObject {
     /// from the receive context (the scheduler is thread-safe and owns its
     /// serial queue), so a busy main thread can no longer backlog the
     /// downlink. Control frames hop back to the main actor.
+    /// Standby receive gate: a hot-standby socket decodes genuine frames
+    /// (keeping the codec warm and proving readiness) but NEVER feeds the
+    /// player — exactly one playback owner. Returns true when the caller
+    /// must skip the playback push.
+    private nonisolated func standbyConsumes(_ pcm: [Int16]) -> Bool {
+        standbyLock.lock()
+        let standby = standbyModeFlag
+        standbyLock.unlock()
+        guard standby else { return false }
+        emitStandbyFresh()
+        return true
+    }
+
     private nonisolated func handle(_ message: URLSessionWebSocketTask.Message) {
         switch message {
         case .data(let frame):
@@ -554,8 +782,14 @@ final class WebSocketCallMedia: NSObject {
                     for slot in slots {
                         switch slot {
                         case .decode(let payload):
-                            if let pcm = try? decoder.decode(payload) {
-                                audioIO.pushPlayback(pcm)
+                            do {
+                                let pcm = try decoder.decode(payload)
+                                self.emitInboundRealFrame()
+                                if !self.standbyConsumes(pcm) {
+                                    audioIO.pushPlayback(pcm)
+                                }
+                            } catch {
+                                self.noteOpusDecodeFailure()
                             }
                         case .plc:
                             if let pcm = try? decoder.decode(nil) {
@@ -581,38 +815,59 @@ final class WebSocketCallMedia: NSObject {
                 // undetectably, which is exactly what the framed negotiation
                 // fixes when both sides are build 27.
                 guard !frame.isEmpty, frame.count <= OpusCodec.maxFrameBytes else { return }
-                guard let pcm = try? decoder.decode(Array(frame)) else { return }
-                audioIO.pushPlayback(pcm)
+                do {
+                    let pcm = try decoder.decode(Array(frame))
+                    self.emitInboundRealFrame()
+                    if !standbyConsumes(pcm) {
+                        audioIO.pushPlayback(pcm)
+                    }
+                } catch {
+                    self.noteOpusDecodeFailure()
+                }
             } else {
                 guard frame.count == 160, let pcm = PCMUCodec.decode(frame) else { return }
-                audioIO.pushPlayback(pcm)
+                self.emitInboundRealFrame()
+                if !standbyConsumes(pcm) {
+                    audioIO.pushPlayback(pcm)
+                }
             }
         case .string(let text):
-            Task { @MainActor in self.handleControl(text) }
+            // Stamp the pong's arrival on the RECEIVE context, not inside the
+            // main-actor control handler: the RTT must measure the network
+            // path plus the gateway's turnaround, never the main-actor queue
+            // delay behind a busy UI. These samples feed the call-start route
+            // comparison (relay vs direct), the hot-standby promotion gate
+            // and the in-call telemetry row, and a scheduling delay is pure
+            // noise in every one of them.
+            let arrived = Date()
+            Task { @MainActor in self.handleControl(text, arrivedAt: arrived) }
         @unknown default:
             break
         }
     }
 
-    @MainActor private func handleControl(_ text: String) {
+    @MainActor private func handleControl(_ text: String, arrivedAt: Date) {
         guard let data = text.data(using: .utf8),
               let control = try? JSONDecoder().decode(WSMediaControl.self, from: data) else { return }
         if control.type == "error" {
             socketDidFail()
         } else if control.type == "pong", let tag = control.t,
                   let sent = pendingPings.removeValue(forKey: tag) {
-            let rtt = Date().timeIntervalSince(sent)
+            // The RTT is computed against the RECEIVE-context arrival stamp
+            // (passed in), never `Date()` here: main-actor scheduling delay
+            // must not inflate the sample.
+            let rtt = arrivedAt.timeIntervalSince(sent)
             // Measurement hygiene: only accept finite, non-negative pongs
             // that answer a ping from the last 30 s — a clock anomaly or a
             // stale replay must never enter the samples the UI/advisor use.
             if rtt.isFinite, rtt >= 0, rtt <= 30 {
-                pingSampleLog.append(PingSample(rtt: rtt, at: Date()))
+                pingSampleLog.append(PingSample(rtt: rtt, at: arrivedAt))
                 if pingSampleLog.count > 120 { pingSampleLog.removeFirst(pingSampleLog.count - 120) }
             }
             // Gateway-side host buffer depth (seconds) for the live telemetry
             // row; stale evidence is never rendered as current.
             if let hostBuf = control.buf {
-                lastGatewayBuffer = (frames: max(0, hostBuf), at: Date())
+                lastGatewayBuffer = (frames: max(0, hostBuf), at: arrivedAt)
             }
             // Uplink closed loop: the gateway answers with the depth of the
             // host buffer this socket feeds and the worst uplink gap it saw.
@@ -639,6 +894,12 @@ final class WebSocketCallMedia: NSObject {
                     try? encoder.setPacketLossPerc(settings.fec ? 10 : 0)
                 }
             }
+        } else if control.type == "promoted"
+                    || (control.type == "ready" && control.transport == "quic") {
+            // Build-61 QUIC control plane (protocol §3): the `promoted`
+            // reply and the QUIC ready greeting are surfaced to the
+            // coordinator, never consumed as this socket's own state.
+            onTransportControl?(control)
         }
     }
 
@@ -691,6 +952,46 @@ final class WebSocketCallMedia: NSObject {
                 }
             }
         }
+    }
+
+    // MARK: Denoise control (build 48)
+
+    /// Build-61 QUIC control plane (protocol §3): control frames on this
+    /// socket that are NOT this socket's own media handshake — the
+    /// `ready transport=quic` standby greeting and the `promoted` reply to a
+    /// standby-promote command. Surfaced verbatim to the coordinator; never
+    /// treated as this socket's own ready, pong or failure.
+    var onTransportControl: ((WSMediaControl) -> Void)?
+
+    /// Build-50 fenced promotion request ON this standby socket: asks the
+    /// gateway to promote THIS transport to the primary role (the previous
+    /// primary is demoted into the standby slot; both stay attached). The
+    /// token pins this exact standby instance, expectEpoch the client's view
+    /// of the primary role, nonce gives idempotent retries. The gateway
+    /// replies `{"type":"promoted",...}` on this same socket; an old gateway
+    /// ignores the unknown control (the caller times out / reconciles).
+    ///
+    /// Build-61: an optional `transport` marker (e.g. `"quic"`) selects the
+    /// standby transport to promote; nil keeps the exact legacy JSON.
+    func sendPromoteCommand(token: String, expectEpoch: UInt64, nonce: String,
+                            transport: String? = nil) {
+        guard let socket, connected else { return }
+        var json = "{\"type\":\"promote\""
+        if let transport { json += ",\"transport\":\"\(transport)\"" }
+        json += ",\"token\":\"\(token)\",\"expectEpoch\":\(expectEpoch),\"nonce\":\"\(nonce)\"}"
+        socket.send(.string(json)) { _ in }
+    }
+
+    /// Sends the hot directional-denoise control to the gateway. An older
+    /// gateway ignores the unknown message type; the next attach params and
+    /// the preferences PATCH converge the policy regardless.
+    func sendDenoiseControl(uplink: Bool?, downlink: Bool?) {
+        guard let socket, connected else { return }
+        var parts: [String] = [#""type":"denoise""#]
+        if let uplink { parts.append(#""uplink":\#(uplink ? "true" : "false")"#) }
+        if let downlink { parts.append(#""downlink":\#(downlink ? "true" : "false")"#) }
+        let json = "{" + parts.joined(separator: ",") + "}"
+        socket.send(.string(json)) { _ in }
     }
 
     // MARK: Ping sampling
@@ -827,6 +1128,13 @@ final class WebSocketCallMedia: NSObject {
         AppLog.media.debug("ws audio activated (owned)")
         return true
     }
+
+    /// Live audio-input readiness for the exclusive promotion handover
+    /// (build-51): the staged relay graph may only start once the retiring
+    /// direct ADM's asynchronous teardown has released the input — the
+    /// start's hard guard is a usable input format (WSAudioGraph code=1
+    /// otherwise). Poll-safe: reads only the session-derived input format.
+    func isAudioInputReady() -> Bool { audioIO.isInputReadyForStart() }
 
     /// Privacy-safe failure-code suffix for diagnostics (numeric only).
     private static func failureCodeSuffix(_ code: Int?) -> String {
@@ -1126,6 +1434,76 @@ final class WSSCodecState: @unchecked Sendable {
     var lastFrameArrival: Date?
     var worstDownlinkGapMs = 0
 
+    // MARK: Receiver-side downlink quality (build-62)
+    //
+    // The seq16 envelope makes DOWNLINK loss/reorder MEASURABLE at the
+    // receiver — the lack of transport ACKs only hides OUTBOUND delivery.
+    // Counters advance on actual arrivals only: silence never fabricates
+    // loss. Reset together with the depacketizer on codec/epoch changes.
+    private(set) var downlinkSeeded = false
+    private(set) var downlinkReceived: UInt64 = 0
+    private(set) var downlinkLost: UInt64 = 0
+    private(set) var downlinkFECAssisted: UInt64 = 0
+    private(set) var downlinkLateOrDuplicate: UInt64 = 0
+
+    func resetDownlinkQuality() {
+        downlinkSeeded = false
+        downlinkReceived = 0
+        downlinkLost = 0
+        downlinkFECAssisted = 0
+        downlinkLateOrDuplicate = 0
+    }
+
+    /// Record one depacketizer work list. Callers hold `lock`.
+    func recordDownlinkSlots(_ slots: [WSSFrameCodec.Slot]) {
+        if !slots.isEmpty { downlinkSeeded = true }
+        for slot in slots {
+            switch slot {
+            case .decode:
+                downlinkReceived &+= 1
+            case .plc:
+                downlinkLost &+= 1
+            case .fecRecover:
+                downlinkReceived &+= 1
+                downlinkFECAssisted &+= 1
+            }
+        }
+    }
+
+    /// A seeded stream that produced NO work list for an arrival carried a
+    /// duplicate/late (reordered-behind) frame. Callers hold `lock`.
+    func recordDownlinkLateOrDuplicate() {
+        guard downlinkSeeded else { return }
+        downlinkLateOrDuplicate &+= 1
+    }
+
+    struct DownlinkQualitySnapshot: Equatable, Sendable {
+        /// True once the framed seq16 stream produced measurable arrivals.
+        let measured: Bool
+        let receivedFrames: UInt64
+        let lostFrames: UInt64
+        let fecAssistedFrames: UInt64
+        let lateOrDuplicateFrames: UInt64
+        var lossFraction: Double {
+            let total = receivedFrames + lostFrames
+            return total == 0 ? 0 : Double(lostFrames) / Double(total)
+        }
+        var reorderFraction: Double {
+            let arrivals = receivedFrames + lateOrDuplicateFrames
+            return arrivals == 0 ? 0 : Double(lateOrDuplicateFrames) / Double(arrivals)
+        }
+    }
+
+    /// Callers hold `lock`.
+    func downlinkQualitySnapshot() -> DownlinkQualitySnapshot {
+        DownlinkQualitySnapshot(
+            measured: downlinkSeeded && (downlinkReceived + downlinkLost) > 0,
+            receivedFrames: downlinkReceived,
+            lostFrames: downlinkLost,
+            fecAssistedFrames: downlinkFECAssisted,
+            lateOrDuplicateFrames: downlinkLateOrDuplicate)
+    }
+
     /// Downlink inter-arrival evidence for the ping: worst gap observed
     /// since the last read (sendPing rotates the window on the main actor).
     func recordDownlinkGap() {
@@ -1163,6 +1541,55 @@ struct WSMediaControl: Decodable {
     /// feeds (frames) and the worst uplink inter-arrival gap (ms).
     let buf: Int?
     let ugap: Int?
+    /// Build-50 hot standby: true when the gateway accepted this attach into
+    /// the standby slot (the primary transport was NOT evicted). Absent on
+    /// primary attaches and older gateways.
+    let standby: Bool?
+    /// Build-50 fencing: the session's primary role epoch at attach time.
+    let epoch: UInt64?
+    /// Build-50 fencing: this standby instance's identity token (promotion
+    /// commands must pin it exactly).
+    let token: String?
+    /// Build-61 QUIC control plane (protocol `docs/quic61/protocol.md` §3):
+    /// present on the `ready` greeting when it announces a NON-ws transport
+    /// (`"quic"`) — never THIS socket's own media ready.
+    let transport: String?
+    /// Build-61 fencing: echoed on the `promoted` reply so the promoter can
+    /// fence duplicates/replays of the standby-promote command.
+    let nonce: String?
+
+    // The `promoted` reply names the post-swap roles as TRANSPORT STRINGS
+    // (`"primary":"quic","standby":"ws"`), while the `ready` greeting uses
+    // `standby` as a BOOL. One key, two shapes: decode tolerantly.
+    let primaryKind: String?
+    let standbyKind: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type, t, codec, fmt, buf, ugap, epoch, token, transport, nonce
+        case standby, primary
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        type = try c.decode(String.self, forKey: .type)
+        t = try c.decodeIfPresent(UInt64.self, forKey: .t)
+        codec = try c.decodeIfPresent(String.self, forKey: .codec)
+        fmt = try c.decodeIfPresent(String.self, forKey: .fmt)
+        buf = try c.decodeIfPresent(Int.self, forKey: .buf)
+        ugap = try c.decodeIfPresent(Int.self, forKey: .ugap)
+        epoch = try c.decodeIfPresent(UInt64.self, forKey: .epoch)
+        token = try c.decodeIfPresent(String.self, forKey: .token)
+        transport = try c.decodeIfPresent(String.self, forKey: .transport)
+        nonce = try c.decodeIfPresent(String.self, forKey: .nonce)
+        if let flag = try? c.decodeIfPresent(Bool.self, forKey: .standby) {
+            standby = flag
+            standbyKind = nil
+        } else {
+            standby = nil
+            standbyKind = try? c.decodeIfPresent(String.self, forKey: .standby) ?? nil
+        }
+        primaryKind = try? c.decodeIfPresent(String.self, forKey: .primary) ?? nil
+    }
 }
 
 // Default implementations keep lightweight test fakes conforming without
@@ -1180,6 +1607,9 @@ extension WebSocketCallMedia.WSAudioGraphing {
     func revalidateRoute() {}
     /// Lightweight fakes report no failure detail.
     var lastStartFailureCode: Int? { nil }
+    /// Lightweight fakes default to READY; tests override to script the
+    /// ADM-teardown window (build-51 promotion readiness gate).
+    func isInputReadyForStart() -> Bool { true }
 }
 
 extension WebSocketCallMedia.MediaSocket {

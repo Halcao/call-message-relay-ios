@@ -1,0 +1,45 @@
+# EXAMPLE — one CallRelay cellular worker per line.
+# Install as /etc/systemd/system/callrelay-worker@.service and enable per
+# line, e.g. `systemctl enable --now callrelay-worker@1.service`.
+#
+# The %i instance is the registry line number (1, 2, ...): the worker binary
+# is built from cmd/cellbridge-gateway and installed as callrelay-worker;
+# its config /run/callrelay/line%i.yaml is rendered by
+# tools/prepare-line.example.sh (adjust ExecStartPre to its install path —
+# copy tools/prepare-line.example.sh to /usr/local/lib/callrelay/).
+#
+# FIRMWARE PREREQUISITE: modules must already be provisioned (AT ports
+# enumerated, voice runtime installed if the qdc507 backend is used). EDL
+# flashing/unlock is a one-time operator step OUTSIDE this unit — this
+# service never flashes anything. See docs/self-hosting.md §hardware.
+[Unit]
+Description=CallRelay cellular worker for line %i
+Wants=network-online.target
+After=network-online.target callrelay-adb.service
+StartLimitIntervalSec=0
+# Never run the legacy cellbridge unit and the unified worker for the same
+# line at once: both would claim the AT port and the audio device pair.
+Conflicts=cellbridge@%i.service
+
+[Service]
+Type=simple
+User=root
+UMask=0077
+Environment=ADB_LIBUSB=0
+# SMS submissions are REAL sends (AT+CMGS) when false. The store-only dry
+# run (AT+CMGW) is a lab mode: messages never reach the network yet used to
+# be reported "sent". Keep false in production.
+Environment=CELLBRIDGE_SMS_DRY_RUN=false
+ExecStartPre=/usr/local/lib/callrelay/prepare-line.example.sh line%i
+ExecStart=/opt/callrelay/bin/callrelay-worker \
+  --config /run/callrelay/line%i.yaml \
+  --gateway-id line%i \
+  --name "Line %i" \
+  --version 2.0.6-fork
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=180
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

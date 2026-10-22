@@ -70,7 +70,7 @@ struct WebPushSettingsView: View {
                     Text("\(status?.subscriptionCount ?? 0)")
                 }
                 if !vapidEnabled {
-                    Label(WebPushL10n.text("网关未启用网页推送（需要运维开启 webpush.enabled）。"),
+                    Label(WebPushL10n.text("网关未启用网页推送，请联系网关管理员。"),
                           systemImage: "wrench.and.screwdriver")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -145,7 +145,7 @@ struct WebPushSettingsView: View {
         } header: {
             Text(WebPushL10n.text("绑定浏览器"))
         } footer: {
-            Text(WebPushL10n.text("在 iPhone/iPad 上先把网关网页“添加到主屏幕”（iOS 16.4+），打开该网页应用后输入上方绑定码；绑定码与链接只在此设备屏幕上显示，不会上传到其他服务。"))
+            Text(WebPushL10n.text("在 iPhone/iPad 上把网关网页“添加到主屏幕”（iOS 16.4+），打开后输入绑定码。"))
         }
     }
 
@@ -154,16 +154,14 @@ struct WebPushSettingsView: View {
             Label(WebPushL10n.text("选择上方通知方式（默认仅系统推送；需要网页兜底时选“系统 + 网页”）。"), systemImage: "1.circle")
             Label(WebPushL10n.text("点“生成绑定码”，在已添加到主屏幕的网关网页中输入绑定码并允许通知。"), systemImage: "2.circle")
             Label(WebPushL10n.text("在该网页中发送测试通知，确认此设备能收到。"), systemImage: "3.circle")
-            Label(WebPushL10n.text("来电时点击通知会在网页中显示来电；点“在 CallRelay 中打开”回到本 App 的来电界面（不会自动接听）。"), systemImage: "4.circle")
+            Label(WebPushL10n.text("点通知中的“在 CallRelay 中打开”回到本 App 接听，绝不会自动接听。"), systemImage: "4.circle")
         }
     }
 
     private var securitySection: some View {
         Section(WebPushL10n.text("安全说明")) {
             Label(WebPushL10n.text("网页推送由你的网关自托管服务，不经过任何第三方通知服务。"), systemImage: "checkmark.shield")
-            Label(WebPushL10n.text("浏览器订阅密钥只保存在网关，App 与通知中都不包含订阅密钥。"), systemImage: "key")
-            Label(WebPushL10n.text("通知链接使用一次性、短时有效的令牌并放在网址片段中，服务器与代理日志不会记录。"), systemImage: "link")
-            Label(WebPushL10n.text("解除配对或删除设备会同时移除浏览器订阅与网页会话。"), systemImage: "person.badge.minus")
+            Label(WebPushL10n.text("解除配对会同时移除已绑定的浏览器。"), systemImage: "person.badge.minus")
             Label(WebPushL10n.text("来电只在响铃时通知；检查来电只显示系统来电界面，绝不会自动接听。"), systemImage: "phone.down.circle")
         }
     }

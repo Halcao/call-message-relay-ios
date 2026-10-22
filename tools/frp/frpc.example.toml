@@ -1,0 +1,23 @@
+# EXAMPLE — frp client for hosts WITHOUT a public IP (behind CGNAT).
+#
+# OPTIONAL path only. If your gateway host is publicly reachable (direct or
+# via your own reverse proxy), you do not need frp at all.
+#
+# Requires frp >= 0.64.0 for tokenSource. Official docs:
+# https://gofrp.org/en/docs/features/common/authentication/
+# (tokenSource is mutually exclusive with a literal auth.token; whitespace
+# in the file is trimmed; the token is read at config load, not hot-reloaded;
+# keep the file mode 0600 owned by the frpc user.)
+serverAddr = "frps.example.com"
+serverPort = 7000
+
+# Secret material lives ONLY in the referenced file — never inline here.
+auth.tokenSource.type = "file"
+auth.tokenSource.file.path = "/etc/callrelay-frp/token"
+
+[[proxies]]
+name = "callrelay-https"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 443
+remotePort = 8443

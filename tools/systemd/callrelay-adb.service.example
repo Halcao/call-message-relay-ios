@@ -1,0 +1,20 @@
+# EXAMPLE — shared private USB ADB server (only needed for the qdc507
+# module-side voice path, which drives the module over adb).
+# Install as /etc/systemd/system/callrelay-adb.service if your hardware uses
+# adb-attached modules. Bind loopback-only on port 5038 (deliberately NOT the
+# public 5037 default).
+[Unit]
+Description=CallRelay shared private USB ADB server
+After=local-fs.target
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+Environment=ADB_LIBUSB=0
+ExecStart=/usr/bin/adb -L tcp:localhost:5038 nodaemon server
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

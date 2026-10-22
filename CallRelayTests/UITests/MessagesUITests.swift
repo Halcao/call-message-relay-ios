@@ -116,7 +116,7 @@ final class MessagesUITests: XCTestCase {
 
         // MARK: 6. Open junk thread and restore it as a known sender
         junkThread.tap()
-        XCTAssertTrue(element(containing: "若未预期会收到来自未知发件人的这则信息").waitForExistence(timeout: 5))
+        XCTAssertTrue(element(containing: "这可能是垃圾信息").waitForExistence(timeout: 5))
         attach(named: "06-junk-detail")
         app.buttons["junkRestore"].tap()
         app.navigationBars.buttons.element(boundBy: 0).tap()
@@ -126,9 +126,18 @@ final class MessagesUITests: XCTestCase {
         XCTAssertTrue(app.buttons["junk-555-0155"].exists)
         attach(named: "07-junk-after-restore")
 
-        // MARK: 7. Rules screen: presets and a local preview
+        // MARK: 7. Rules screen: presets and a local preview (advanced screen)
         app.tabBars.buttons["设置"].tap()
-        app.staticTexts["垃圾拦截规则"].tap()
+        app.staticTexts["骚扰拦截"].tap()
+        XCTAssertTrue(app.navigationBars["骚扰拦截"].waitForExistence(timeout: 5))
+        // The advanced destination is the last row of a long form; scroll
+        // until the lazily-rendered NavigationLink exists, then open it.
+        let advanced = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label CONTAINS %@", "高级规则与测试")).firstMatch
+        for _ in 0..<8 where !advanced.exists { app.swipeUp() }
+        XCTAssertTrue(advanced.waitForExistence(timeout: 5))
+        advanced.tap()
+        XCTAssertTrue(app.navigationBars["高级规则与测试"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.switches["preset-loanAndInvestment"].waitForExistence(timeout: 5))
         attach(named: "08-spam-rules")
         // The preview section sits below the rule sections: scroll until the
@@ -141,7 +150,8 @@ final class MessagesUITests: XCTestCase {
         previewButton.tap()
         XCTAssertTrue(element(containing: "未知发件人").waitForExistence(timeout: 3))
         attach(named: "08b-spam-preview")
-        app.navigationBars.buttons.element(boundBy: 0).tap()
+        app.navigationBars["高级规则与测试"].buttons.element(boundBy: 0).tap()
+        app.navigationBars["骚扰拦截"].buttons.element(boundBy: 0).tap()
 
         // MARK: 8. Settings shows concise statuses without engineering prose
         for _ in 0..<6 where !element(containing: "默认拨出线路").isHittable {

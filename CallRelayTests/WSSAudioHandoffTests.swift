@@ -20,6 +20,12 @@ final class Graph: WebSocketCallMedia.WSAudioGraphing {
     /// Scripted start outcome (build 44: a failing staged graph must roll a
     /// handover back, never kill the carrier). Flippable mid-test.
     var startResult = true
+    /// Build-51: models the retiring direct ADM's asynchronous teardown —
+    /// the FIRST `inputNotReadyProbes` readiness probes report the input
+    /// unusable (a start now would fail with WSAudioGraph code=1), then
+    /// it reports usable. 0 = ready immediately.
+    var inputNotReadyProbes = 0
+    private(set) var inputReadyProbeCount = 0
     var isRunning: Bool { startResult && startCount > stopCount }
     @discardableResult
     func startIfNeeded() -> Bool {
@@ -32,7 +38,12 @@ final class Graph: WebSocketCallMedia.WSAudioGraphing {
     }
     func stop() { stopCount += 1 }
     func setMicMuted(_ muted: Bool) { }
-    func pushPlayback(_ frame: [Int16]) { }
+    func isInputReadyForStart() -> Bool {
+        inputReadyProbeCount += 1
+        return inputReadyProbeCount > inputNotReadyProbes
+    }
+    private(set) var playedFrames = 0
+    func pushPlayback(_ frame: [Int16]) { playedFrames += 1 }
 }
 
 @MainActor

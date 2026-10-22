@@ -40,6 +40,10 @@ final class RoutePreflightController {
         let expiresAt: Date?
         /// Fresh app-level echo RTT samples (seconds) at handoff time.
         let samples: [TimeInterval]
+        /// Build 68: the network path identity this candidate was measured
+        /// on. A different path means the measurements are stale by
+        /// definition and the caller must not adopt them as fresh.
+        let pathGeneration: UInt64
     }
 
     struct Cadence {
@@ -61,14 +65,34 @@ final class RoutePreflightController {
         /// Client safety margin under the reported server TTL: the handoff is
         /// never handed out with less than this much server validity left.
         var ttlSafetySeconds: TimeInterval = 4
-        /// Max successful TTL renewals of one candidate before a fresh
-        /// bounded rebuild (keeps the resource use bounded and re-measures a
-        /// possibly changed network path).
-        var maximumRenewalsPerChain = 6
+        /// Build 68: a HEALTHY candidate is renewed continuously instead of
+        /// being torn down and renegotiated at a renewal-chain cap (the old
+        /// cap forced a full gather+handshake every ~3 minutes on a perfectly
+        /// usable path). The resource bound is the ONE candidate itself; a
+        /// rebuild now happens only when the evidence is stale/unhealthy or
+        /// the server refuses the renewal.
+        var maximumRenewalsPerChain = Int.max
+        /// Renewals are attempted while the candidate still has genuine
+        /// evidence: a fresh echo sample (or a fresh attach) within this
+        /// window. Beyond it the candidate is unhealthy and gets rebuilt.
+        var healthyEchoSeconds: TimeInterval = 20
         /// Pause between a renewal-failed rebuild and the next attach attempt.
         var renewPauseSeconds: TimeInterval = 0.25
         /// Max consecutive immediate rebuilds before a full cooldown.
         var maximumConsecutiveRebuilds = 3
+        /// Build 68: capped exponential backoff after failed rebuilds, so a
+        /// gateway that is down is not hammered.
+        var backoffSeconds: TimeInterval = 1
+        var maximumBackoffSeconds: TimeInterval = 30
+        /// Upper bound on how long the GLOBAL preflight ICE configuration
+        /// stays usable. The effective lifetime is
+        /// `min(this, server expiresAt - iceCacheSafetySeconds)`: the
+        /// GATEWAY's own expiry always wins, and a payload with a missing,
+        /// malformed or already-passed expiry is NEVER cached (it may carry
+        /// credentials).
+        var iceCacheSeconds: TimeInterval = 300
+        /// Safety margin subtracted from the server-provided expiry.
+        var iceCacheSafetySeconds: TimeInterval = 30
     }
 
     private enum CycleOutcome {
@@ -99,6 +123,24 @@ final class RoutePreflightController {
     private var probe: DirectProbeControlling?
     private var preflightId: String?
     private var attachedAt: Date?
+    /// Build 68 incremental exchange for the CURRENT candidate (nil when the
+    /// gateway does not advertise trickle or the attach was full-SDP).
+    private var trickleExchange: TrickleCandidateExchange?
+    /// Network path identity captured at attach time.
+    private var attachedPathGeneration: UInt64?
+    /// Build-68 attach token of the CURRENT candidate (nil for a full-SDP
+    /// attach).
+    private var attachId: String?
+    private var currentPathGeneration: () -> UInt64 = { 0 }
+    /// Bounded cache of the GLOBAL preflight ICE configuration
+    /// (`GET /ice`, no call id, no minted per-call credentials). Every entry
+    /// is keyed by the network-path generation it was fetched on and expires
+    /// after `iceCacheSeconds`; a network change or expiry refetches. The
+    /// per-call ICE payload (with its per-call IDs/credentials) is NEVER
+    /// cached here.
+    private var cachedICE: (config: ICEConfiguration, pathGeneration: UInt64, fetchedAt: Date)?
+    private var iceCacheHits = 0
+    private var iceCacheMisses = 0
     /// Server TTL deadline (client-margined) for the current candidate.
     private var probeExpiry: Date?
     /// True once the current probe's ownership moved to a call handoff.
@@ -106,6 +148,7 @@ final class RoutePreflightController {
 
     init(api: GatewayAPI,
          cadence: Cadence = Cadence(),
+         pathGeneration: @escaping () -> UInt64 = { 0 },
          eligible: @escaping () -> Bool = { true },
          probeFactory: @escaping @MainActor () -> DirectProbeControlling = { MediaProbeController() },
          log: @escaping (String) -> Void = { message in
@@ -113,6 +156,7 @@ final class RoutePreflightController {
          }) {
         self.api = api
         self.cadence = cadence
+        self.currentPathGeneration = pathGeneration
         self.eligible = eligible
         self.probeFactory = probeFactory
         self.log = log
@@ -129,6 +173,12 @@ final class RoutePreflightController {
                     Date().timeIntervalSince($0.at) <= cadence.handoffFreshSeconds
                 } ?? false))
         else { return nil }
+        // A candidate measured on a DIFFERENT network path is stale evidence:
+        // never hand it out as fresh (a Wi-Fi→cellular switch must be
+        // re-measured, not adopted).
+        if let attachedPathGeneration, attachedPathGeneration != currentPathGeneration() {
+            return nil
+        }
         if let probeExpiry, Date() >= probeExpiry {
             // The server TTL lapsed (or the renewal never landed): this
             // candidate can no longer be committed; never hand it out.
@@ -136,7 +186,8 @@ final class RoutePreflightController {
         }
         return Handoff(probe: probe, preflightId: preflightId,
                        attachedAt: attachedAt, expiresAt: probeExpiry,
-                       samples: probe.freshQualitySamples(within: 10, now: Date()))
+                       samples: probe.freshQualitySamples(within: 10, now: Date()),
+                       pathGeneration: attachedPathGeneration ?? currentPathGeneration())
     }
 
     /// Consumes the fresh candidate: ownership moves to the caller (the
@@ -144,10 +195,15 @@ final class RoutePreflightController {
     func consumeHandoff() -> Handoff? {
         guard let handoff = freshHandoff else { return nil }
         ownershipTransferred = true
+        // The call takes over the peer connection; the idle exchange stops
+        // here so no candidate is posted for a commit in flight.
+        trickleExchange?.cancel()
+        trickleExchange = nil
         probe = nil
         self.preflightId = nil
         attachedAt = nil
         probeExpiry = nil
+        attachedPathGeneration = nil
         // The cycle loop stops at the next generation/idle checkpoint; the
         // call-start generation bump happens in `callWillStart`.
         log("preflight handoff consumed id=\(handoff.preflightId)")
@@ -185,6 +241,9 @@ final class RoutePreflightController {
         generation &+= 1
         cycleTask?.cancel()
         cycleTask = nil
+        // Background releases the cached configuration too: a long
+        // background stay may cross network changes we never observed.
+        invalidateICECache()
         cancelProbe(serverDiscard: true)
         publish(RoutePreflightSnapshot(phase: .stopped))
         log("preflight stopped (background)")
@@ -213,6 +272,7 @@ final class RoutePreflightController {
         generation &+= 1
         cycleTask?.cancel()
         cycleTask = nil
+        invalidateICECache()
         cancelProbe(serverDiscard: true)
         publish(RoutePreflightSnapshot(phase: .probing))
         appDidEnterForeground()
@@ -220,12 +280,68 @@ final class RoutePreflightController {
 
     // MARK: - Cycle
 
+    /// The global preflight ICE configuration, from the bounded cache when it
+    /// is still valid for the CURRENT network path; otherwise fetched (and
+    /// stored) fresh. Only this call-independent payload is cached.
+    private func cachedICEConfiguration() async throws -> ICEConfiguration {
+        let pathGeneration = currentPathGeneration()
+        let lifetimeGeneration = generation
+        if let cached = cachedICE,
+           cached.pathGeneration == pathGeneration,
+           Date().timeIntervalSince(cached.fetchedAt) < effectiveCacheLifetime(cached.config) {
+            iceCacheHits += 1
+            return cached.config
+        }
+        iceCacheMisses += 1
+        let config = try await api.iceConfiguration()
+        // Guard the store: a fetch that straddled an invalidation, a
+        // background transition or a cycle stop must NOT repopulate the cache
+        // for a state that no longer exists.
+        guard lifetimeGeneration == generation else { return config }
+        if isCacheable(config) {
+            cachedICE = (config, pathGeneration, Date())
+        } else {
+            // No usable server expiry (or an already-expired one): never keep
+            // it — the payload may carry credentials.
+            cachedICE = nil
+        }
+        return config
+    }
+
+    /// Effective lifetime of one cached payload: the local upper bound or the
+    /// GATEWAY's own expiry minus the safety margin, whichever is SHORTER.
+    /// It is only ever called for cacheable payloads.
+    private func effectiveCacheLifetime(_ config: ICEConfiguration) -> TimeInterval {
+        guard let expiry = config.expiryDate else { return 0 }
+        let serverBound = expiry.timeIntervalSinceNow - cadence.iceCacheSafetySeconds
+        return min(cadence.iceCacheSeconds, max(0, serverBound))
+    }
+
+    /// A payload is only cacheable when the gateway supplied a parseable,
+    /// still-future expiry with real margin left.
+    private func isCacheable(_ config: ICEConfiguration) -> Bool {
+        effectiveCacheLifetime(config) > 0
+    }
+
+    /// Real cache evidence for the stage log (hits/misses since launch).
+    var iceCacheStats: (hits: Int, misses: Int) { (iceCacheHits, iceCacheMisses) }
+
+    /// Invalidates the cached configuration (network change, logout or an
+    /// explicit recheck): the next handshake refetches. The bump of
+    /// `generation` also fences any in-flight fetch, so an answer that lands
+    /// after the invalidation can never repopulate the cache.
+    func invalidateICECache() {
+        cachedICE = nil
+        generation &+= 1
+    }
+
     private func publish(_ snapshot: RoutePreflightSnapshot) {
         onUpdate?(snapshot)
     }
 
     private func cycle(gen: UInt64) async {
         var consecutiveRebuilds = 0
+        var backoff = cadence.backoffSeconds
         while !Task.isCancelled, gen == generation {
             guard eligible() else { return }
             let outcome = await runOnce(gen: gen)
@@ -233,15 +349,31 @@ final class RoutePreflightController {
             switch outcome {
             case .consumed, .stopped:
                 return
-            case .needsRebuild where consecutiveRebuilds < cadence.maximumConsecutiveRebuilds:
-                // The server lost the candidate but the cycle is still
-                // eligible: rebuild promptly instead of leaving a long dead
-                // window. Backoff grows only after repeated immediate
-                // failures.
+            case .needsRebuild:
+                // The server lost the candidate (or refused a renewal): a
+                // rebuild is the honest response, but repeated failures must
+                // not hammer the gateway — capped exponential backoff, and a
+                // long cooldown only after the consecutive-rebuild cap.
                 consecutiveRebuilds += 1
-                try? await Task.sleep(nanoseconds: UInt64(cadence.renewPauseSeconds * 1_000_000_000))
-            default:
+                if consecutiveRebuilds >= cadence.maximumConsecutiveRebuilds {
+                    consecutiveRebuilds = 0
+                    backoff = cadence.backoffSeconds
+                    log("preflight rebuild cap reached; backing off \(Int(cadence.cooldownSeconds))s")
+                    try? await Task.sleep(nanoseconds: UInt64(cadence.cooldownSeconds * 1_000_000_000))
+                } else {
+                    try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+                    backoff = min(backoff * 2, cadence.maximumBackoffSeconds)
+                }
+            case .unavailable:
+                // The path/gateway is not usable right now: keep the measured
+                // candidate (if any) and re-measure with the same capped
+                // backoff instead of a tight retry loop.
                 consecutiveRebuilds = 0
+                backoff = cadence.backoffSeconds
+                try? await Task.sleep(nanoseconds: UInt64(cadence.cooldownSeconds * 1_000_000_000))
+            case .renewCapReached:
+                consecutiveRebuilds = 0
+                backoff = cadence.backoffSeconds
                 try? await Task.sleep(nanoseconds: UInt64(cadence.cooldownSeconds * 1_000_000_000))
             }
         }
@@ -263,20 +395,52 @@ final class RoutePreflightController {
             }
         }
         let cycleStarted = Date()
+        // A cycle that still owns a connected, previously measured candidate is
+        // a WARM revalidation; a cycle that starts from scratch is COLD.
+        let hadMeasuredCandidate = self.probe != nil
+        var configMs = 0
         do {
-            let ice = try await api.iceConfiguration()
+            let configStart = Date()
+            let ice = try await cachedICEConfiguration()
+            configMs = Int(Date().timeIntervalSince(configStart) * 1000)
             guard ice.mediaTransports?.contains("ice") == true else {
                 log("preflight skipped: gateway advertises no direct path")
                 publish(RoutePreflightSnapshot(phase: .unavailable(String(localized: "网关未提供直连路径"))))
                 return .unavailable
             }
             guard !Task.isCancelled, gen == generation else { return .stopped }
+            // Build 68 incremental handshake: when the gateway advertises
+            // trickle (and the probe supports it) the offer goes out as soon
+            // as the local description exists — no gather wait — and the
+            // remaining candidates travel in BOTH directions while the
+            // connection checks already run. Anything else keeps the exact
+            // full-SDP behavior.
+            var trickleProbe: TrickleProbeCapable?
+            if ice.mediaTrickle, api is TrickleMediaAPI, let capable = probe as? TrickleProbeCapable {
+                trickleProbe = capable
+            }
             let offerStart = Date()
-            let offer = try await probe.makeOffer(ice: ice)
-            let offerMs = Int(Date().timeIntervalSince(offerStart) * 1000)
+            var offer: String
+            var attachId: String?
+            var remoteCursor = 0
+            var attachTrickle = false
+            if let trickleProbe {
+                let built = try await trickleProbe.makeOfferTrickle(ice: ice)
+                offer = built.sdp
+                attachTrickle = true
+            } else {
+                offer = try await probe.makeOffer(ice: ice)
+            }
+            let gatherMs = Int(Date().timeIntervalSince(offerStart) * 1000)
             guard !Task.isCancelled, gen == generation else { return .stopped }
             let attachStart = Date()
-            let answer = try await api.attachMediaPreflight(sdp: offer)
+            let trickleAPI = api as? TrickleMediaAPI
+            let answer: V2PreflightAnswer
+            if attachTrickle, let trickleAPI {
+                answer = try await trickleAPI.attachMediaPreflight(sdp: offer, trickle: true)
+            } else {
+                answer = try await api.attachMediaPreflight(sdp: offer)
+            }
             let attachMs = Int(Date().timeIntervalSince(attachStart) * 1000)
             guard !Task.isCancelled, gen == generation else {
                 // Background raced the attach: tell the server to drop it.
@@ -286,17 +450,60 @@ final class RoutePreflightController {
             preflightId = answer.preflightId
             probeExpiry = Self.expiry(ttlMs: answer.ttlMs, margin: cadence.ttlSafetySeconds,
                                       now: Date())
+            attachedPathGeneration = currentPathGeneration()
             try await probe.applyAnswer(answer.sdp)
+            // The incremental exchange runs CONCURRENTLY with the connection
+            // establishment: the gateway's candidates arrive while the local
+            // ones are still being posted.
+            if let trickleProbe, let attachId = answer.attachId {
+                remoteCursor = answer.candidateCursor ?? 0
+                self.attachId = attachId
+                let exchange = TrickleCandidateExchange(log: log)
+                trickleExchange = exchange
+                let preflightID = answer.preflightId
+                exchange.start(
+                    attachId: attachId,
+                    initialRemoteCursor: remoteCursor,
+                    localCandidates: { [weak trickleProbe] in
+                        trickleProbe?.locallyGatheredCandidates ?? []
+                    },
+                    localGatheringComplete: { [weak trickleProbe] in
+                        trickleProbe?.gatheringFinished ?? true
+                    },
+                    post: { [trickleAPI] attachId, candidates in
+                        guard let trickleAPI else { throw APIError.notReady("当前配对不支持增量直连协商。") }
+                        try await trickleAPI.postPreflightCandidates(
+                            preflightId: preflightID, attachId: attachId, candidates: candidates)
+                    },
+                    poll: { [trickleAPI] attachId, after in
+                        guard let trickleAPI else { throw APIError.notReady("当前配对不支持增量直连协商。") }
+                        return try await trickleAPI.pollPreflightCandidates(
+                            preflightId: preflightID, attachId: attachId, after: after)
+                    },
+                    apply: { [weak trickleProbe] candidate in
+                        trickleProbe?.addRemoteCandidate(candidate)
+                    })
+            }
             let connected = await waitConnected(probe, gen: gen)
             guard connected else {
-                log("preflight did not connect in time offerMs=\(offerMs) attachMs=\(attachMs)")
+                log("preflight did not connect in time gatherMs=\(gatherMs) attachMs=\(attachMs)"
+                    + " trickle=\(attachTrickle)")
                 publish(RoutePreflightSnapshot(phase: .unavailable(String(localized: "直连探测未连通"))))
                 return .unavailable
             }
             attachedAt = Date()
-            log("preflight attached id=\(answer.preflightId) offerMs=\(offerMs)"
-                + " attachMs=\(attachMs) connectMs=\(Int(Date().timeIntervalSince(cycleStarted) * 1000))"
-                + " ttlMs=\(answer.ttlMs)")
+            let connectMs = Int(Date().timeIntervalSince(cycleStarted) * 1000)
+            // Cold/warm is a REAL distinction: a warm attach comes from an
+            // already-measured candidate revalidation, a cold one starts from
+            // nothing. The cache hit/miss counters are measured, never
+            // fabricated.
+            let warm = hadMeasuredCandidate
+            log("preflight attached cold=\(!warm ? 1 : 0) warm=\(warm ? 1 : 0)"
+                + " id=\(answer.preflightId) configMs=\(configMs)"
+                + " gatherMs=\(gatherMs) attachMs=\(attachMs) connectMs=\(connectMs)"
+                + " firstFrameReadyMs=\(connectMs) ttlMs=\(answer.ttlMs)"
+                + " trickle=\(attachTrickle ? 1 : 0)"
+                + " iceCacheHits=\(iceCacheHits) iceCacheMisses=\(iceCacheMisses)")
             publish(connectedSnapshot(probe))
             // Collect echo samples: the probe pings once per second once the
             // echo channel opens; wait for the bounded measure window.
@@ -339,6 +546,23 @@ final class RoutePreflightController {
                 guard let id = preflightId, let expiry = probeExpiry else { return .needsRebuild }
                 if Date() >= expiry {
                     log("preflight TTL lapsed before renewal id=\(id)")
+                    return .needsRebuild
+                }
+                // Build 68: a HEALTHY candidate is renewed indefinitely (one
+                // bounded resource) instead of being rebuilt at a chain cap.
+                // "Healthy" means the SAME peer connection still delivers
+                // fresh evidence (echo sample or fresh attach) AND the network
+                // path did not change; anything else is rebuilt honestly.
+                if let attachedPathGeneration,
+                   attachedPathGeneration != currentPathGeneration() {
+                    log("preflight network path changed id=\(id); rebuilding")
+                    return .needsRebuild
+                }
+                let echoAge = probe.latestQualitySample.map {
+                    Date().timeIntervalSince($0.at)
+                } ?? Date().timeIntervalSince(attachedAt ?? Date())
+                if echoAge > cadence.healthyEchoSeconds {
+                    log("preflight evidence stale id=\(id) echoAgeMs=\(Int(echoAge * 1000))")
                     return .needsRebuild
                 }
                 if renewals >= cadence.maximumRenewalsPerChain { return .renewCapReached }
@@ -400,10 +624,14 @@ final class RoutePreflightController {
     private func cancelProbe(serverDiscard: Bool) {
         let probe = self.probe
         let preflightId = self.preflightId
+        trickleExchange?.cancel()
+        trickleExchange = nil
         self.probe = nil
         self.preflightId = nil
         attachedAt = nil
         probeExpiry = nil
+        attachedPathGeneration = nil
+        attachId = nil
         probe?.cancel()
         if serverDiscard, let preflightId {
             Task { try? await api.discardMediaPreflight(preflightId: preflightId) }

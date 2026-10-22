@@ -98,7 +98,7 @@ final class SecureRedirectDelegate: NSObject, URLSessionTaskDelegate, URLSession
 }
 
 /// Live URLSession implementation of the CellBridge v1 API.
-final class HTTPGatewayAPI: GatewayAPI {
+final class HTTPGatewayAPI: GatewayAPI, TrickleMediaAPI {
     private let origin: GatewayOrigin
     private let tokens: TokenStore
     private let session: URLSession
@@ -107,13 +107,39 @@ final class HTTPGatewayAPI: GatewayAPI {
     private let refresher = TokenRefresher()
     private let deviceName: String
     private let credentialEpoch: UInt64
+    /// Durable scoped history cache; the ONLY surface allowed to hold HTTP
+    /// validators (ETags) for the allowlisted history GETs (thread list,
+    /// message pages, call history). nil = no persistence (demo/tests):
+    /// conditional calls then always fetch full bodies.
+    private let historyStore: GatewayHistoryStore?
+    /// Pre-identity-verification gate. A cold start hydrates the UI from the
+    /// durable cache BEFORE the network identity probe completes; until that
+    /// probe verifies, this instance must be able to render but must never
+    /// put the bearer token on the wire. Anonymous discovery paths
+    /// (`identity`/`health`) are unaffected; a mismatch keeps the gate closed
+    /// forever (the session is torn down with it).
+    private let identityGate = IdentityGate()
+
+    private final class IdentityGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var required = false
+        private var verified = true
+        func require() { lock.lock(); required = true; verified = false; lock.unlock() }
+        func verify() { lock.lock(); verified = true; lock.unlock() }
+        var blocksCredentialledRequests: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return required && !verified
+        }
+    }
 
     init(origin: GatewayOrigin, tokens: TokenStore, deviceName: String? = nil,
-         configuration: URLSessionConfiguration = .ephemeral) {
+         configuration: URLSessionConfiguration = .ephemeral,
+         historyStore: GatewayHistoryStore? = nil) {
         self.origin = origin
         self.tokens = tokens
         self.credentialEpoch = tokens.snapshot().epoch
         self.deviceName = deviceName ?? HTTPGatewayAPI.currentDeviceName()
+        self.historyStore = historyStore
         let config = configuration
         config.tlsMinimumSupportedProtocolVersion = .TLSv12
         config.allowsCellularAccess = true
@@ -127,6 +153,13 @@ final class HTTPGatewayAPI: GatewayAPI {
             delegateQueue: nil
         )
     }
+
+    /// Arm the pre-verification gate (called by AppModel when a hydrated
+    /// session is created before the identity probe has answered).
+    func requireIdentityVerification() { identityGate.require() }
+
+    /// Allow credentialed traffic once the gateway identity matched.
+    func markIdentityVerified() { identityGate.verify() }
 
     static func currentDeviceName() -> String {
         #if targetEnvironment(simulator)
@@ -295,11 +328,29 @@ final class HTTPGatewayAPI: GatewayAPI {
         )
     }
 
+    /// Build-68 trickle offer. It is NOT part of the base protocol: a caller
+    /// must have checked `ice.mediaTrickle` AND cast the client to
+    /// `TrickleMediaAPI` before using it.
+    func webRTCOfferTrickle(callId: String, sdp: String, transport: String,
+                            idempotencyKey: String) async throws -> WebRTCAnswer {
+        try await webRTCOffer(callId: callId, sdp: sdp, transport: transport,
+                              idempotencyKey: idempotencyKey, trickle: true)
+    }
+
     func webRTCOffer(callId: String, sdp: String, transport: String, idempotencyKey: String) async throws -> WebRTCAnswer {
+        try await webRTCOffer(callId: callId, sdp: sdp, transport: transport,
+                              idempotencyKey: idempotencyKey, trickle: false)
+    }
+
+    private func webRTCOffer(callId: String, sdp: String, transport: String, idempotencyKey: String,
+                             trickle: Bool) async throws -> WebRTCAnswer {
         if isV2 {
             // Unified signaling is transport-agnostic: the gateway picks host
-            // or relay from `/ice` and answers with `iceMode`.
-            let body = V2WebRTCOfferRequest(sdp: sdp, type: "offer")
+            // or relay from `/ice` and answers with `iceMode`. `trickle` marks
+            // an incremental offer (build 68) and asks the gateway to answer
+            // BEFORE its own gathering completes; the caller then posts its
+            // remaining candidates and polls the gateway's.
+            let body = V2WebRTCOfferRequest(sdp: sdp, type: "offer", trickle: trickle ? true : nil)
             return try await authorizedPost(
                 "calls/\(callId)/webrtc/offer", body: body, idempotencyKey: idempotencyKey
             )
@@ -321,7 +372,10 @@ final class HTTPGatewayAPI: GatewayAPI {
             let expires = RFC3339Date.formatter.string(from: Date().addingTimeInterval(3600))
             return ICEConfiguration(
                 policy: config.policy, iceServers: servers, expiresAt: expires,
-                mediaTransports: config.mediaTransports
+                mediaTransports: config.mediaTransports,
+                mediaStandby: config.capabilities?.mediaStandby == true,
+                mediaTrickle: config.capabilities?.iceTrickle == true,
+                mediaQuic: config.capabilities?.mediaQuic == true
             )
         }
         return try await authorizedGet("calls/\(callId)/ice")
@@ -331,14 +385,38 @@ final class HTTPGatewayAPI: GatewayAPI {
     /// channel. The bearer token travels in the Upgrade headers exactly like
     /// the event stream; the URL rides the same origin as the REST API so
     /// FRP/caddy carry it without extra ports.
-    func mediaWebSocketRequest(callId: String) async throws -> URLRequest {
+    func mediaWebSocketRequest(callId: String, denoise: DenoiseChoice? = nil) async throws -> URLRequest {
         guard isV2 else { throw APIError.notReady("当前配对不支持 WebSocket 音频。") }
-        return try await authorizedWebSocketRequest(path: "calls/\(callId)/media")
+        return try await authorizedWebSocketRequest(
+            path: "calls/\(callId)/media", queryItems: denoiseQueryItems(denoise))
     }
 
-    func conferenceMediaWebSocketRequest(conferenceId: String) async throws -> URLRequest {
+    func mediaWebSocketStandbyRequest(callId: String) async throws -> URLRequest {
+        guard isV2 else { throw APIError.notReady("当前配对不支持备用通道。") }
+        // standby=1 asks the gateway (build 50+) to install the socket in
+        // the hot-standby slot; an old gateway ignores the parameter, which
+        // the caller detects via its primary's eviction + the missing
+        // `standby` flag in the ready greeting.
+        return try await authorizedWebSocketRequest(
+            path: "calls/\(callId)/media",
+            queryItems: [URLQueryItem(name: "standby", value: "1")])
+    }
+
+    func conferenceMediaWebSocketRequest(conferenceId: String, denoise: DenoiseChoice? = nil) async throws -> URLRequest {
         guard isV2 else { throw APIError.notReady("当前配对不支持 WebSocket 音频。") }
-        return try await authorizedWebSocketRequest(path: "conferences/\(conferenceId)/media")
+        return try await authorizedWebSocketRequest(
+            path: "conferences/\(conferenceId)/media", queryItems: denoiseQueryItems(denoise))
+    }
+
+    /// Builds the optional build-48 per-attach denoise query parameters.
+    /// Returns [] when the choice is nil (old behavior, gateway uses the
+    /// device's stored preference / build-49 default-OFF policy).
+    private func denoiseQueryItems(_ choice: DenoiseChoice?) -> [URLQueryItem] {
+        guard let choice else { return [] }
+        return [
+            URLQueryItem(name: "uplinkDenoise", value: choice.uplink ? "1" : "0"),
+            URLQueryItem(name: "downlinkDenoise", value: choice.downlink ? "1" : "0"),
+        ]
     }
 
     /// Measurement-only WSS socket: pings the relay path while media runs
@@ -357,16 +435,117 @@ final class HTTPGatewayAPI: GatewayAPI {
         return try await authorizedWebSocketRequest(path: "media/relay-probe")
     }
 
+    /// Build-61: the QUIC capability + TLS pin document. Authenticated like
+    /// every other v2 call; the pin travels here exactly because this
+    /// response is what makes the unauthenticated QUIC dial safe.
+    func quicMediaInfo() async throws -> QUICMediaInfo {
+        guard isV2 else { throw APIError.notReady("当前配对不支持 QUIC 直连音频。") }
+        return try await authorizedGet("media/quic")
+    }
+
+    /// Build-61: records the phone's srflx candidate for the call/device and
+    /// opens the coordinated punch window. Idempotency-Key is a fresh UUID:
+    /// a retried POST after a lost response may mint a new punch token but
+    /// can never double-bind the candidate.
+    func postQUICCandidate(callId: String, candidate: String, networkEpoch: String) async throws -> QUICPunchInfo {
+        guard isV2 else { throw APIError.notReady("当前配对不支持 QUIC 直连音频。") }
+        return try await authorizedPost(
+            "calls/\(callId)/quic/candidate",
+            body: V2QUICCandidateRequest(candidate: candidate, networkEpoch: networkEpoch),
+            idempotencyKey: UUID().uuidString
+        )
+    }
+
     func attachMediaProbe(callId: String, sdp: String) async throws -> WebRTCAnswer {
+        try await attachMediaProbe(callId: callId, sdp: sdp, trickle: false)
+    }
+
+    func attachMediaProbe(callId: String, sdp: String, trickle: Bool) async throws -> WebRTCAnswer {
         guard isV2 else { throw APIError.notReady("当前配对不支持媒体探测。") }
-        let body = V2WebRTCOfferRequest(sdp: sdp, type: "offer")
+        let body = V2WebRTCOfferRequest(sdp: sdp, type: "offer", trickle: trickle ? true : nil)
         return try await authorizedPost(
             "calls/\(callId)/media/probe", body: body, idempotencyKey: UUID().uuidString
         )
     }
 
+    // MARK: - Build 68 incremental ICE
+
+    /// Posts the client's remaining candidates for one attach (call media,
+    /// call probe or device preflight). A stale attachment is an honest 409
+    /// the caller ignores.
+    func postCallCandidates(callId: String, attachId: String, candidates: [String]) async throws {
+        guard isV2 else { throw APIError.notReady("当前配对不支持增量直连协商。") }
+        _ = try await authorizedPost(
+            "calls/\(callId)/webrtc/candidates",
+            body: V2CandidateBatchRequest(attachId: attachId, candidates: candidates),
+            idempotencyKey: UUID().uuidString
+        ) as V2CandidateAccepted
+    }
+
+    func postProbeCandidates(callId: String, attachId: String, candidates: [String]) async throws {
+        guard isV2 else { throw APIError.notReady("当前配对不支持增量直连协商。") }
+        _ = try await authorizedPost(
+            "calls/\(callId)/media/probe/candidates",
+            body: V2CandidateBatchRequest(attachId: attachId, candidates: candidates),
+            idempotencyKey: UUID().uuidString
+        ) as V2CandidateAccepted
+    }
+
+    func postPreflightCandidates(preflightId: String, attachId: String, candidates: [String]) async throws {
+        guard isV2 else { throw APIError.notReady("当前配对不支持增量直连协商。") }
+        _ = try await authorizedPost(
+            "media/probe/candidates",
+            body: V2CandidateBatchRequest(attachId: attachId, candidates: candidates, preflightId: preflightId),
+            idempotencyKey: UUID().uuidString
+        ) as V2CandidateAccepted
+    }
+
+    /// Polls the gateway's incrementally gathered candidates for a call
+    /// attachment. `after` is the cursor from the previous answer.
+    func pollCallCandidates(callId: String, attachId: String, after: Int) async throws -> V2CandidateBatch {
+        guard isV2 else { throw APIError.notReady("当前配对不支持增量直连协商。") }
+        return try await authorizedGet("calls/\(callId)/webrtc/candidates", queryItems: [
+            URLQueryItem(name: "attachId", value: attachId),
+            URLQueryItem(name: "after", value: String(after)),
+        ])
+    }
+
+    func pollProbeCandidates(callId: String, attachId: String, after: Int) async throws -> V2CandidateBatch {
+        guard isV2 else { throw APIError.notReady("当前配对不支持增量直连协商。") }
+        return try await authorizedGet("calls/\(callId)/media/probe/candidates", queryItems: [
+            URLQueryItem(name: "attachId", value: attachId),
+            URLQueryItem(name: "after", value: String(after)),
+        ])
+    }
+
+    func pollPreflightCandidates(preflightId: String, attachId: String, after: Int) async throws -> V2CandidateBatch {
+        guard isV2 else { throw APIError.notReady("当前配对不支持增量直连协商。") }
+        return try await authorizedGet("media/probe/candidates", queryItems: [
+            URLQueryItem(name: "attachId", value: attachId),
+            URLQueryItem(name: "after", value: String(after)),
+            URLQueryItem(name: "preflightId", value: preflightId),
+        ])
+    }
+
     func commitMediaProbe(callId: String, preflightId: String?) async throws {
+        try await commitMediaProbe(callId: callId, preflightId: preflightId, asStandby: false)
+    }
+
+    /// Build-50 commit variant. `asStandby` installs the measured candidate
+    /// into the gateway's hot-standby slot (primary untouched) and returns
+    /// the fencing epoch + standby token the ready greeting/commit ack
+    /// carries. Throws `APIError.notReady` on older gateways — the caller
+    /// must have gated on `ICEConfiguration.mediaStandby`.
+    func commitMediaProbe(callId: String, preflightId: String?, asStandby: Bool) async throws -> V2StandbyFence {
         guard isV2 else { throw APIError.notReady("当前配对不支持媒体探测。") }
+        if asStandby {
+            let response: V2StandbyCommitResponse = try await authorizedPost(
+                "calls/\(callId)/media/probe/commit",
+                body: V2CommitProbeRequest(preflightId: preflightId, standby: true),
+                idempotencyKey: UUID().uuidString
+            )
+            return V2StandbyFence(epoch: response.epoch, token: response.token)
+        }
         if let preflightId {
             // Adopting a device-scoped preflight candidate: the id is the
             // body, not a new route; 404 means it expired — the caller
@@ -376,11 +555,29 @@ final class HTTPGatewayAPI: GatewayAPI {
                 body: V2CommitProbeRequest(preflightId: preflightId),
                 idempotencyKey: UUID().uuidString
             )
-            return
+            return V2StandbyFence(epoch: nil, token: nil)
         }
         try await authorizedVoidAction(
             "calls/\(callId)/media/probe/commit", idempotencyKey: UUID().uuidString
         )
+        return V2StandbyFence(epoch: nil, token: nil)
+    }
+
+    /// Fenced hot-standby role swap (build 50). See V2PromoteStandbyRequest.
+    @discardableResult
+    func promoteStandby(callId: String, transport: String, token: String, expectEpoch: UInt64, nonce: String) async throws -> V2PromoteStandbyResponse {
+        guard isV2 else { throw APIError.notReady("当前配对不支持备用通道。") }
+        return try await authorizedPost(
+            "calls/\(callId)/media/standby/promote",
+            body: V2PromoteStandbyRequest(transport: transport, token: token, expectEpoch: expectEpoch, nonce: nonce),
+            idempotencyKey: nonce
+        )
+    }
+
+    /// Transport roles for post-ack-loss reconciliation (build 50).
+    func mediaState(callId: String) async throws -> V2MediaStateResponse {
+        guard isV2 else { throw APIError.notReady("当前配对不支持备用通道。") }
+        return try await authorizedGet("calls/\(callId)/media/state")
     }
 
     func discardMediaProbe(callId: String) async throws {
@@ -400,13 +597,20 @@ final class HTTPGatewayAPI: GatewayAPI {
         let expires = RFC3339Date.formatter.string(from: Date().addingTimeInterval(3600))
         return ICEConfiguration(
             policy: config.policy, iceServers: servers, expiresAt: expires,
-            mediaTransports: config.mediaTransports
+            mediaTransports: config.mediaTransports,
+            mediaStandby: config.capabilities?.mediaStandby == true,
+            mediaTrickle: config.capabilities?.iceTrickle == true,
+            mediaQuic: config.capabilities?.mediaQuic == true
         )
     }
 
     func attachMediaPreflight(sdp: String) async throws -> V2PreflightAnswer {
+        try await attachMediaPreflight(sdp: sdp, trickle: false)
+    }
+
+    func attachMediaPreflight(sdp: String, trickle: Bool) async throws -> V2PreflightAnswer {
         guard isV2 else { throw APIError.notReady("当前配对不支持媒体探测。") }
-        let body = V2WebRTCOfferRequest(sdp: sdp, type: "offer")
+        let body = V2WebRTCOfferRequest(sdp: sdp, type: "offer", trickle: trickle ? true : nil)
         return try await authorizedPost(
             "media/probe", body: body, idempotencyKey: UUID().uuidString
         )
@@ -430,12 +634,15 @@ final class HTTPGatewayAPI: GatewayAPI {
         )
     }
 
-    private func authorizedWebSocketRequest(path: String) async throws -> URLRequest {
+    private func authorizedWebSocketRequest(path: String, queryItems: [URLQueryItem] = []) async throws -> URLRequest {
         let access = try await validAccessToken()
         var components = URLComponents(
             url: origin.apiURL(path), resolvingAgainstBaseURL: false
         )!
         components.scheme = origin.scheme == "https" ? "wss" : "ws"
+        if !queryItems.isEmpty {
+            components.queryItems = queryItems
+        }
         guard let url = components.url else { throw APIError.network(URLError(.badURL)) }
         var request = URLRequest(url: url)
         request.setValue("Bearer \(access)", forHTTPHeaderField: "Authorization")
@@ -489,6 +696,18 @@ final class HTTPGatewayAPI: GatewayAPI {
             "devices/\(deviceId)/preferences", method: "PUT",
             body: V2DevicePreferencesRequest(defaultLineId: lineId),
             idempotencyKey: idempotencyKey
+        )
+    }
+
+    func setDenoisePreferences(uplink: Bool?, downlink: Bool?) async throws {
+        guard isV2 else { throw APIError.notReady("当前配对不是统一网关。") }
+        guard let deviceId = tokens.tokens()?.deviceId else { throw APIError.noCredentials }
+        // Optional fields are omitted by the Encodable when nil (PATCH
+        // presence semantics enforced by the gateway).
+        try await authorizedVoidAction(
+            "devices/\(deviceId)/preferences", method: "PUT",
+            body: V2DenoisePreferencesRequest(uplinkDenoise: uplink, downlinkDenoise: downlink),
+            idempotencyKey: "denoise-\(deviceId)-\(uplink.map { $0 ? "1" : "0" } ?? "x")-\(downlink.map { $0 ? "1" : "0" } ?? "x")"
         )
     }
 
@@ -570,6 +789,29 @@ final class HTTPGatewayAPI: GatewayAPI {
         )
     }
 
+    func listThreads(folder: String) async throws -> [MessageThread] {
+        guard isV2 else { throw APIError.notReady("当前配对不是统一网关。") }
+        return try await authorizedGet(
+            "threads", queryItems: [URLQueryItem(name: "folder", value: folder)]
+        )
+    }
+
+    func restoreThread(threadKey: String) async throws {
+        guard isV2 else { throw APIError.notReady("当前配对不是统一网关。") }
+        try await authorizedVoidAction(
+            "threads/\(threadKey)/restore", method: "POST",
+            body: Optional<Data>.none, idempotencyKey: UUID().uuidString
+        )
+    }
+
+    func supportsSMSActions() async throws -> Bool {
+        guard isV2 else { return false }
+        return try await device().capabilities?.smsThreadActions == true
+    }
+    func performSMSActions(_ actions: [SMSConversationAction]) async throws -> SMSActionResponse {
+        try await authorizedPost("threads/actions", body: SMSActionRequest(actions: actions), idempotencyKey: UUID().uuidString)
+    }
+
     func deleteThread(threadKey: String) async throws {
         guard isV2 else { throw APIError.notReady("当前配对不支持删除对话。") }
         // Global keys are "lineId:workerKey"; phone-number keys contain no
@@ -624,6 +866,113 @@ final class HTTPGatewayAPI: GatewayAPI {
             ?? http.value(forHTTPHeaderField: "X-CellBridge-Has-More")
         let hasMore = header.map { $0.lowercased() == "true" } ?? false
         return ThreadMessagePage(messages: messages, hasMore: hasMore)
+    }
+
+    // MARK: Conditional history GETs (ETag / If-None-Match)
+    //
+    /// The durable scoped store is the SINGLE source of validators: a
+    /// validator exists there only if its guarding body was committed in the
+    /// SAME atomic write (and the store drops a surface's validators whenever
+    /// that body's query variant or coherence changes — root review: an
+    /// A→B→A line-filter flip or relaunch must never reuse variant A's ETag
+    /// against variant B's persisted body). This transport therefore holds NO
+    /// separate in-memory validator cache: what disk knows is what the wire
+    /// sends, so invalidating one place invalidates all places. A transport
+    /// without a store (demo, unbound device principal) never sends
+    /// If-None-Match and never claims a validator — full fetches, exactly the
+    /// pre-cache behavior.
+    private func storedValidator(for key: String) -> String? {
+        guard let etag = historyStore?.validator(for: key), !etag.isEmpty else { return nil }
+        return etag
+    }
+
+    /// The ONLY surfaces allowed to cache/validate: thread list, message
+    /// pages, call history. Admin/auth/keys/token/ICE never route through
+    /// here. A durable cache makes an unchanged repeat — even after a process
+    /// restart — cost a 304 with zero body bytes.
+    private func conditionalGet<Output>(
+        path: String, queryItems: [URLQueryItem],
+        decode: (Data, HTTPURLResponse) throws -> Output
+    ) async throws -> ConditionalOutcome<Output> {
+        var request = try makeRequest(path: path, method: "GET", queryItems: queryItems)
+        guard let url = request.url else { throw APIError.invalidBaseURL }
+        // This transport owns revalidation; never let URLSession replay its
+        // own cached 200 behind our back (a 304 must be a REAL round trip).
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let validatorKey = url.absoluteString
+        if let etag = storedValidator(for: validatorKey) {
+            request.setValue(etag, forHTTPHeaderField: "If-None-Match")
+        }
+        let (data, response) = try await performWithTokenRefresh(request)
+        guard let http = response as? HTTPURLResponse else { throw APIError.network(URLError(.badServerResponse)) }
+        if http.statusCode == 304 {
+            // Gateway says our stored body is current: keep it, transfer
+            // nothing, do not treat as failure.
+            return .notModified
+        }
+        guard (200..<300).contains(http.statusCode) else { throw try error(from: http, data: data) }
+        let value: Output
+        do {
+            value = try decode(data, http)
+        } catch {
+            AppLog.network.error("response decoding failed for GET history")
+            throw APIError.decoding(String(describing: error))
+        }
+        let etag = http.value(forHTTPHeaderField: "ETag")
+        // A transport without a durable cache has nowhere coherent to commit
+        // the pair, so it never claims a validator. With a store, an absent
+        // ETag is committed as an explicit REMOVAL: the gateway stopped
+        // advertising revalidation for this body.
+        let validator = historyStore != nil
+            ? HistoryValidator(key: validatorKey, etag: etag) : nil
+        return .changed(value, validator: validator)
+    }
+
+    func listThreadsConditional(folder: String?, lineId: String?) async throws -> ConditionalOutcome<[MessageThread]> {
+        var query: [URLQueryItem] = []
+        if let folder {
+            guard isV2 else { throw APIError.notReady("当前网关版本不支持垃圾信息隔离。") }
+            query.append(URLQueryItem(name: "folder", value: folder))
+        } else if isV2, let lineId {
+            query.append(URLQueryItem(name: "line", value: lineId))
+        }
+        return try await conditionalGet(path: "threads", queryItems: query) { data, _ in
+            try self.decoder.decode([MessageThread].self, from: data)
+        }
+    }
+
+    func listThreadMessagesConditional(
+        threadKey: String, beforeCreatedAt: Int64?, beforeID: String?, limit: Int
+    ) async throws -> ConditionalOutcome<ThreadMessagePage> {
+        var query = [
+            URLQueryItem(name: "threadKey", value: threadKey),
+            URLQueryItem(name: "limit", value: String(limit))
+        ]
+        if let beforeCreatedAt {
+            query.append(URLQueryItem(name: "before", value: String(beforeCreatedAt)))
+        }
+        if let beforeID {
+            query.append(URLQueryItem(name: "beforeId", value: beforeID))
+        }
+        return try await conditionalGet(path: "messages", queryItems: query) { data, http in
+            let messages = try self.decoder.decode([MessageRecord].self, from: data)
+            let header = http.value(forHTTPHeaderField: "X-CallRelay-Has-More")
+                ?? http.value(forHTTPHeaderField: "X-CellBridge-Has-More")
+            return ThreadMessagePage(
+                messages: messages, hasMore: header.map { $0.lowercased() == "true" } ?? false)
+        }
+    }
+
+    func listCallsConditional(limit: Int) async throws -> ConditionalOutcome<[CallRecord]> {
+        let query = [URLQueryItem(name: "limit", value: String(limit))]
+        if isV2 {
+            return try await conditionalGet(path: "calls", queryItems: query) { data, _ in
+                try self.decoder.decode([V2CallView].self, from: data).map(\.callRecord)
+            }
+        }
+        return try await conditionalGet(path: "calls", queryItems: query) { data, _ in
+            try self.decoder.decode([CallRecord].self, from: data)
+        }
     }
 
     func sendMessage(to: String, body: String, idempotencyKey: String) async throws -> MessageRecord {
@@ -757,6 +1106,207 @@ final class HTTPGatewayAPI: GatewayAPI {
         // ("it is gone") is identical, so treat it as success.
         if http.statusCode == 404 { return }
         guard (200..<300).contains(http.statusCode) else { throw try error(from: http, data: data) }
+    }
+
+    // MARK: Manual call recording (v2)
+
+    func startCallRecording(callId: String) async throws -> RecordingRecord {
+        guard isV2 else { throw APIError.notReady("当前配对不支持通话录音。") }
+        return try await authorizedPost("calls/\(callId)/recording/start")
+    }
+
+    func stopCallRecording(callId: String) async throws -> RecordingRecord {
+        guard isV2 else { throw APIError.notReady("当前配对不支持通话录音。") }
+        return try await authorizedPost("calls/\(callId)/recording/stop")
+    }
+
+    func startConferenceRecording(conferenceId: String) async throws -> RecordingRecord {
+        guard isV2 else { throw APIError.notReady("当前配对不支持会议录音。") }
+        return try await authorizedPost("conferences/\(conferenceId)/recording/start")
+    }
+
+    func stopConferenceRecording(conferenceId: String) async throws -> RecordingRecord {
+        guard isV2 else { throw APIError.notReady("当前配对不支持会议录音。") }
+        return try await authorizedPost("conferences/\(conferenceId)/recording/stop")
+    }
+
+    func listRecordings() async throws -> [RecordingRecord] {
+        guard isV2 else { return [] }
+        return try await authorizedGet("recordings")
+    }
+
+    func recordingAudio(id: String) async throws -> Data {
+        guard isV2 else { throw APIError.notReady("当前配对不支持通话录音。") }
+        var request = try makeRequest(path: "recordings/\(id)/audio", method: "GET", queryItems: [])
+        request.setValue("audio/wav, application/octet-stream", forHTTPHeaderField: "Accept")
+        let (data, response) = try await performWithTokenRefresh(request)
+        guard let http = response as? HTTPURLResponse else { throw APIError.network(URLError(.badServerResponse)) }
+        guard (200..<300).contains(http.statusCode) else { throw try error(from: http, data: data) }
+        return data
+    }
+
+    func deleteRecording(id: String) async throws {
+        guard isV2 else { throw APIError.notReady("当前配对不支持通话录音。") }
+        var request = try makeRequest(path: "recordings/\(id)", method: "DELETE", queryItems: [])
+        let (data, response) = try await performWithTokenRefresh(request)
+        guard let http = response as? HTTPURLResponse else { throw APIError.network(URLError(.badServerResponse)) }
+        // 404 converges: another device may already have deleted it.
+        if http.statusCode == 404 { return }
+        guard (200..<300).contains(http.statusCode) else { throw try error(from: http, data: data) }
+    }
+
+    // MARK: Harassment (骚扰拦截, v2)
+
+    func harassmentSettings() async throws -> HarassmentSettingsRecord {
+        guard isV2 else { throw APIError.notReady("当前配对不是统一网关。") }
+        let envelope: V2HarassmentSettingsEnvelope = try await authorizedGet("harassment/settings")
+        return envelope.settings
+    }
+
+    func updateHarassmentSettings(callBlocking: Bool, smsBlocking: Bool, contactWhitelist: Bool?, version: Int64?) async throws -> HarassmentSettingsRecord {
+        guard isV2 else { throw APIError.notReady("当前配对不是统一网关。") }
+        let envelope: V2HarassmentSettingsEnvelope = try await authorizedPut(
+            "harassment/settings",
+            body: V2HarassmentSettingsRequest(
+                callBlocking: callBlocking, smsBlocking: smsBlocking,
+                contactWhitelist: contactWhitelist, version: version))
+        return envelope.settings
+    }
+
+    func harassmentEntries() async throws -> [HarassmentEntryRecord] {
+        guard isV2 else { throw APIError.notReady("当前配对不是统一网关。") }
+        let envelope: V2HarassmentEntriesEnvelope = try await authorizedGet("harassment/entries")
+        return envelope.entries
+    }
+
+    func addHarassmentEntry(number: String, matchKind: String, mode: String, action: String?, replaceOpposite: Bool) async throws -> HarassmentEntryAddResult {
+        guard isV2 else { throw APIError.notReady("当前配对不是统一网关。") }
+        let envelope: V2HarassmentEntryEnvelope = try await authorizedPost(
+            "harassment/entries",
+            body: V2HarassmentEntryRequest(
+                number: number, matchKind: matchKind, mode: mode, action: action,
+                replaceOpposite: replaceOpposite),
+            idempotencyKey: nil, successStatus: nil)
+        return HarassmentEntryAddResult(
+            entry: envelope.entry, replaced: envelope.replaced,
+            effective: envelope.effective, note: envelope.note)
+    }
+
+    func deleteHarassmentEntry(id: String) async throws {
+        guard isV2 else { throw APIError.notReady("当前配对不是统一网关。") }
+        try await authorizedVoidAction(
+            "harassment/entries/\(id)", method: "DELETE", body: Optional<Data>.none,
+            idempotencyKey: "harassment-entry-\(id)")
+    }
+
+    func harassmentLists() async throws -> [HarassmentListRecord] {
+        guard isV2 else { throw APIError.notReady("当前配对不是统一网关。") }
+        let envelope: V2HarassmentListsEnvelope = try await authorizedGet("harassment/lists")
+        return envelope.lists
+    }
+
+    func importHarassmentList(name: String, numbers: [String], defaultAction: String) async throws -> HarassmentListRecord {
+        guard isV2 else { throw APIError.notReady("当前配对不是统一网关。") }
+        let envelope: V2HarassmentListEnvelope = try await authorizedPost(
+            "harassment/lists/import",
+            body: V2HarassmentImportRequest(name: name, defaultAction: defaultAction, numbers: numbers),
+            idempotencyKey: nil, successStatus: nil)
+        return envelope.list
+    }
+
+    func deleteHarassmentList(id: String) async throws {
+        guard isV2 else { throw APIError.notReady("当前配对不是统一网关。") }
+        try await authorizedVoidAction(
+            "harassment/lists/\(id)", method: "DELETE", body: Optional<Data>.none,
+            idempotencyKey: "harassment-list-\(id)")
+    }
+
+    func harassmentHistory() async throws -> [HarassmentEventRecord] {
+        guard isV2 else { throw APIError.notReady("当前配对不是统一网关。") }
+        let envelope: V2HarassmentHistoryEnvelope = try await authorizedGet("harassment/history")
+        return envelope.events
+    }
+
+    func clearHarassmentHistory() async throws {
+        guard isV2 else { throw APIError.notReady("当前配对不是统一网关。") }
+        try await authorizedVoidAction(
+            "harassment/history", method: "DELETE", body: Optional<Data>.none,
+            idempotencyKey: "harassment-history-clear")
+    }
+
+    func testHarassment(kind: String, number: String, body: String) async throws -> HarassmentDecisionRecord {
+        guard isV2 else { throw APIError.notReady("当前配对不是统一网关。") }
+        return try await authorizedPost(
+            "harassment/test",
+            body: V2HarassmentTestRequest(kind: kind, number: number, body: body),
+            idempotencyKey: nil, successStatus: nil)
+    }
+
+    func recordingSettings() async throws -> RecordingSettingsRecord {
+        guard isV2 else { throw APIError.notReady("当前配对不是统一网关。") }
+        return try await authorizedGet("recordings/settings")
+    }
+
+    @discardableResult
+    func updateDeviceAutoRecord(_ enabled: Bool) async throws -> Bool {
+        guard isV2 else { throw APIError.notReady("当前配对不是统一网关。") }
+        guard let deviceId = tokens.tokens()?.deviceId else { throw APIError.noCredentials }
+        let body = try encoder.encode(V2AutoRecordPreferencesRequest(autoRecord: enabled))
+        let data = try await authorizedActionData(
+            "devices/\(deviceId)/preferences", method: "PUT", body: body,
+            idempotencyKey: "auto-record-\(deviceId)-\(enabled ? "1" : "0")")
+        // The gateway echoes the STORED preference. A gateway that silently
+        // ignores the field (200 without the echo) must be reported as NOT
+        // saved — otherwise the app would show an ON state the server never
+        // accepted, which is exactly the field "ON then OFF" switch class.
+        if let failure = Self.autoRecordWriteOutcome(requested: enabled, responseBody: data) {
+            await MainActor.run {
+                DiagnosticsStore.shared.log("settings",
+                    "auto-record write not confirmed by the gateway (no echoed value)")
+            }
+            throw failure
+        }
+        return enabled
+    }
+
+    /// Pure verification of the gateway's preference echo (unit-tested).
+    /// The V2 preference endpoint ALWAYS answers with the stored view
+    /// (JSON including `autoRecord`), so an empty, malformed or
+    /// field-less 2xx is UNCONFIRMED — never a confirmed write:
+    /// nil = the stored value was echoed and matches the request;
+    /// an APIError = the write could not be confirmed / was not stored.
+    static func autoRecordWriteOutcome(requested: Bool, responseBody data: Data) -> APIError? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let echoed = object["autoRecord"] as? Bool else {
+            return APIError.http(
+                status: 200, code: "CB-CLIENT-NOT-SAVED",
+                message: "网关未确认保存录音开关，请升级网关或稍后重试。")
+        }
+        guard echoed == requested else {
+            return APIError.http(
+                status: 200, code: "CB-CLIENT-NOT-SAVED",
+                message: "网关未保存录音开关，请稍后重试。")
+        }
+        return nil
+    }
+
+    /// Authorized write that RETURNS the response body (needed by callers
+    /// that must verify what the gateway actually stored).
+    private func authorizedActionData(
+        _ path: String, method: String = "PUT", body: Data, idempotencyKey: String
+    ) async throws -> Data {
+        var request = try makeRequest(path: path, method: method, queryItems: [])
+        request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+        let (data, response) = try await performWithTokenRefresh(request)
+        guard let http = response as? HTTPURLResponse else {
+            throw APIError.network(URLError(.badServerResponse))
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            throw try error(from: http, data: data)
+        }
+        return data
     }
 
     // MARK: Unauthenticated pairing endpoints
@@ -927,6 +1477,12 @@ final class HTTPGatewayAPI: GatewayAPI {
     /// Idempotency-Key, so replaying after a 401 (request never authorized) is
     /// safe; we never blindly retry after 5xx or transport failure.
     private func performWithTokenRefresh(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        // Hydrate-before-network: the cold-start session may exist and render
+        // before the identity probe resolves, but NO bearer token may leave
+        // the device until the probe verified this exact gateway.
+        guard !identityGate.blocksCredentialledRequests else {
+            throw APIError.notReady("正在验证网关身份，请稍候。")
+        }
         var authorized = request
         let snapshot = tokens.snapshot()
         guard snapshot.epoch == credentialEpoch, let tokenSet = snapshot.tokens else { throw APIError.noCredentials }

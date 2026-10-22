@@ -1,0 +1,171 @@
+# Unified CallRelay gateway configuration — portable EXAMPLE.
+#
+# This file is the example for the `callrelayd` unified daemon
+# (cmd/callrelayd). It contains NO real secrets and NO deployment-specific
+# values: replace every *.example placeholder and every path with your own,
+# and provide all credentials through root-owned files (0600) or environment
+# variables as shown. Never commit a filled-in copy.
+#
+# Secrets policy enforced by the code: the daemon reads bcrypt credentials,
+# enrollment keys, APNs .p8 keys, VAPID keys and internal worker tokens from
+# FILES or ENVIRONMENT at runtime; none of them are stored in YAML.
+
+gateway:
+  # Stable identifier of THIS gateway installation (used in enrollment proofs
+  # and event payloads). Pick any non-empty name.
+  id: callrelay-primary
+  # Display name shown to clients.
+  name: CallRelay
+  # The daemon binds loopback only by design; the TLS reverse proxy
+  # (see tools/caddy/Caddyfile.example) is the only public listener.
+  listen: 127.0.0.1:8790
+  data_dir: /var/lib/callrelay
+  # Gateway Ed25519 signing key (created by the daemon on first start if the
+  # parent directory exists and is writable; keep it off any shared volume).
+  key_file: /var/lib/callrelay/gateway-ed25519.key
+  # Console administrator credential file: one line
+  #   <username>:<bcrypt-hash>
+  # (htpasswd -nbB-compatible). Generate your OWN password:
+  #   htpasswd -nbB admin 'PASTE-YOUR-STRONG-PASSWORD' > /etc/callrelay/console.bcrypt
+  # chmod 0600 the file. There is no shipped default password anywhere.
+  console_bcrypt_file: /etc/callrelay/console.bcrypt
+  # 32-byte AES-256 master key (base64) sealing recoverable enrollment
+  # secrets; empty defaults to <data_dir>/console-secrets.key which the
+  # daemon creates with 0600 on first start.
+  console_secret_file: ""
+  # Public HTTPS base URL fronted by your reverse proxy (domain placeholder).
+  public_base_url: https://callrelay.example.com
+  version: dev
+  # Optional generated per-line block (rendered by
+  # `python3 tools/line_registry.py render-lines`). The daemon re-reads it
+  # while running, so a newly approved module needs no edit here.
+  lines_file: /etc/callrelay/lines.yaml
+
+# Inline lines are optional; when present each entry points at a per-line
+# worker on loopback (see tools/config/line-worker.example.yaml and
+# tools/prepare-line.example.sh). IDs must match line<N>.
+lines: []
+
+settings:
+  max_concurrent_calls: 2
+  disconnect_grace_seconds: 45
+  access_token_ttl: 15m
+  refresh_token_ttl: 720h
+  console_session_ttl: 12h
+  console_login_rate_per_minute: 8
+  max_history_merge: 400
+
+# Optional TURN relay for media. Disabled by default; direct ICE (with the
+# public STUN list below) and the authenticated WSS relay cover the rest.
+turn:
+  enabled: false
+  host: ""
+  port: 3478
+  bind_ip: ""
+  # The shared secret is read from this ENVIRONMENT variable at startup;
+  # export it in the service environment, never write it here.
+  secret_env: CALLRELAY_TURN_AUTH_SECRET
+  credential_ttl: 10m
+
+# ICE address discovery. Bare host:port entries, no scheme, no credentials.
+# Empty keeps host-candidates-only behaviour.
+ice:
+  stun_servers:
+    - stun.cloudflare.com:3478
+
+push:
+  # Optional central push broker. Leave empty for a pure self-host install.
+  broker_url: ""
+  authorization_env: CALLRELAY_PUSH_BROKER_AUTHORIZATION
+  # Optional DIRECT APNs sender for native iOS ringing. Disabled until ALL
+  # four fields below are set. The .p8 key stays on the gateway host (0600)
+  # and is never served or logged. Get a "VoIP Services"-capable APNs key
+  # from Apple Developer and use YOUR team id, key id and app bundle id.
+  apns_key_file: ""
+  apns_key_id: ""
+  apns_team_id: ""
+  apns_bundle_id: ""
+  apns_environment: sandbox
+
+# Self-hosted PWA Web Push: every gateway owns its VAPID identity (generated
+# at first start under <data_dir>/webpush/vapid.pem, 0600) and sends standard
+# Web Push itself. The author runs no central push service; final delivery
+# still rides the browser/OS push transport (e.g. Apple's infrastructure
+# wakes Safari).
+webpush:
+  enabled: true
+  # VAPID JWT contact claim (mailto: or https:). Empty uses a gateway-local
+  # default; set a reachable operator contact if you prefer.
+  subject: ""
+  private_key_file: ""
+  ttl: 30s
+  bind_token_ttl: 10m
+  session_ttl: 720h
+  handoff_ttl: 120s
+  max_subscriptions_per_device: 4
+  # Default policy rejects special-use push endpoints; only add vendor
+  # endpoint host suffixes if you self-host a push relay.
+  allowed_endpoint_hosts: []
+
+# Optional self-hosted Bark bridge for SMS/call alerts. Disabled by default.
+# Devices must separately opt in through the settings API; see
+# gateway/configs/bark.example.yaml for the security policy notes.
+bark:
+  enabled: false
+  allow_private: false
+  timeout: 10s
+  max_call_age: 60s
+
+# Ordinary service alerts (carrier arrears notices, designated backup-line
+# network availability). DISABLED in this example because the WAN fields
+# integrate with an EXTERNAL fallback agent this repository does not ship:
+# with no agent, keep wan_state_file/wan_probe_command EMPTY (state-file-only
+# monitor never claims backup availability) or keep enabled: false. Enable
+# only after you supply your own agent + line.
+notify:
+  enabled: false
+  wan_line_id: ""
+  wan_state_file: ""
+  wan_probe_command: ""
+  wan_probe_interval: 15m
+  wan_failure_probe_interval: 5m
+  wan_probe_timeout: 60s
+  sustained_failures: 2
+  recovery_successes: 2
+  # Exact-sender allowlist for arrears/restored classification. These are
+  # public carrier service short numbers (China Mobile/Unicom/Telecom);
+  # replace them with your carrier's notification senders.
+  carrier_senders:
+    - "10086"
+    - "10010"
+    - "10000"
+
+# Disposable voicemail audio goes to a SEPARATE volume (e.g. an SD card) so
+# heavy writes never touch the system disk; the mount is verified with the
+# expected device + filesystem before every write and there is NO fallback —
+# with the mount absent voicemail reports unavailable truthfully.
+voicemail:
+  audio_root: /srv/callrelay/voicemail
+  mount_point: /srv/callrelay
+  expected_device: /dev/mmcblk0p1
+  expected_fstype: vfat
+
+# Manual call recording follows the same verified-mount policy. Manual-only:
+# there is no automatic mode and recordings never touch the live call path.
+recording:
+  audio_root: /srv/callrelay/recordings
+  mount_point: /srv/callrelay
+  expected_device: /dev/mmcblk0p1
+  expected_fstype: vfat
+  retention_days: 0
+  minimum_free_bytes: 536870912
+  max_bytes: 0
+
+# Optional QUIC DATAGRAM direct media path (private UDP; no public port
+# mapping). Disabled by default; when enabled the listener advertises only
+# while it actually starts. See gateway/docs/quic-datagram-media-protocol.md.
+quic:
+  enabled: false
+  listen: :8792
+  lan_punch: false
+  stun_servers: []

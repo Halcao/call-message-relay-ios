@@ -43,7 +43,7 @@ final class LineOwnNumberTests: XCTestCase {
     func testEmptySIMGivesHonestStatusAndFallsBackToName() throws {
         let line = try makeLine(numberSource: "empty")
         XCTAssertNil(line.actualNumber)
-        XCTAssertEqual(line.numberUnavailableText, "SIM 未存储号码")
+        XCTAssertEqual(line.numberUnavailableText, "未设置号码")
         XCTAssertEqual(line.friendlyName, "H28K Line 1")
     }
 

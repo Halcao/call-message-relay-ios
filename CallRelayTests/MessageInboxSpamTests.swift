@@ -8,6 +8,13 @@ final class MessageInboxSpamTests: XCTestCase {
             .appendingPathComponent("spam-\(UUID().uuidString).json"))
     }
 
+    /// Build-55 master switches default OFF; these tests exercise the junk
+    /// classifier, so the SMS channel is explicitly enabled.
+    private func enableSpam(_ filter: SpamFilterStore) {
+        filter.setSMSBlocking(true, notifyGateway: false)
+        filter.setCallBlocking(true, notifyGateway: false)
+    }
+
     private func message(_ id: String, peer: String, body: String,
                          direction: MessageDirection = .inbound,
                          createdAt: Int64 = Date().unixMilliseconds) -> MessageRecord {
@@ -29,6 +36,7 @@ final class MessageInboxSpamTests: XCTestCase {
     func testJunkAndOTPSeparateWithPresetEnabled() async {
         let filter = tempSpamStore()
         filter.enable(preset: .loanAndInvestment)
+        enableSpam(filter)
         let api = FakeGatewayAPI()
         let otp = message("m1", peer: "555-0188", body: "【银行】验证码 482913，5 分钟内有效。")
         let loan = message("m2", peer: "555-0166", body: "无抵押贷款，低息贷款，极速放款。")
@@ -48,6 +56,7 @@ final class MessageInboxSpamTests: XCTestCase {
     func testOrderWordScamIsStillJunk() async {
         let filter = tempSpamStore()
         filter.enable(preset: .gamblingAndTask)
+        enableSpam(filter)
         let api = FakeGatewayAPI()
         let scam = message("m1", peer: "555-0155", body: "订单福利：刷单返佣，垫付小额本金日赚800。")
         api.threads = [thread(peer: "555-0155", message: scam)]
@@ -59,6 +68,7 @@ final class MessageInboxSpamTests: XCTestCase {
     func testRestoreMarksSenderKnownAndMovesThread() async {
         let filter = tempSpamStore()
         filter.enable(preset: .loanAndInvestment)
+        enableSpam(filter)
         let api = FakeGatewayAPI()
         let loan = message("m1", peer: "555-0166", body: "无抵押贷款额度已批。")
         api.threads = [thread(peer: "555-0166", message: loan)]
@@ -75,6 +85,7 @@ final class MessageInboxSpamTests: XCTestCase {
     func testLegitimateReplyInMixedThreadIsNotHidden() async {
         let filter = tempSpamStore()
         filter.enable(preset: .gamblingAndTask)
+        enableSpam(filter)
         let api = FakeGatewayAPI()
         // Inbound promo arrived first, then the owner replied from the same
         // 106 sender (transactional thread); the conversation must stay known.

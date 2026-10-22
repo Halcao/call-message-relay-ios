@@ -27,6 +27,15 @@ jobs:
       - name: Install XcodeGen
         run: command -v xcodegen || brew install xcodegen
 
+      - name: Verify portable signing helpers and license notices
+        run: |
+          source ./Scripts/build-env.sh
+          ./Scripts/tests/run-signing-tests.sh
+          test -s Vendor/opus/COPYING
+          test -s CallRelay/Resources/Licenses/Opus-LICENSE.txt
+          cmp Vendor/opus/COPYING CallRelay/Resources/Licenses/Opus-LICENSE.txt
+          cmp ThirdPartyNotices.md CallRelay/Resources/Licenses/ThirdPartyNotices.txt
+
       - name: Fetch and verify pinned WebRTC M151
         run: ./Scripts/bootstrap.sh
 

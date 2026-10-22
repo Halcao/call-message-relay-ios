@@ -91,7 +91,33 @@ final class WSPlaybackScheduler: @unchecked Sendable {
     /// header documents it as firing after the buffer is "consumed by the
     /// player", possibly before rendering begins, so downstream render/
     /// output-device latency is outside this accounting and is unknown here.
-    private var highWaterFrames: Int { targetFrames + 1 }
+    /// Sink completion batching (build-67). The runway is sized from the
+    /// REAL player consumption cadence — how many buffers the sink completes
+    /// in one burst — measured at runtime, not inferred: a render cycle that
+    /// finishes several buffers at once drains the whole runway in one pull,
+    /// and a runway smaller than that cycle starves the player mid-cycle
+    /// while every arrival beyond the bound looks "over the high water" and
+    /// is trimmed. The 0.3.55(65) field trace shows exactly that shape
+    /// (uniform 100 ms input-tap quanta — an INPUT-path signal, NOT proof of
+    /// the output consumption cadence — with 690 trims / 1532 downlink
+    /// frames in 28.5 s against only ~26 buffer-schedules/s), which is why
+    /// the cadence is now measured directly instead of assumed.
+    private var completionBatchMax = 1
+    private var currentCompletionBurst = 0
+    private var lastCompletionUptime: TimeInterval?
+    /// Completions inside this window belong to ONE render cycle.
+    private let completionBurstWindow: TimeInterval = 0.005
+
+    /// Effective schedule-ahead: the adaptive jitter target, raised only when
+    /// the sink actually completed multiple buffers in one burst
+    /// (`completionBatchMax + 1`), never above the pre-existing adaptive
+    /// maximum `maxTargetFrames` or the hard caps. A smooth single-buffer
+    /// cadence keeps the floor unchanged (batch 1 → target), so this adds NO
+    /// latency to a well-behaved device while a genuinely batched consumer
+    /// stops discarding live audio. The latency CEILING is unchanged: the
+    /// trim cap below stays `max(target, runway) + 1`, the same bound the
+    /// adaptive target already enforced.
+    private var highWaterFrames: Int { max(targetFrames, scheduleAheadFrames) + 1 }
     private var inFlight = 0
     private let maxScheduledFrames: Int
     /// Upper bound on buffers handed to the player (safety cap). The
@@ -138,7 +164,8 @@ final class WSPlaybackScheduler: @unchecked Sendable {
     /// adaptive target governs); `scheduleAheadFrames` is the effective
     /// number of buffers handed to the player.
     private var scheduleAheadFrames: Int {
-        max(1, min(targetFrames, maxScheduledFrames, refillThreshold))
+        let engineFloor = min(completionBatchMax + 1, maxTargetFrames)
+        return max(1, min(max(targetFrames, engineFloor), maxScheduledFrames, refillThreshold))
     }
 
     init(maxQueuedFrames: Int = 50,
@@ -183,6 +210,9 @@ final class WSPlaybackScheduler: @unchecked Sendable {
             recentBatchFrames = 0
             targetFrames = minTargetFrames
             maxTotalDepth = 0
+            completionBatchMax = 1
+            currentCompletionBurst = 0
+            lastCompletionUptime = nil
             sink?.startPlaying()
             drain()
         }
@@ -207,6 +237,9 @@ final class WSPlaybackScheduler: @unchecked Sendable {
             recentBatchFrames = 0
             targetFrames = minTargetFrames
             maxTotalDepth = 0
+            completionBatchMax = 1
+            currentCompletionBurst = 0
+            lastCompletionUptime = nil
             sink?.stopPlaying()
         }
     }
@@ -419,9 +452,41 @@ final class WSPlaybackScheduler: @unchecked Sendable {
     /// Owner-queue only.
     private func completionArrived(generation completedGeneration: UInt64) {
         guard completedGeneration == generation, running else { return }
+        noteCompletionBatch()
         inFlight = max(0, inFlight - 1)
         completed += 1
         drain()
+    }
+
+    /// Owner-queue only. Counts how many sink completions arrive together —
+    /// the engine render cycle measured in buffers. The stored maximum
+    /// decays by one per NEW burst, so a one-off coalesced batch cannot hold
+    /// latency up forever and a renderer that settles back to 20 ms returns
+    /// the runway to the adaptive floor.
+    private func noteCompletionBatch() {
+        let t = now
+        if let last = lastCompletionUptime, t - last <= completionBurstWindow {
+            currentCompletionBurst += 1
+        } else {
+            currentCompletionBurst = 1
+            completionBatchMax = max(1, completionBatchMax - 1)
+        }
+        lastCompletionUptime = t
+        if currentCompletionBurst > completionBatchMax {
+            completionBatchMax = currentCompletionBurst
+        }
+    }
+
+    /// Largest sink completion batch observed this run (the engine's render
+    /// cycle in 20 ms buffers; evidence for the stop log and field export).
+    var maxCompletionBatch: Int {
+        ownerQueue.sync { completionBatchMax }
+    }
+
+    /// Effective schedule-ahead runway right now, in 20 ms frames (evidence
+    /// and test seam; the value the drain enforces).
+    var scheduleAheadFramesForEvidence: Int {
+        ownerQueue.sync { scheduleAheadFrames }
     }
 
     // MARK: Rendering (real AVAudioConverter for non-8 kHz output)

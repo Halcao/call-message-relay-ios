@@ -149,7 +149,7 @@ final class RouteDiagnosticsTests: XCTestCase {
         XCTAssertEqual(rows.first { $0.label == "网络往返" }?.value, "85 ms")
         XCTAssertEqual(rows.first { $0.label == "网络往返" }?.isCurrent, true)
         XCTAssertEqual(rows.first { $0.label == "音频抖动" }?.value, "±7 ms")
-        XCTAssertEqual(rows.first { $0.label == "丢包" }?.value, "不适用（TCP）")
+        XCTAssertEqual(rows.first { $0.label == "丢包" }?.value, "不适用")
         XCTAssertEqual(rows.first { $0.label == "播放缓冲" }?.value, "40 ms")
         XCTAssertEqual(rows.first { $0.label == "网关缓冲" }?.value, "120 ms")
     }
@@ -229,7 +229,7 @@ final class RouteDiagnosticsTests: XCTestCase {
                       "post-call rows must never be marked current")
         XCTAssertEqual(rows.first { $0.label == "网络往返" }?.value, "168 ms（2 分钟前）")
         XCTAssertEqual(rows.first { $0.label == "音频抖动" }?.value, "±69 ms（已停更; 2 分钟前）")
-        XCTAssertEqual(rows.first { $0.label == "丢包" }?.value, "不适用（TCP）")
+        XCTAssertEqual(rows.first { $0.label == "丢包" }?.value, "不适用")
         XCTAssertEqual(rows.first { $0.label == "网关缓冲" }?.value, "120 ms（已停更; 2 分钟前）")
     }
 
@@ -256,17 +256,6 @@ final class RouteDiagnosticsTests: XCTestCase {
         let rows = diagnostics.liveTelemetryRows(now: now.addingTimeInterval(1))
         XCTAssertEqual(rows.first?.value, "连接中断",
                        "a new call with no route yet must not show the previous call's numbers")
-    }
-
-    func testMeasurementFooterNeverClaimsUpdatingDuringCall() {
-        var diagnostics = RouteDiagnostics()
-        XCTAssertFalse(diagnostics.measurementFooter().contains("实时"))
-        diagnostics.apply(preflight: RoutePreflightSnapshot(phase: .probing), now: now)
-        XCTAssertEqual(diagnostics.measurementFooter(), "正在测量…")
-        diagnostics.apply(call: telemetryState(
-            active: .relay, rtt: 0.1, jitter: nil, loss: nil,
-            localBuffer: nil, gatewayBuffer: nil), now: now)
-        XCTAssertTrue(diagnostics.measurementFooter().contains("暂停"))
     }
 
     // MARK: Idle relay probe (call-independent WSS measurement)

@@ -7,10 +7,28 @@ struct ActiveCallView: View {
     @State private var speaker = false
     @State private var showKeypad = false
     @State private var selectedLegID: String?
+    /// Local observation instant for the recording timer. The recording STATE
+    /// itself always comes from the gateway; this only ticks the elapsed label.
+    @State private var recordingObservedAt: Date?
 
     private var call: ActiveCallViewState? { model.activeCall }
     private var heldCalls: [CallRecord] { group.heldCalls }
     private var conference: ConferenceRecord? { group.conference }
+
+    /// Server-confirmed recording state for whatever owns the audio: a hosted
+    /// conference's own segment while one exists, else the focused 1:1 call.
+    private var effectiveRecordingState: String {
+        if let conference { return conference.recordingState ?? "" }
+        return call?.recordingState ?? ""
+    }
+    private var effectiveIsRecording: Bool { effectiveRecordingState == "recording" }
+    private var effectiveRecordingInProgress: Bool {
+        ["recording", "starting", "finalizing"].contains(effectiveRecordingState)
+    }
+    private var effectiveRecordingDurationMs: Int64 {
+        if let conference { return conference.recordingDurationMs ?? 0 }
+        return call?.recordingDurationMs ?? 0
+    }
 
     var body: some View {
         ZStack {
@@ -37,6 +55,17 @@ struct ActiveCallView: View {
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                         .accessibilityIdentifier("call.audioStatus")
+                }
+
+                // Manual recording indicator: red while the gateway confirms
+                // capture, then an honest "saving" note during finalization.
+                recordingStatus
+                if let notice = model.recordingNotice {
+                    Text(notice)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .multilineTextAlignment(.center)
+                        .accessibilityIdentifier("call.recordingNotice")
                 }
 
                 if conference == nil, !heldCalls.isEmpty {
@@ -223,7 +252,7 @@ struct ActiveCallView: View {
     // MARK: Controls
 
     private var controls: some View {
-        HStack(spacing: 26) {
+        HStack(spacing: 22) {
             CallControlButton(active: muted, icon: "mic.slash.fill", label: String(localized: "静音")) {
                 muted.toggle()
                 model.setMuted(muted)
@@ -235,6 +264,7 @@ struct ActiveCallView: View {
             CallControlButton(active: false, icon: "circle.grid.3x3.fill", label: String(localized: "键盘")) {
                 showKeypad = true
             }
+            recordingControl
             if conference == nil, supportsHold {
                 CallControlButton(active: false, icon: "pause.circle.fill", label: String(localized: "保持")) {
                     group.holdActive()
@@ -249,11 +279,96 @@ struct ActiveCallView: View {
         .padding(.bottom, 4)
     }
 
+    /// Manual recording control for a 1:1 call or a hosted conference. The
+    /// visible state follows the server-confirmed recording state; the pending
+    /// spinner only covers the request round-trip.
+    @ViewBuilder
+    private var recordingControl: some View {
+        if supportsRecording {
+            if model.recordingRequestPending || group.conferenceRecordingPending {
+                VStack(spacing: 6) {
+                    ProgressView()
+                        .frame(width: 60, height: 60)
+                        .background(Color(.secondarySystemFill))
+                        .clipShape(Circle())
+                    Text(String(localized: "录音")).font(.caption).foregroundStyle(.secondary)
+                }
+                .frame(minWidth: 60, minHeight: 44)
+                .accessibilityLabel(String(localized: "正在请求录音"))
+            } else {
+                CallControlButton(
+                    active: effectiveIsRecording,
+                    icon: effectiveIsRecording ? "record.circle.fill" : "record.circle",
+                    label: effectiveRecordingInProgress ? String(localized: "停止录音") : String(localized: "录音")
+                ) {
+                    if conference != nil {
+                        group.toggleConferenceRecording()
+                    } else {
+                        Task { await model.toggleCallRecording() }
+                    }
+                }
+                .accessibilityIdentifier("call.recordToggle")
+                .accessibilityLabel(effectiveIsRecording ? String(localized: "停止录音") : String(localized: "开始录音"))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var recordingStatus: some View {
+        if effectiveIsRecording {
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                let elapsedMs = recordingObservedAt.map {
+                    Int64(max(context.date.timeIntervalSince($0), 0) * 1000)
+                } ?? 0
+                let totalMs = max(effectiveRecordingDurationMs, elapsedMs)
+                HStack(spacing: 6) {
+                    Circle().fill(Color.red).frame(width: 8, height: 8)
+                    Text(String(localized: "录音中") + " " + Self.durationLabel(totalMs))
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.red)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(Color.red.opacity(0.12), in: Capsule())
+            }
+            .accessibilityIdentifier("call.recordingIndicator")
+            .onChange(of: effectiveRecordingState) { _, newValue in
+                if newValue == "recording" {
+                    if recordingObservedAt == nil { recordingObservedAt = Date() }
+                } else {
+                    recordingObservedAt = nil
+                }
+            }
+        } else if effectiveRecordingState == "finalizing" {
+            Label(String(localized: "正在保存录音…"), systemImage: "waveform")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("call.recordingIndicator")
+        }
+    }
+
+    static func durationLabel(_ milliseconds: Int64) -> String {
+        let totalSeconds = max(Int(milliseconds / 1000), 0)
+        return String(format: "%d:%02d", totalSeconds / 60, totalSeconds % 60)
+    }
+
     private var supportsHold: Bool {
         switch call?.phase {
         case .active, .connecting, .reconnecting: return true
         default: return false
         }
+    }
+
+    /// Start is offered once audio is live; once a segment exists the control
+    /// stays available in every live phase so it can always be stopped. A
+    /// hosted conference uses its own segment state.
+    private var supportsRecording: Bool {
+        if conference != nil {
+            return call?.phase.isLive == true || effectiveRecordingInProgress
+        }
+        if call?.recordingInProgress == true { return true }
+        if case .active = call?.phase { return true }
+        return false
     }
 
     @ViewBuilder

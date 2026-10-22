@@ -61,7 +61,7 @@ struct NumberListsView: View {
                 }
             }
             Section {
-                Text("仅按完整号码匹配，不会因为号段或归属地拦截普通号码；信任名单和你的拦截号码始终优先。更新失败会保留上一份可用名单。")
+                Text("更新失败会保留上一份可用名单。")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

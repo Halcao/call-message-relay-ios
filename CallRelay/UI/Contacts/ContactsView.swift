@@ -45,7 +45,7 @@ private struct ContactsContent: View {
                             Button {
                                 model.syncContactsToGateway()
                             } label: {
-                                Label("同步到网关（同密钥设备共享）", systemImage: "arrow.triangle.2.circlepath")
+                                Label("同步到网关", systemImage: "arrow.triangle.2.circlepath")
                             }
                             .disabled(model.contactSyncStatus == .syncing)
                             if model.contactSyncStatus != .idle {
@@ -202,7 +202,7 @@ struct RequestAccessView: View {
             Text(primary ? "读取通讯录以拨号、发短信" : "通讯录访问未授权")
                 .font(.headline)
             Text(primary
-                 ? "仅在你点击授权后读取；联系人保存在本机/iCloud，不会上传，也不会用于演示或日志。你随时可在系统设置中关闭。"
+                 ? "仅在你点击授权后读取；联系人保存在本机/iCloud，不会上传。你随时可在系统设置中关闭。"
                  : "请在系统设置中允许访问通讯录，或使用“受限访问”仅选择部分联系人。")
                 .font(.subheadline).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center).padding(.horizontal, 32)

@@ -1,16 +1,20 @@
 import XCTest
 @testable import CallRelay
 
-// MARK: - Live-captured, sanitized production fixtures
+// MARK: - Fully synthetic line fixtures
 
-/// Captured from the real H28K gateway `/api/v2/lines` response on 2026-10-02
-/// and then sanitized: phone numbers, SIM identifiers and module hashes are
-/// synthetic placeholders with the same length/shape. The key set and value
-/// types are exactly what the gateway returned, including the absence of
-/// `activeCallId`/`lastError` when nil/empty.
-enum LiveGatewayFixture {
+/// Hand-written fixture. It is NOT a record of any current or past real
+/// device: every field value here is synthetic. Phone numbers use the NANP
+/// fictional-reserved range (+1 202 555-01XX, masks preserving the 0101 /
+/// 0102 tails), SIM identifiers and module hashes are placeholder shapes,
+/// and the module/ICCID/USB/firmware fields describe the public H28K/QDC507
+/// product surface rather than one captured unit. What the fixture pins is
+/// the /api/v2/lines CONTRACT shape: the key set and value types a unified
+/// gateway returns, including the absence of `activeCallId`/`lastError`
+/// when nil/empty.
+enum SyntheticGatewayFixture {
     static let linesJSON = """
-    [{"id":"line1","name":"LINE1 155****3039","enabled":true,"online":true,"sim":"ready","operator":"","registration":"registered","voice":"ready","sms":"ready","signal":{"rssi":-53,"bars":4},"permissions":{"receiveSms":true,"receiveCalls":true,"sendSms":true,"dial":true},"smsLive":false,"identity":{"lineId":"line1","moduleKey":"sha256:1111111111111111","usbPath":"1-1.1","firmware":"QDC507GLEFM21_01.001.01.009","simMasked":"8986************0001","phoneMasked":"155****3039","numberSource":"manual","operatorAlpha":"????","registration":"registered","accessTech":"lte","simChanged":false,"updatedAt":1790946274079},"phoneNumber":"15550003039","canManageNumber":false},{"id":"line2","name":"LINE2 QDC507GLEFM21_01.001.02.004","enabled":true,"online":true,"sim":"ready","operator":"","registration":"registered","voice":"ready","sms":"ready","signal":{"rssi":-59,"bars":4},"permissions":{"receiveSms":true,"receiveCalls":true,"sendSms":true,"dial":true},"smsLive":false,"identity":{"lineId":"line2","moduleKey":"sha256:2222222222222222","usbPath":"1-1.2","firmware":"QDC507GLEFM21_01.001.02.004","simMasked":"8986************0002","phoneMasked":"155****4926","numberSource":"manual","operatorAlpha":"CHINA MOBILE","registration":"registered","accessTech":"lte","simChanged":false,"updatedAt":1790946274090},"phoneNumber":"15550004926","canManageNumber":false}]
+    [{"id":"line1","name":"LINE1 +120****0101","enabled":true,"online":true,"sim":"ready","operator":"","registration":"registered","voice":"ready","sms":"ready","signal":{"rssi":-53,"bars":4},"permissions":{"receiveSms":true,"receiveCalls":true,"sendSms":true,"dial":true},"smsLive":false,"identity":{"lineId":"line1","moduleKey":"sha256:1111111111111111","usbPath":"1-1.1","firmware":"QDC507GLEFM21_01.001.01.009","simMasked":"8986************0001","phoneMasked":"+120****0101","numberSource":"manual","operatorAlpha":"????","registration":"registered","accessTech":"lte","simChanged":false,"updatedAt":1790946274079},"phoneNumber":"+12025550101","canManageNumber":false},{"id":"line2","name":"LINE2 QDC507GLEFM21_01.001.02.004","enabled":true,"online":true,"sim":"ready","operator":"","registration":"registered","voice":"ready","sms":"ready","signal":{"rssi":-59,"bars":4},"permissions":{"receiveSms":true,"receiveCalls":true,"sendSms":true,"dial":true},"smsLive":false,"identity":{"lineId":"line2","moduleKey":"sha256:2222222222222222","usbPath":"1-1.2","firmware":"QDC507GLEFM21_01.001.02.004","simMasked":"8986************0002","phoneMasked":"+120****0102","numberSource":"manual","operatorAlpha":"CHINA MOBILE","registration":"registered","accessTech":"lte","simChanged":false,"updatedAt":1790946274090},"phoneNumber":"+12025550102","canManageNumber":false}]
     """
 }
 
@@ -18,12 +22,12 @@ enum LiveGatewayFixture {
 
 final class GatewayCallStateDecodingTests: XCTestCase {
     func testEndedEventDecodesInsteadOfBeingDropped() throws {
-        // The live gateway emits state "ended" in call.ended. The synthesized
+        // The gateway emits state "ended" in call.ended. The synthesized
         // decoder used to throw on it, dropping the only terminal event and
         // leaving dead calls (and replayed rings) on screen forever.
         let json = """
         {"id":"evt_1","seq":80,"type":"call.ended","createdAt":1790936681764,
-         "data":{"id":"line1:b7ffe88b","lineId":"line1","lineName":"LINE1 155****3039",
+         "data":{"id":"line1:b7ffe88b","lineId":"line1","lineName":"LINE1 +120****0101",
          "direction":"inbound","peer":"15555550100","state":"ended","held":false,
          "startedAt":1790936681376,"endedAt":1790936681764,"endReason":"NO CARRIER"}}
         """
@@ -83,34 +87,34 @@ final class ProductionLineContractTests: XCTestCase {
         return HTTPGatewayAPI(origin: origin, tokens: store, configuration: server.configuration)
     }
 
-    func testAuthorizedLinesDecodeLiveGatewayShape() async throws {
+    func testAuthorizedLinesDecodeSyntheticGatewayShape() async throws {
         let server = ScriptedHTTPServer()
         server.start()
         defer { server.stop() }
-        server.enqueue(status: 200, body: LiveGatewayFixture.linesJSON)
+        server.enqueue(status: 200, body: SyntheticGatewayFixture.linesJSON)
         let client = try makeClient(server)
 
         let lines = try await client.authorizedLines()
         XCTAssertEqual(lines.map(\.id), ["line1", "line2"])
-        XCTAssertEqual(lines.map(\.friendlyName), ["15550003039", "15550004926"])
-        XCTAssertEqual(lines[0].phoneNumber, "15550003039")
+        XCTAssertEqual(lines.map(\.friendlyName), ["+12025550101", "+12025550102"])
+        XCTAssertEqual(lines[0].phoneNumber, "+12025550101")
         XCTAssertEqual(lines[0].identity?.numberSource, "manual")
-        XCTAssertEqual(lines[0].identity?.phoneMasked, "155****3039")
-        XCTAssertTrue(lines.allSatisfy(\.canDialNow), "both real lines are dialable")
+        XCTAssertEqual(lines[0].identity?.phoneMasked, "+120****0101")
+        XCTAssertTrue(lines.allSatisfy(\.canDialNow), "both lines are dialable")
         XCTAssertTrue(lines.allSatisfy { $0.permissions.dial })
         XCTAssertTrue(lines.allSatisfy { !$0.canManageNumber }, "probe key had no manage grant")
-        // activeCallId/lastError are absent in the real body; decoding must
+        // activeCallId/lastError are absent in the synthetic body; decoding must
         // tolerate that instead of failing the whole list.
         XCTAssertTrue(lines.allSatisfy { $0.activeCallId == nil && $0.lastError == nil })
         XCTAssertEqual(server.paths, ["/api/v2/lines"])
     }
 
     @MainActor
-    func testLaunchRefreshAndSelectionUseRealDecodedLines() async throws {
+    func testLaunchRefreshAndSelectionUseSyntheticDecodedLines() async throws {
         let server = ScriptedHTTPServer()
         server.start()
         defer { server.stop() }
-        server.enqueue(status: 200, body: LiveGatewayFixture.linesJSON)
+        server.enqueue(status: 200, body: SyntheticGatewayFixture.linesJSON)
         server.enqueue(status: 200, body: "{}") // default-line preference push (first pairing)
         server.enqueue(status: 200, body: "[]") // voicemail refresh after lines
         let client = try makeClient(server)
@@ -511,7 +515,7 @@ final class VoIPTokenRetentionTests: XCTestCase {
         )
         model.testingSimulateVoIPToken("a1b2c3d4e5f6")
         model.unpair()
-        XCTAssertEqual(model.testingVoIPTokenHex, "a1b2c3d4e5f6",
+        XCTAssertEqual(model.testingVoIPTokenHex, "a1b2c3d4e5f6", // gitleaks:allow -- Synthetic PushKit token for this in-memory test only.
                        "the device-scoped voip token must survive unpair so re-pair can re-upload it")
     }
 }

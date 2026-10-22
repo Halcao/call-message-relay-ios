@@ -185,6 +185,126 @@ final class RoutePreflightControllerTests: XCTestCase {
         XCTAssertLessThanOrEqual(h.api.preflightAttachCount, attempts + 1)
     }
 
+    /// Build 68: the GLOBAL preflight ICE configuration is cached for a
+    /// bounded lifetime and keyed by the network-path generation. A second
+    /// handshake on the same path must NOT refetch; an invalidation (network
+    /// change / recheck / background) must refetch. Only the global,
+    /// call-independent payload is ever cached.
+    func testICECacheIsBoundedAndPathKeyed() async throws {
+        let h = Harness()
+        h.cadence.iceCacheSeconds = 60
+        h.api.preflightIce = ICEConfiguration(
+            policy: "all", iceServers: [],
+            expiresAt: RFC3339Date.formatter.string(from: Date().addingTimeInterval(3600)),
+            mediaTransports: ["ice", "ws"])
+        h.make()
+        h.controller.appDidEnterForeground()
+        await waitUntil(timeout: 2) { h.api.preflightAttachCount >= 1 }
+        XCTAssertEqual(h.api.preflightIceFetchCount, 1)
+
+        // A second handshake on the SAME path reuses the cached payload.
+        await waitUntil(timeout: 4) { h.api.preflightAttachCount >= 2 }
+        XCTAssertEqual(h.api.preflightIceFetchCount, 1,
+                       "the global ICE configuration was refetched on an unchanged path")
+        XCTAssertGreaterThanOrEqual(h.controller.iceCacheStats.hits, 1)
+
+        // An invalidation (the explicit user recheck, a background transition
+        // or a network change) must refetch.
+        h.controller.recheck()
+        await waitUntil(timeout: 4) { h.api.preflightIceFetchCount >= 2 }
+        XCTAssertGreaterThanOrEqual(h.api.preflightIceFetchCount, 2,
+                                    "an invalidated cache must refetch")
+    }
+
+    /// An expired local entry is refetched even when the path is unchanged.
+    func testICECacheExpires() async throws {
+        let h = Harness()
+        h.cadence.iceCacheSeconds = 0.05
+        h.api.preflightIce = ICEConfiguration(
+            policy: "all", iceServers: [],
+            expiresAt: RFC3339Date.formatter.string(from: Date().addingTimeInterval(3600)),
+            mediaTransports: ["ice", "ws"])
+        h.make()
+        h.controller.appDidEnterForeground()
+        await waitUntil(timeout: 2) { h.api.preflightAttachCount >= 1 }
+        XCTAssertEqual(h.api.preflightIceFetchCount, 1)
+        try await Task.sleep(nanoseconds: 120_000_000)
+        h.controller.recheck()
+        await waitUntil(timeout: 4) { h.api.preflightIceFetchCount >= 2 }
+        XCTAssertGreaterThanOrEqual(h.api.preflightIceFetchCount, 2)
+    }
+
+    /// The GATEWAY's own expiry always wins over the local upper bound: a
+    /// still-valid but SHORT server expiry is reused while it lasts, and a
+    /// payload whose server expiry has already passed is refetched and never
+    /// cached.
+    func testICECacheHonoursShorterServerExpiry() async throws {
+        let h = Harness()
+        h.cadence.iceCacheSeconds = 300
+        h.cadence.iceCacheSafetySeconds = 0.05
+        h.api.preflightIce = ICEConfiguration(
+            policy: "all", iceServers: [],
+            expiresAt: RFC3339Date.formatter.string(from: Date().addingTimeInterval(8)),
+            mediaTransports: ["ice", "ws"])
+        XCTAssertNotNil(h.api.preflightIce.expiryDate, "fixture expiry must parse")
+        h.make()
+        h.controller.appDidEnterForeground()
+        await waitUntil(timeout: 2) { h.api.preflightAttachCount >= 1 }
+        XCTAssertEqual(h.api.preflightIceFetchCount, 1)
+        // A second cycle inside the server-derived window reuses the payload
+        // even though the local bound is 300s.
+        await waitUntil(timeout: 4) { h.api.preflightAttachCount >= 2 }
+        XCTAssertEqual(h.api.preflightIceFetchCount, 1,
+                       "a still-valid short server expiry must not force a refetch")
+
+        // Now the gateway answers an ALREADY-EXPIRED payload: it must be
+        // refetched (and never cached), so the next cycle fetches again.
+        h.api.preflightIce = ICEConfiguration(
+            policy: "all", iceServers: [],
+            expiresAt: RFC3339Date.formatter.string(from: Date().addingTimeInterval(-60)),
+            mediaTransports: ["ice", "ws"])
+        h.controller.recheck()
+        await waitUntil(timeout: 4) { h.api.preflightIceFetchCount >= 2 }
+        let fetchesAfterExpired = h.api.preflightIceFetchCount
+        await waitUntil(timeout: 6) { h.api.preflightIceFetchCount >= fetchesAfterExpired + 1 }
+        XCTAssertGreaterThanOrEqual(h.api.preflightIceFetchCount, fetchesAfterExpired + 1,
+                                    "an expired payload must never be cached")
+    }
+
+    /// A payload with no usable server expiry is NEVER cached (it may carry
+    /// credentials): every handshake refetches.
+    func testICECacheRefusesUnknownExpiry() async throws {
+        let h = Harness()
+        h.api.preflightIce = ICEConfiguration(
+            policy: "all", iceServers: [], expiresAt: "not-a-date", mediaTransports: ["ice", "ws"])
+        h.make()
+        h.controller.appDidEnterForeground()
+        await waitUntil(timeout: 2) { h.api.preflightAttachCount >= 1 }
+        XCTAssertEqual(h.api.preflightIceFetchCount, 1)
+        h.controller.recheck()
+        await waitUntil(timeout: 4) { h.api.preflightIceFetchCount >= 2 }
+        XCTAssertGreaterThanOrEqual(h.api.preflightIceFetchCount, 2,
+                                    "an unparseable expiry must never be cached")
+    }
+
+    /// The handshake STAGE LOG carries measured cold/warm markers, the real
+    /// config/gather/attach/connect timings, the trickle flag and the cache
+    /// hit/miss counters — no fabricated end-to-end latency.
+    func testStageTimingEvidenceIsLogged() async throws {
+        let h = Harness()
+        h.make()
+        h.controller.appDidEnterForeground()
+        await waitUntil(timeout: 2) { h.controller.freshHandoff != nil }
+        guard let line = h.logs.first(where: { $0.contains("preflight attached") }) else {
+            return XCTFail("no attach stage line: \(h.logs)")
+        }
+        for field in ["cold=", "warm=", "configMs=", "gatherMs=", "attachMs=",
+                      "connectMs=", "firstFrameReadyMs=", "trickle=",
+                      "iceCacheHits=", "iceCacheMisses="] {
+            XCTAssertTrue(line.contains(field), "stage line missing \(field): \(line)")
+        }
+    }
+
     func testTTLExpiryHelperAppliesSafetyMargin() {
         let now = Date()
         XCTAssertEqual(RoutePreflightController.expiry(ttlMs: 45_000, margin: 4, now: now),

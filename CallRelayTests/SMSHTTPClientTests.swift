@@ -143,4 +143,101 @@ final class SMSHTTPClientTests: XCTestCase {
         XCTAssertEqual(server.lastPath, "/api/v1/messages/msg_9/read")
         XCTAssertEqual(server.lastIdempotencyKey, "rk")
     }
+
+    // MARK: Recording device preference wire path (build-67)
+    //
+    // The recording switch must not fake success: the exact PUT path/method/
+    // body/auth are asserted, and the gateway's echoed preference decides
+    // whether the write succeeded. Live evidence (2026-10-16) showed the
+    // gateway had never persisted a recording pref while the same device's
+    // denoise pref persisted, so a silently-ignored field must surface as a
+    // failure instead of an ON state the server never accepted.
+
+    func testDeviceAutoRecordSendsExactPathMethodBodyAndAuth() async throws {
+        server.respond(with: 200, body: #"{"defaultLineId":"line1","uplinkDenoise":false,"downlinkDenoise":false,"autoRecord":true}"#)
+        let client = try makeV2Client()
+        let stored = try await client.updateDeviceAutoRecord(true)
+        XCTAssertTrue(stored)
+        XCTAssertEqual(server.lastMethod, "PUT")
+        XCTAssertEqual(server.lastPath, "/api/v2/devices/dev/preferences")
+        XCTAssertEqual(server.lastAuthorization, "Bearer a")
+        XCTAssertNotNil(server.lastIdempotencyKey)
+        let body = try XCTUnwrap(server.lastBody).replacingOccurrences(of: " ", with: "")
+        XCTAssertTrue(body.contains(#""autoRecord":true"#),
+                      "the device preference body must carry autoRecord=true (got \(body))")
+    }
+
+    func testDeviceAutoRecordFalseSendsFalseAndReturnsEcho() async throws {
+        server.respond(with: 200, body: #"{"autoRecord":false}"#)
+        let client = try makeV2Client()
+        let stored = try await client.updateDeviceAutoRecord(false)
+        XCTAssertFalse(stored)
+        let body = try XCTUnwrap(server.lastBody).replacingOccurrences(of: " ", with: "")
+        XCTAssertTrue(body.contains(#""autoRecord":false"#))
+    }
+
+    /// A 2xx that stores the OPPOSITE value must throw, never fake success.
+    func testEchoedOppositePreferenceIsReportedAsNotSaved() async throws {
+        server.respond(with: 200, body: #"{"autoRecord":false}"#)
+        let client = try makeV2Client()
+        do {
+            _ = try await client.updateDeviceAutoRecord(true)
+            XCTFail("an unconfirmed echo must not report success")
+        } catch let error as APIError {
+            guard case .http(let status, let code, let message) = error else {
+                return XCTFail("expected a structured http failure, got \(error)")
+            }
+            XCTAssertEqual(status, 200)
+            XCTAssertEqual(code, "CB-CLIENT-NOT-SAVED")
+            XCTAssertTrue((message ?? "").contains("未保存"))
+        }
+    }
+
+    /// A 2xx WITHOUT the echo (an older gateway ignoring the field) must
+    /// throw: this is the exact "switch bounces back later" class.
+    func testMissingEchoFieldIsReportedAsNotSaved() async throws {
+        server.respond(with: 200, body: #"{"defaultLineId":"line1","uplinkDenoise":false,"downlinkDenoise":false}"#)
+        let client = try makeV2Client()
+        do {
+            _ = try await client.updateDeviceAutoRecord(true)
+            XCTFail("a response without the stored preference cannot confirm the write")
+        } catch let error as APIError {
+            guard case .http(_, let code, _) = error else {
+                return XCTFail("expected a structured http failure, got \(error)")
+            }
+            XCTAssertEqual(code, "CB-CLIENT-NOT-SAVED")
+        }
+    }
+
+    /// A non-2xx (e.g. a rejected device binding) keeps its own status/code.
+    func testNon2xxPreferenceWriteKeepsTheGatewayStatusAndCode() async throws {
+        server.respond(with: 403, body: #"{"code":"CB-V2-403","message":"forbidden"}"#)
+        let client = try makeV2Client()
+        do {
+            _ = try await client.updateDeviceAutoRecord(true)
+            XCTFail("a rejected write must throw")
+        } catch let error as APIError {
+            guard case .http(let status, let code, _) = error else {
+                return XCTFail("expected a structured http failure, got \(error)")
+            }
+            XCTAssertEqual(status, 403)
+            XCTAssertEqual(code, "CB-V2-403")
+        }
+    }
+
+    /// The V2 endpoint always returns the stored view, so an empty/204 body
+    /// is UNCONFIRMED and must be reported as not saved (never a fake ON).
+    func testEmptyPreferenceEchoBodyIsUnconfirmedNotSaved() async throws {
+        server.respond(with: 204, body: "")
+        let client = try makeV2Client()
+        do {
+            _ = try await client.updateDeviceAutoRecord(true)
+            XCTFail("an empty 2xx body cannot confirm the stored preference")
+        } catch let error as APIError {
+            guard case .http(_, let code, _) = error else {
+                return XCTFail("expected a structured http failure, got \(error)")
+            }
+            XCTAssertEqual(code, "CB-CLIENT-NOT-SAVED")
+        }
+    }
 }

@@ -113,6 +113,9 @@ struct MediaQuality: Equatable {
     var packetLoss: Double?
     /// Audio level 0...1 for the incoming track, if available.
     var inboundLevel: Float?
+    /// Total inbound audio packets reported by the stack, if available.
+    /// Build-48 recovery treats an advancing count as fresh-media proof.
+    var inboundPackets: Int?
 
     var summary: String {
         switch phase {
@@ -160,6 +163,12 @@ protocol CallMediaSession: AnyObject {
     /// Tears the self-managed session down on close. No-op when CallKit owns
     /// the session (or it was never self-activated).
     func deactivateAudioWithoutCallKit()
+    /// Build-48 fresh-media hook: invoked when the stack observes inbound
+    /// audio packets. Default no-op keeps fakes source-compatible.
+    func setRecoveryFreshMedia(_ callback: (() -> Void)?)
+    /// Current transport state, readable after callbacks for the build-48
+    /// direct-recovery adoption gate. Fakes default to a connected session.
+    var currentMediaState: MediaState { get }
     func close()
 }
 
@@ -168,6 +177,8 @@ extension CallMediaSession {
     // overrides them.
     func activateAudioWithoutCallKit() -> Bool { true }
     func deactivateAudioWithoutCallKit() {}
+    func setRecoveryFreshMedia(_ callback: (() -> Void)?) {}
+    var currentMediaState: MediaState { .connected }
 }
 
 // MARK: - WebRTC implementation
@@ -175,6 +186,11 @@ extension CallMediaSession {
 final class WebRTCCallMedia: NSObject, CallMediaSession {
     var onState: ((MediaState) -> Void)?
     var onQuality: ((MediaQuality) -> Void)?
+    var currentMediaState: MediaState { currentState }
+    private var freshMediaCallback: (() -> Void)?
+    func setRecoveryFreshMedia(_ callback: (() -> Void)?) {
+        freshMediaCallback = callback
+    }
 
     private let factory: RTCPeerConnectionFactory
     private var peerConnection: RTCPeerConnection?
@@ -190,6 +206,22 @@ final class WebRTCCallMedia: NSObject, CallMediaSession {
         }
     }
     private var quality = MediaQuality()
+    /// Build-61 three-path routing evidence (real only): the freshest
+    /// stats RTT (seconds) and whether the stats-driven fresh-media proof
+    /// has fired since this session started. nil RTT = no evidence yet.
+    var policyRttSeconds: Double? { quality.rttSeconds }
+    private(set) var policyFreshMediaProven = false
+    /// Build-62 route-policy evidence (REAL stats, never fabricated):
+    /// measured packet loss from the RTCP reports (nil = the stack gave
+    /// no loss visibility this poll — unknown, not zero), measured
+    /// inter-arrival jitter (seconds, inbound-rtp `jitter`), the poll
+    /// timestamp (the sample's freshness anchor — never re-stamped by the
+    /// policy) and a monotonically increasing measurement ID (the poll
+    /// cadence mints measurements; a changed RTT VALUE is not a new one).
+    private(set) var policyPacketLoss: Double?
+    private(set) var policyJitterSeconds: Double?
+    private(set) var policyStatsMeasuredAt: Date?
+    private(set) var policyStatsMeasurementID: UInt64 = 0
     /// True while this session activated the shared AVAudioSession itself
     /// (direct in-app answer, no CallKit activation).
     private var selfManagedAudioActive = false
@@ -412,7 +444,10 @@ final class WebRTCCallMedia: NSObject, CallMediaSession {
 
     private func startStats() {
         stopStats()
-        let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
+        // 1 s while the call is proving/recovering media (build 48 needs a
+        // fresh-inbound signal well inside the 45 s window); this poll reads
+        // stats only and is cheap on a single audio PeerConnection.
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             self?.pollStats()
         }
         statsTimer = timer
@@ -430,20 +465,46 @@ final class WebRTCCallMedia: NSObject, CallMediaSession {
             guard let self else { return }
             var rtt: Double?
             var loss: Double?
+            var jitter: Double?
+            var inboundPackets: Int?
             for statistic in report.statistics.values {
                 let value = statistic.values
                 if let raw = value["googRtt"] as? String, let ms = Double(raw) {
                     rtt = ms / 1000.0
+                }
+                // Inbound-rtp inter-arrival jitter (seconds) — the same
+                // report row the packet counters come from.
+                if value["mediaType"] as? String == "audio",
+                   let j = value["jitter"] as? NSNumber {
+                    jitter = j.doubleValue
                 }
                 if let lost = (value["packetsLost"] as? NSNumber)?.intValue,
                    let recv = (value["packetsReceived"] as? NSNumber)?.intValue,
                    recv + lost > 0 {
                     loss = Double(lost) / Double(recv + lost)
                 }
+                // Inbound RTP audio packets only (the inbound-rtp media
+                // kind discriminator keeps this off of candidate/transport
+                // rows): this is the fresh-media proof.
+                if let kind = value["mediaType"] as? String, kind == "audio",
+                   value["id"] != nil,
+                   let recv = (value["packetsReceived"] as? NSNumber)?.intValue, recv > 0 {
+                    inboundPackets = recv
+                }
             }
             DispatchQueue.main.async {
                 self.quality.rttSeconds = rtt
                 self.quality.packetLoss = loss
+                self.policyPacketLoss = loss
+                self.policyJitterSeconds = jitter
+                self.policyStatsMeasuredAt = Date()
+                self.policyStatsMeasurementID &+= 1
+                let previous = self.quality.inboundPackets ?? 0
+                self.quality.inboundPackets = inboundPackets
+                if let recv = inboundPackets, recv > previous {
+                    self.policyFreshMediaProven = true
+                    self.freshMediaCallback?()
+                }
                 self.onQuality?(self.quality)
             }
         }

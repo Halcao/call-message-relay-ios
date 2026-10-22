@@ -1,0 +1,27 @@
+# EXAMPLE — frp client unit (only for the CGNAT tunnel path; see
+# tools/frp/frpc.example.toml). Install the frpc binary as
+# /usr/local/bin/callrelay-frpc or adjust ExecStart.
+[Unit]
+Description=CallRelay private FRP client
+Wants=network-online.target
+After=network-online.target caddy.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/callrelay-frpc -c /etc/callrelay-frp/frpc.toml
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/callrelay-frp
+WorkingDirectory=/run
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

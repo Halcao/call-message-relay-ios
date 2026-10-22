@@ -24,6 +24,10 @@ final class CallGroupStore: ObservableObject {
     @Published private(set) var conference: ConferenceRecord?
     /// Conference legs the host has put on hold.
     @Published private(set) var heldConferenceLegIDs: Set<String> = []
+    /// True while a conference recording start/stop request is in flight; the
+    /// in-call button shows a pending state and refuses a second tap until the
+    /// awaited server response lands.
+    @Published private(set) var conferenceRecordingPending = false
 
     weak var driver: CallDriver?
 
@@ -46,8 +50,15 @@ final class CallGroupStore: ObservableObject {
         if heldConferenceLegIDs != heldLegIDs { heldConferenceLegIDs = heldLegIDs }
     }
 
+    /// Request-pending flag owned by the live driver; tied to the actual
+    /// awaited start/stop completion, never to a fixed timer.
+    @MainActor func setConferenceRecordingPending(_ pending: Bool) {
+        if conferenceRecordingPending != pending { conferenceRecordingPending = pending }
+    }
+
     func clear() {
         update(held: [], conference: nil, heldLegIDs: [])
+        if conferenceRecordingPending { conferenceRecordingPending = false }
     }
 
     // MARK: Actions (forwarded to the live driver)
@@ -63,6 +74,7 @@ final class CallGroupStore: ObservableObject {
         driver?.playConferenceDTMF(digit, callId: callId)
     }
     @MainActor func splitConference(callId: String) { driver?.splitConference(callId: callId) }
+    @MainActor func toggleConferenceRecording() { driver?.toggleConferenceRecording() }
 
     static func lineLabel(_ lineID: String?) -> String {
         guard let lineID, !lineID.isEmpty else { return "默认线路" }

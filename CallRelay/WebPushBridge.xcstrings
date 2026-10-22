@@ -416,29 +416,6 @@
         }
       }
     },
-    "网关未启用网页推送（需要运维开启 webpush.enabled）。": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "This gateway has web push disabled (the operator must enable webpush.enabled)."
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "网关未启用网页推送（需要运维开启 webpush.enabled）。"
-          }
-        },
-        "zh-Hant": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "網關未啟用網頁推送（需要運維開啟 webpush.enabled）。"
-          }
-        }
-      }
-    },
     "已绑定浏览器": {
       "extractionState": "manual",
       "localizations": {
@@ -692,29 +669,6 @@
         }
       }
     },
-    "在 iPhone/iPad 上先把网关网页“添加到主屏幕”（iOS 16.4+），打开该网页应用后输入上方绑定码；绑定码与链接只在此设备屏幕上显示，不会上传到其他服务。": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "On iPhone/iPad, add this page to your Home Screen first (iOS 16.4+), open it from there, then enter the code above."
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "在 iPhone/iPad 上先把网关网页“添加到主屏幕”（iOS 16.4+），打开该网页应用后输入上方绑定码；绑定码与链接只在此设备屏幕上显示，不会上传到其他服务。"
-          }
-        },
-        "zh-Hant": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "在 iPhone/iPad 上先把本頁「加入主畫面」（iOS 16.4+），從主畫面打開後輸入上方綁定碼。"
-          }
-        }
-      }
-    },
     "设置步骤": {
       "extractionState": "manual",
       "localizations": {
@@ -807,29 +761,6 @@
         }
       }
     },
-    "来电时点击通知会在网页中显示来电；点“在 CallRelay 中打开”回到本 App 的来电界面（不会自动接听）。": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Tap a notification to see the call here, then “Open in CallRelay” to answer in the app."
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "来电时点击通知会在网页中显示来电；点“在 CallRelay 中打开”回到本 App 的来电界面（不会自动接听）。"
-          }
-        },
-        "zh-Hant": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "點按通知在此查看來電，再點「在 CallRelay 中打開」回 App 接聽。"
-          }
-        }
-      }
-    },
     "安全说明": {
       "extractionState": "manual",
       "localizations": {
@@ -872,75 +803,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "網頁推送由你的 CallRelay 網關提供。"
-          }
-        }
-      }
-    },
-    "浏览器订阅密钥只保存在网关，App 与通知中都不包含订阅密钥。": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Subscription keys stay on the gateway — never in this app or in notifications."
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "浏览器订阅密钥只保存在网关，App 与通知中都不包含订阅密钥。"
-          }
-        },
-        "zh-Hant": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "訂閱密鑰只保存在網關，App 與通知都不包含。"
-          }
-        }
-      }
-    },
-    "通知链接使用一次性、短时有效的令牌并放在网址片段中，服务器与代理日志不会记录。": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Notification links use a one-time token that server logs never record."
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "通知链接使用一次性、短时有效的令牌并放在网址片段中，服务器与代理日志不会记录。"
-          }
-        },
-        "zh-Hant": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "通知連結使用一次性令牌，伺服器日誌不會記錄。"
-          }
-        }
-      }
-    },
-    "解除配对或删除设备会同时移除浏览器订阅与网页会话。": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Unpairing removes the browser subscriptions too."
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "解除配对或删除设备会同时移除浏览器订阅与网页会话。"
-          }
-        },
-        "zh-Hant": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "解除配對會同時移除瀏覽器訂閱。"
           }
         }
       }
@@ -1240,6 +1102,98 @@
           "stringUnit": {
             "state": "translated",
             "value": "網頁通知"
+          }
+        }
+      }
+    },
+    "网关未启用网页推送，请联系网关管理员。": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Web push is not enabled on this gateway. Contact your gateway administrator."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "网关未启用网页推送，请联系网关管理员。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "網關未啟用網頁推送，請聯絡網關管理員。"
+          }
+        }
+      }
+    },
+    "在 iPhone/iPad 上把网关网页“添加到主屏幕”（iOS 16.4+），打开后输入绑定码。": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "On iPhone/iPad, add the gateway page to your Home Screen (iOS 16.4+), open it from there, then enter the bind code."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在 iPhone/iPad 上把网关网页“添加到主屏幕”（iOS 16.4+），打开后输入绑定码。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在 iPhone/iPad 上把網關網頁「加入主畫面」（iOS 16.4+），開啟後輸入綁定碼。"
+          }
+        }
+      }
+    },
+    "点通知中的“在 CallRelay 中打开”回到本 App 接听，绝不会自动接听。": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Tap “Open in CallRelay” in the notification to answer in this app; calls are never answered automatically."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "点通知中的“在 CallRelay 中打开”回到本 App 接听，绝不会自动接听。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "點通知中的「在 CallRelay 中開啟」回到本 App 接聽，絕不會自動接聽。"
+          }
+        }
+      }
+    },
+    "解除配对会同时移除已绑定的浏览器。": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Unpairing also removes the bound browsers."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "解除配对会同时移除已绑定的浏览器。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "解除配對會同時移除已綁定的瀏覽器。"
           }
         }
       }

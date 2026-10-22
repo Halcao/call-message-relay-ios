@@ -137,6 +137,10 @@ private final class FeedState: @unchecked Sendable {
     var runPlayFrames = 0
     var runPlaySilent = 0
     var runTickLate = 0
+    /// Longest no-delivery span this run (ms) — honest "capture stopped"
+    /// evidence that the conservation ratio (span ending at the last
+    /// delivery) cannot show.
+    var runMaxDeliveryStallMs = 0
 }
 
 /// Process-wide engine-restart budget shared by all graph instances: at
@@ -235,7 +239,14 @@ final class WSAudioGraph: WebSocketCallMedia.WSAudioGraphing {
             DiagnosticsCensus.shared.increment("audio.graphStartBlockedInterrupted")
             return false
         }
+        return startIfNeededInternal(allowEngineRecreate: true)
+    }
 
+    /// One engine-start attempt. `allowEngineRecreate` bounds the
+    /// invalid-input recovery to a SINGLE engine recreation per start
+    /// (no recursion loop); the re-entry guards in startIfNeeded's caller
+    /// side (running/interruption) are re-checked on the recursive pass.
+    private func startIfNeededInternal(allowEngineRecreate: Bool) -> Bool {
         var captureRate = 0
         var playbackRate = 0
         var hardwareChannels = 0
@@ -276,13 +287,26 @@ final class WSAudioGraph: WebSocketCallMedia.WSAudioGraphing {
         feed.runPlayFrames = 0
         feed.runPlaySilent = 0
         feed.runTickLate = 0
+        feed.runMaxDeliveryStallMs = 0
         feed.lock.unlock()
         } catch {
-            let code = (error as NSError).code
+            let nsError = error as NSError
+            let code = nsError.code
             lastStartFailureCode = code
             AppLog.media.notice("ws audio engine start failed: \(code)")
             DiagnosticsCensus.shared.increment("audio.graphStartFail")
-            DiagnosticsStore.shared.log("audio", "graph start failed code=\(code)")
+            // Build-51: the code-only log could not distinguish a
+            // not-yet-settled session input (the retiring direct ADM's
+            // asynchronous teardown) from a genuinely missing input.
+            // Record the domain, the sampled input format carried in the
+            // error, the session/route state and the ADM demand ownership
+            // so the next field export is conclusive.
+            let inputRate = nsError.userInfo["inputRate"] as? Double ?? -1
+            let inputChannels = nsError.userInfo["inputChannels"] as? Int ?? -1
+            DiagnosticsStore.shared.log("audio",
+                "graph start failed domain=\(nsError.domain) code=\(code)"
+                + " inputRate=\(inputRate) inputCh=\(inputChannels)"
+                + Self.startFailureContextSuffix())
             // The tap is now installed BEFORE start: a failed start must
             // remove it or a retry would install a second tap on the node.
             removeCapture()
@@ -291,6 +315,20 @@ final class WSAudioGraph: WebSocketCallMedia.WSAudioGraphing {
             feed.capture = nil
             feed.lock.unlock()
             sink = nil
+            // Build-51: when the failure is the invalid-input guard (a
+            // reused engine's input node can hold the zero format sampled
+            // while the session input was unsettled — a voice-processing
+            // toggle can also leave the node's IO changed), rebuild ONCE
+            // on a FRESH engine whose input node re-derives the format
+            // from the CURRENT session, then retry the start. Bounded by
+            // `allowEngineRecreate`; any other failure reports false.
+            if allowEngineRecreate,
+               nsError.domain == "WSAudioGraph", code == 1 {
+                audioSurface.recreateEngine()
+                DiagnosticsStore.shared.log("audio",
+                    "ws engine recreated after invalid input format; retrying start")
+                return startIfNeededInternal(allowEngineRecreate: false)
+            }
             return false
         }
         lastStartFailureCode = nil
@@ -303,6 +341,81 @@ final class WSAudioGraph: WebSocketCallMedia.WSAudioGraphing {
         armFeedTimer()
         healthRunStarted()
         return true
+    }
+
+    /// Live readiness probe for the exclusive promotion handover
+    /// (build-51): true while the engine input reports a usable hardware
+    /// format — the exact guard `startIfNeeded` enforces (start failure
+    /// WSAudioGraph code=1). This is a session-derived READ: it can gate
+    /// the start on the retiring ADM's asynchronous teardown, but by
+    /// itself cannot prove a reused engine's input node is not holding a
+    /// sampled zero format — `startIfNeeded` therefore ALSO recreates the
+    /// engine once when a start still samples an invalid format.
+    func isInputReadyForStart() -> Bool { audioSurface.isInputUsable() }
+
+    /// Route-change revalidation (build-67 repair). The coordinator's
+    /// audio-event queue calls `revalidateAudioRoute()` on every
+    /// AVAudioSession route change, and the protocol documents that the REAL
+    /// graph re-checks the live input format and rebuilds the capture
+    /// pipeline when the route altered it — but the production graph never
+    /// implemented the hook, so that revalidation was a silent no-op (the
+    /// test fake implements it, which masked the gap). Implemented here on
+    /// the existing bounded, non-degrading tap-reinstall path: a live format
+    /// mismatch re-attaches the tap with the current format (and rebuilds the
+    /// capture pipeline when the sample rate changed); a settled format is a
+    /// counted no-op, so a running graph is never churned. Nonisolated hop
+    /// matches the other engine-lifecycle entry points.
+    nonisolated func revalidateRoute() {
+        DispatchQueue.main.async { [weak self] in
+            Task { @MainActor in self?.performRouteRevalidation() }
+        }
+    }
+
+    /// Main-actor revalidation: only acts while a real (non-headless) engine
+    /// is running with a live capture pipeline and the LIVE input format
+    /// really differs from the format the current tap was installed with.
+    private func performRouteRevalidation() {
+        guard !configuredForHeadlessTesting, let engine else { return }
+        feed.lock.lock()
+        let running = feed.running
+        let generation = feed.generation
+        let hasPipeline = feed.capture != nil
+        feed.lock.unlock()
+        guard running, hasPipeline else { return }
+        let installed = installedCaptureFormat
+        let current = engine.hardwareInputFormat
+        let changed = installed?.sampleRate != current.sampleRate
+            || installed?.channelCount != current.channelCount
+            || installed?.isInterleaved != current.isInterleaved
+        guard changed else {
+            DiagnosticsCensus.shared.increment("audio.routeRevalidateUnchanged")
+            return
+        }
+        DiagnosticsCensus.shared.increment("audio.routeRevalidateRebuild")
+        DiagnosticsStore.shared.log("audio",
+            "route revalidation: input format changed"
+            + " installedRate=\(Int(installed?.sampleRate ?? 0))"
+            + " currentRate=\(Int(current.sampleRate))"
+            + " installedCh=\(Int(installed?.channelCount ?? 0))"
+            + " currentCh=\(Int(current.channelCount))")
+        performTapReinstall(generation: generation)
+    }
+
+    /// Privacy-safe audio-ownership snapshot for start-failure evidence:
+    /// session activation (bridge), input availability, category/mode, the
+    /// current route's port TYPES, and the process-wide RTC ADM demand
+    /// count. Never audio content, never user identifiers.
+    private nonisolated static func startFailureContextSuffix() -> String {
+        let session = AVAudioSession.sharedInstance()
+        let route = session.currentRoute
+        let inPorts = route.inputs.map { $0.portType.rawValue }.joined(separator: ",")
+        let outPorts = route.outputs.map { $0.portType.rawValue }.joined(separator: ",")
+        let bridgeActive = AudioSessionBridge.shared.activeSession != nil
+        return " sessionActive=\(bridgeActive ? 1 : 0)"
+            + " inputAvailable=\(session.isInputAvailable ? 1 : 0)"
+            + " cat=\(session.category.rawValue) mode=\(session.mode.rawValue)"
+            + " routeIn=[\(inPorts)] routeOut=[\(outPorts)]"
+            + " rtcAdmOwners=\(RTCAudioDemand.ownerCount)"
     }
 
     /// Headless start for tests: wires the capture pipeline at a real
@@ -328,6 +441,7 @@ final class WSAudioGraph: WebSocketCallMedia.WSAudioGraphing {
         feed.runPlayFrames = 0
         feed.runPlaySilent = 0
         feed.runTickLate = 0
+        feed.runMaxDeliveryStallMs = 0
         feed.lock.unlock()
         playback.configure(sink: sink, format: playbackFormat)
         configuredForHeadlessTesting = true
@@ -353,7 +467,8 @@ final class WSAudioGraph: WebSocketCallMedia.WSAudioGraphing {
         let run = (mic: feed.runMicFrames, micSilent: feed.runMicSilent, micPeak: feed.runMicPeak,
                    micSilentDL: feed.runMicSilentDuringDownlink,
                    play: feed.runPlayFrames, playSilent: feed.runPlaySilent,
-                   tickLate: feed.runTickLate)
+                   tickLate: feed.runTickLate,
+                   tapStallMsMax: feed.runMaxDeliveryStallMs)
         let feedMinConservation = feed.runMinConservation
         feed.lock.unlock()
         DiagnosticsCensus.shared.increment("audio.graphStop")
@@ -384,10 +499,19 @@ final class WSAudioGraph: WebSocketCallMedia.WSAudioGraphing {
         DiagnosticsCensus.shared.add("audio.playTrimmed", playback.trimmedFrames)
         DiagnosticsCensus.shared.add("audio.playDropped", playback.droppedFrames)
         DiagnosticsCensus.shared.add("audio.playConcealed", playback.concealedFrames)
+        // Build-67 render-cycle evidence: the largest sink completion batch
+        // (the engine's render cycle in 20 ms buffers) and the effective
+        // schedule-ahead runway. Makes the next field export self-describing
+        // for the class where a runway smaller than one engine cycle starves
+        // the player and trims live audio (0.3.55(65) 5G trace: 100 ms tap
+        // quanta, 690 trims / 1429 downlink frames).
+        let sinkBatchMax = playback.maxCompletionBatch
+        DiagnosticsCensus.shared.maximize("audio.sinkCompletionBatchMax", sinkBatchMax)
         let stopSummary = "graph stop capDropped=\(capDropped) "
             + "playDropped=\(playback.droppedFrames) playTrimmed=\(playback.trimmedFrames)"
             + " playConcealed=\(playback.concealedFrames)"
             + " playDepthMax=\(playDepthMax)"
+            + " sinkBatchMax=\(sinkBatchMax) runway=\(playback.scheduleAheadFramesForEvidence)"
             + " inFlight=\(playback.framesInFlight)"
             + " tapDeliveries=\(tapDeliveries) tapGapMsMax=\(tapGapMs) tapFramesMax=\(tapFramesMax)"
             + " tapCallbacks=\(tapCallbacks) tapUnusable=\(tapUnusable)"
@@ -397,6 +521,7 @@ final class WSAudioGraph: WebSocketCallMedia.WSAudioGraphing {
         let runSummary = " mic=\(run.mic) micSilent=\(run.micSilent) micPeak=\(run.micPeak)"
             + " micSilentDL=\(run.micSilentDL)"
             + " play=\(run.play) playSilent=\(run.playSilent) tickLate=\(run.tickLate)"
+            + " tapStallMsMax=\(run.tapStallMsMax)"
         DiagnosticsStore.shared.log("audio", stopSummary + runSummary)
 
         removeCapture()
@@ -556,6 +681,41 @@ final class WSAudioGraph: WebSocketCallMedia.WSAudioGraphing {
                 requestHealthRestart(reason: "tap-dead", now: now, generation: generation)
             }
         }
+
+        // Build-67 mid-call capture stall (user-confirmed stuck silence:
+        // total loss of actual audio with the call UI still up). The tap
+        // PROVED capture (delivered at least one buffer) and then STOPPED
+        // delivering while the graph runs unmuted. The old watchdog only
+        // reacted to a tap that NEVER delivered, and the conservation gauge
+        // was evidence-only (it also FROZE at its last healthy ratio, so the
+        // 0.3.55(65) export showed capMinPct=100); an uplink that dies after
+        // a healthy start therefore stayed silent forever with the far end
+        // hearing nothing. The verdict reuses the SAME bounded policy as the
+        // cold-start tap-dead path: first the cheap non-degrading tap
+        // reinstall, then ONE engine restart per run inside the process-wide
+        // budget. Real content silence keeps DELIVERING silent samples
+        // (deliveries only stop on genuine capture starvation), a delivery
+        // gap below the grace is normal tap batching (100 ms-1 s cadences
+        // are documented), and while muted the door drops buffers so the
+        // stall clock is reset at the mute boundary.
+        if !muted, let capture, capture.tapDeliverySnapshotCount > 0,
+           let stalled = capture.lastDeliverySilenceSeconds(now: now) {
+            // Evidence (build-67): the longest no-delivery span this run —
+            // the honest signal that capture STOPPED, which the
+            // conservation ratio cannot show (its span ends at the last
+            // delivery and freezes).
+            feed.lock.lock()
+            let stalledMs = Int((stalled * 1000).rounded())
+            if stalledMs > feed.runMaxDeliveryStallMs {
+                feed.runMaxDeliveryStallMs = stalledMs
+            }
+            feed.lock.unlock()
+            if !tapReinstalled, stalled > tapReinstallGraceWindow {
+                requestTapReinstall(now: now, generation: generation)
+            } else if stalled > tapGraceWindow {
+                requestHealthRestart(reason: "tap-stalled", now: now, generation: generation)
+            }
+        }
         // Rate fence: a delivered buffer arrived at a rate the pipeline's
         // converter was not built for. Rejected at the door already; rebuild
         // the pipeline for the live format (bounded once per run) so uplink
@@ -568,11 +728,13 @@ final class WSAudioGraph: WebSocketCallMedia.WSAudioGraphing {
         // Capture-conservation EVIDENCE (2026-10-05 review: NOT a restart
         // trigger — restarts already hurt this user once, and no synthetic
         // repro proves a restart repairs this class). The rolling-window
-        // ratio (delivered samples vs wall time × source rate) is recorded
-        // per run so the next physical call discriminates capture
-        // starvation (ratio ≪ 1, upstream of the pipeline) from transport
-        // batching (ratio ≈ 1): the periodic 200-on/200-off uplink is
-        // diagnosed from evidence, not "fixed" by a risky heuristic.
+        // ratio (delivered samples vs wall time × source rate, span ending
+        // at `now`) is recorded per run so the next physical call
+        // discriminates capture starvation (ratio ≪ 1, upstream of the
+        // pipeline) from transport batching (ratio ≈ 1): the periodic
+        // 200-on/200-off uplink is diagnosed from evidence, not "fixed" by
+        // a risky heuristic. Ending the span at `now` keeps the gauge honest
+        // when the tap stops mid-run (it can no longer freeze at 100).
         if !muted, let capture, let conservation = capture.conservationSnapshot {
             let pct = Int((conservation.ratio * 100).rounded())
             feed.lock.lock()
@@ -1055,6 +1217,10 @@ final class WSAudioGraph: WebSocketCallMedia.WSAudioGraphing {
         // transmitted after unmute.
         pipeline.setAccepting(!muted)
         pipeline.flushAndReset()
+        // Build-67: the mute boundary also resets the mid-call capture-stall
+        // clock — while muted no delivery is ACCEPTED, so an aging last
+        // delivery must never look like capture starvation on unmute.
+        pipeline.resetDeliveryStallClock()
     }
 
     var isMicMuted: Bool {
@@ -1107,6 +1273,28 @@ protocol AudioSurfaceProviding: AnyObject {
     /// when the dead-render cycle has been observed).
     func prepareEngine()
     func startEngine() throws
+    /// Live readiness probe: the exact input-format validity check
+    /// `prepare` applies before building the setup. Lets the promotion
+    /// wait out the retiring ADM's asynchronous teardown instead of racing
+    /// it into a code=1 start failure (build-51). Reads only the
+    /// session-derived input format — never starts hardware.
+    func isInputUsable() -> Bool
+    /// Recreates the underlying engine and player (build-51): a reused
+    /// engine's input node can keep reporting a zero format sampled while
+    /// the session input was unsettled (a voice-processing toggle can also
+    /// leave the node's IO changed), so a retried start rebuilds on a FRESH
+    /// engine whose input node re-derives the format from the CURRENT
+    /// session. Default no-op for lightweight test surfaces.
+    func recreateEngine()
+}
+
+extension AudioSurfaceProviding {
+    /// Lightweight test surfaces default to READY (their start scripting
+    /// already decides success/failure); only the production surface
+    /// probes the real input format.
+    func isInputUsable() -> Bool { true }
+    /// Test surfaces that do not model engine poisoning default to no-op.
+    func recreateEngine() {}
 }
 
 /// Production sink: adapts the nonisolated player box to the scheduler.
@@ -1129,8 +1317,11 @@ private final class PlayerNodeSink: WSPlaybackScheduler.WSPlaybackScheduling {
 
 /// Production AVAudioEngine wrapper.
 private final class AVAudioEngineSurface: AudioSurfaceProviding {
-    private let engine = EngineBox()
-    private let playerNode = PlayerBox()
+    // `var` (not `let`): recreateEngine() replaces BOTH boxes so a retried
+    // start builds on a fresh engine whose input node re-derives its
+    // format from the current session instead of a possibly poisoned one.
+    private var engine = EngineBox()
+    private var playerNode = PlayerBox()
 
     func prepare(enableVoiceProcessing: Bool) throws -> AudioSurfaceSetup {
         // The engine instance is reused across stop/start, so the toggle is
@@ -1147,7 +1338,13 @@ private final class AVAudioEngineSurface: AudioSurfaceProviding {
         let hardwareFormat = engine.avEngine.inputNode.outputFormat(forBus: 0)
         guard hardwareFormat.sampleRate > 0, hardwareFormat.channelCount > 0 else {
             AppLog.media.notice("ws audio: no usable input format")
-            throw NSError(domain: "WSAudioGraph", code: 1)
+            // Carry the sampled format so the catch site can log WHAT the
+            // input reported (build-51: the code-only log was inconclusive
+            // about whether the input was unsettled vs missing).
+            throw NSError(domain: "WSAudioGraph", code: 1, userInfo: [
+                "inputRate": hardwareFormat.sampleRate,
+                "inputChannels": Int(hardwareFormat.channelCount),
+            ])
         }
         let captureSourceFormat = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
@@ -1170,6 +1367,24 @@ private final class AVAudioEngineSurface: AudioSurfaceProviding {
     func startEngine() throws { try engine.startEngine() }
 
     func prepareEngine() { engine.prepareEngine() }
+
+    func isInputUsable() -> Bool {
+        // The input node's outputFormat is a live, session-derived read,
+        // but a REUSED engine can hold a node whose sampled format stayed
+        // zero after the session input was unsettled — a start still
+        // failing this probe triggers recreateEngine() (build-51).
+        let format = engine.avEngine.inputNode.outputFormat(forBus: 0)
+        return format.sampleRate > 0 && format.channelCount > 0
+    }
+
+    func recreateEngine() {
+        // Defensive stop first: the doomed engine never reached start on
+        // this path, but a partial setup must never leak a running unit.
+        engine.stopEngine()
+        engine = EngineBox()
+        playerNode = PlayerBox()
+        DiagnosticsCensus.shared.increment("audio.wsEngineRecreate")
+    }
 
     private final class EngineBox: AudioEngineControlling {
         let avEngine = AVAudioEngine()

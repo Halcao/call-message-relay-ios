@@ -61,23 +61,58 @@ private final class MockAudioSurface: AudioSurfaceProviding {
     func append(_ event: Event) { events.append(event) }
 
     /// Engines created by `prepare`, in order: lets a test change the LIVE
-    /// input format (voice-processing reconfiguration) after start.
+    /// input format (voice-processing reconfiguration) after start. The
+    /// LIVE engine is REUSED across prepares until recreateEngine()
+    /// (mirrors the production surface's reused engine).
     private(set) var engines: [MockEngine] = []
+    private var liveEngine: MockEngine?
     func changeHardwareInputFormat(to format: AVAudioFormat) {
         engines.last?.inputFormat = format
     }
 
+    // MARK: Build-51 invalid-input modeling
+    /// Models the SESSION input state: false while the retiring direct
+    /// ADM's asynchronous teardown still holds the input. The live engine
+    /// SAMPLES this at creation and keeps the sampled validity until the
+    /// surface recreates it — only then does a fresh engine re-derive the
+    /// format from the current session. Never a scripted flip: a start
+    /// succeeds only after the session input genuinely reports usable.
+    var sessionInputUsable = true
+    private(set) var recreateCount = 0
+
     func prepare(enableVoiceProcessing: Bool) throws -> AudioSurfaceSetup {
         events.append(.init(kind: .prepare, voiceProcessing: enableVoiceProcessing))
         requestedVoiceProcessing.append(enableVoiceProcessing)
-        let engine = MockEngine(eventLog: self)
-        engines.append(engine)
+        if liveEngine == nil {
+            let engine = MockEngine(eventLog: self, sampledUsable: sessionInputUsable)
+            engines.append(engine)
+            liveEngine = engine
+        }
+        guard let engine = liveEngine, engine.sampledUsable else {
+            // Mirror the production guard: WSAudioGraph code=1 with the
+            // sampled zero format carried for the failure log.
+            throw NSError(domain: "WSAudioGraph", code: 1, userInfo: [
+                "inputRate": 0.0,
+                "inputChannels": 0,
+            ])
+        }
         let player = MockPlayer()
         return AudioSurfaceSetup(
             engine: engine, player: player,
             hardwareFormat: AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false)!,
             captureSourceFormat: AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false)!,
             playbackFormat: AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 1)!)
+    }
+
+    /// Live readiness probe (production: session-derived input-format
+    /// read on the current engine).
+    func isInputUsable() -> Bool { liveEngine?.sampledUsable ?? sessionInputUsable }
+
+    /// Models the production recreation: the next prepare builds a FRESH
+    /// engine that re-samples the current session input state.
+    func recreateEngine() {
+        recreateCount += 1
+        liveEngine = nil
     }
     func prepareEngine() { events.append(.init(kind: .prepareEngine, voiceProcessing: nil)) }
     func startEngine() throws {
@@ -89,11 +124,20 @@ private final class MockAudioSurface: AudioSurfaceProviding {
 @MainActor
 private final class MockEngine: AudioEngineControlling {
     private let eventLog: MockAudioSurface
+    /// The input validity SAMPLED at engine creation (build-51): a reused
+    /// engine keeps reporting this until the surface recreates it, even if
+    /// the session has since settled — models the production input node
+    /// holding the zero format sampled while the ADM teardown still owned
+    /// the input.
+    let sampledUsable: Bool
     /// Live input-bus format; a test may replace it after start to model a
     /// voice-processing reconfiguration.
     var inputFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false)!
-    init(eventLog: MockAudioSurface) { self.eventLog = eventLog }
+    init(eventLog: MockAudioSurface, sampledUsable: Bool = true) {
+        self.eventLog = eventLog
+        self.sampledUsable = sampledUsable
+    }
     var hardwareInputFormat: AVAudioFormat { inputFormat }
     func installInputTap(bufferSize: AVAudioFrameCount, format: AVAudioFormat, callback: @escaping (AVAudioPCMBuffer) -> Void) {
         eventLog.append(.init(kind: .installTap, voiceProcessing: nil))
@@ -183,6 +227,58 @@ extension WSAudioGraphTests {
             return XCTFail("expected retry tap install + start")
         }
         XCTAssertLessThan(retryTap, retryStart)
+        graph.stop()
+    }
+
+    // MARK: Build-51 invalid-input recovery (promotion handover)
+
+    /// Build-51 field failure (direct→relay promotion): while the retiring
+    /// direct ADM's asynchronous teardown still holds the input, the engine
+    /// start fails with WSAudioGraph code=1 and a REUSED engine keeps its
+    /// sampled zero format. The graph must recreate the engine ONCE per
+    /// start and start ONLY when the session input has genuinely become
+    /// usable again — never succeed from a stale state.
+    func testInvalidInputStartFailsUntilSessionReconfigureAndRecreatesEngineOnce() {
+        let surface = MockAudioSurface()
+        surface.sessionInputUsable = false
+        let graph = WSAudioGraph(audioSurface: surface)
+
+        // Session unsettled: the start fails code=1, the engine is
+        // recreated exactly once, and the retry on the fresh engine STILL
+        // fails because the session input is genuinely still unsettled.
+        XCTAssertFalse(graph.startIfNeeded())
+        XCTAssertEqual(graph.lastStartFailureCode, 1)
+        XCTAssertEqual(surface.recreateCount, 1, "exactly one engine recreation per start")
+        XCTAssertFalse(graph.isRunning)
+
+        // Still unsettled: a later start fails truthfully again (bounded
+        // one more recreation), never claiming audio it cannot run.
+        XCTAssertFalse(graph.startIfNeeded())
+        XCTAssertEqual(graph.lastStartFailureCode, 1)
+        XCTAssertEqual(surface.recreateCount, 2)
+        XCTAssertFalse(graph.isRunning)
+
+        // Proper reconfiguration: the session input becomes usable; the
+        // next start samples it on a fresh engine and runs.
+        surface.sessionInputUsable = true
+        XCTAssertTrue(graph.startIfNeeded())
+        XCTAssertTrue(graph.isRunning)
+        graph.stop()
+    }
+
+    /// Only the WSAudioGraph invalid-input guard may recreate the engine: a
+    /// generic engine-start error (any other domain/code) reports false
+    /// WITHOUT churning the surface.
+    func testNonInputStartFailureDoesNotRecreateEngine() {
+        let surface = MockAudioSurface()
+        surface.startShouldFail = true
+        let graph = WSAudioGraph(audioSurface: surface)
+        XCTAssertFalse(graph.startIfNeeded())
+        XCTAssertEqual(surface.recreateCount, 0,
+                       "only the invalid-input guard recreates the engine")
+        surface.startShouldFail = false
+        XCTAssertTrue(graph.startIfNeeded())
+        XCTAssertEqual(surface.recreateCount, 0)
         graph.stop()
     }
 
@@ -517,6 +613,84 @@ extension WSAudioGraphTests {
         XCTAssertEqual(diagnostics.restarts, 0)
         XCTAssertGreaterThanOrEqual(diagnostics.capMinPct ?? 0, 75,
                                     "one starved window must not dominate the rolling evidence (got \(String(describing: diagnostics.capMinPct)))")
+    }
+
+    // MARK: Build-67 mid-call capture stall (user-confirmed stuck silence)
+
+    /// The tap PROVED capture and then STOPPED delivering: total uplink loss
+    /// that previously had NO recovery (only a tap that NEVER delivered was
+    /// treated, and the conservation gauge froze at its last healthy ratio —
+    /// the 0.3.55(65) export reported capMinPct=100). The bounded policy
+    /// must now fire exactly once per run.
+    func testMidCallCaptureStallTriggersOneBoundedRestart() async {
+        WSAudioGraph.resetRestartBudgetForTest()
+        let graph = WSAudioGraph()
+        let sink = RecordingPlaybackSink()
+        XCTAssertTrue(graph.startHeadless(
+            captureFormat: capture48k, playbackFormat: playback48k, sink: sink, armTimer: true))
+        graph.configureHealthWindowForTest(
+            grace: 0.05, stall: 3600, tapGrace: 0.3, tapReinstallGrace: 0.1)
+        // Prove capture (a healthy delivery), then stop entirely.
+        graph.injectCapturedSamplesForTest(constantSamples(0.25, count: 4800))
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        let diagnostics = graph.runDiagnosticsForTest
+        graph.stop()
+        XCTAssertGreaterThanOrEqual(diagnostics.restarts, 1,
+            "a mid-call capture stall must trigger the bounded health restart")
+        XCTAssertEqual(diagnostics.restarts, 1,
+            "the capture-stall recovery stays bounded to ONE restart per run")
+    }
+
+    /// Real content silence keeps DELIVERING (silent samples are still
+    /// deliveries) and a slow-but-alive tap cadence below the grace is
+    /// normal batching: neither may restart the engine.
+    func testSilentContentAndSlowCadenceNeverTriggerTheCaptureStallVerdict() async {
+        WSAudioGraph.resetRestartBudgetForTest()
+        let graph = WSAudioGraph()
+        let sink = RecordingPlaybackSink()
+        XCTAssertTrue(graph.startHeadless(
+            captureFormat: capture48k, playbackFormat: playback48k, sink: sink, armTimer: true))
+        graph.configureHealthWindowForTest(
+            grace: 0.05, stall: 3600, tapGrace: 0.3, tapReinstallGrace: 0.1)
+        let deadline = Date().addingTimeInterval(1.2)
+        while Date() < deadline {
+            // SILENT samples at a slow 150 ms cadence (each gap < grace).
+            graph.injectCapturedSamplesForTest(constantSamples(0, count: 7200))
+            try? await Task.sleep(nanoseconds: 150_000_000)
+        }
+        let diagnostics = graph.runDiagnosticsForTest
+        graph.stop()
+        XCTAssertEqual(diagnostics.restarts, 0,
+            "silent content and a slow-but-alive cadence are not capture starvation")
+    }
+
+    /// The mute boundary resets the stall clock: while muted no delivery is
+    /// ACCEPTED (the door drops buffers), so a long mute must never look
+    /// like capture starvation on unmute.
+    func testMuteBoundaryResetPreventsSpuriousStallRestart() async {
+        WSAudioGraph.resetRestartBudgetForTest()
+        let graph = WSAudioGraph()
+        let sink = RecordingPlaybackSink()
+        XCTAssertTrue(graph.startHeadless(
+            captureFormat: capture48k, playbackFormat: playback48k, sink: sink, armTimer: true))
+        graph.configureHealthWindowForTest(
+            grace: 0.05, stall: 3600, tapGrace: 0.3, tapReinstallGrace: 0.1)
+        graph.injectCapturedSamplesForTest(constantSamples(0.25, count: 4800))
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        // Muted far longer than the stall grace — no delivery is accepted.
+        graph.setMicMuted(true)
+        try? await Task.sleep(nanoseconds: 600_000_000)
+        graph.setMicMuted(false)
+        // Deliveries resume immediately after unmute.
+        let deadline = Date().addingTimeInterval(0.6)
+        while Date() < deadline {
+            graph.injectCapturedSamplesForTest(constantSamples(0.25, count: 4800))
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        let diagnostics = graph.runDiagnosticsForTest
+        graph.stop()
+        XCTAssertEqual(diagnostics.restarts, 0,
+            "a muted span must not accumulate as capture-stall time")
     }
 
     // MARK: Downlink adaptive jitter + PLC (continuous nonzero PCM)

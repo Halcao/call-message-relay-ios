@@ -15,6 +15,16 @@ final class SpamFilterStore: ObservableObject {
     @Published private(set) var knownSenders: Set<String> = []
     /// Thread keys dismissed from the junk view locally (server keeps them).
     @Published private(set) var hiddenThreadKeys: Set<String> = []
+    /// Master call/SMS interception switches. Both default OFF: unlike the
+    /// old always-on-with-rules behavior, a fresh install never rejects
+    /// anything until the owner deliberately enables a channel. When a
+    /// harassment-capable gateway is paired these also mirror the gateway's
+    /// per-enrollment-key toggles; without one they gate the local policy.
+    @Published private(set) var callBlockingEnabled = false
+    @Published private(set) var smsBlockingEnabled = false
+    /// Local screening history shown in 骚扰拦截 when no gateway history is
+    /// available (unknown/old gateway). Never uploaded.
+    @Published private(set) var screeningHistory: [ScreeningHistoryEntry] = []
 
     private var url: URL
     private var didLoad = false
@@ -40,6 +50,9 @@ final class SpamFilterStore: ObservableObject {
         knownSenders = []
         hiddenThreadKeys = []
         lists = []
+        callBlockingEnabled = false
+        smsBlockingEnabled = false
+        screeningHistory = []
         load()
     }
 
@@ -51,7 +64,111 @@ final class SpamFilterStore: ObservableObject {
     // MARK: Snapshot policy
 
     func policy() -> SpamPolicy {
-        SpamPolicy(rules: rules, enabledPresets: enabledPresets)
+        SpamPolicy(
+            rules: rules, enabledPresets: enabledPresets,
+            callBlockingEnabled: callBlockingEnabled, smsBlockingEnabled: smsBlockingEnabled
+        )
+    }
+
+    // MARK: Master switches
+
+    func setCallBlocking(_ enabled: Bool, notifyGateway: Bool = true) {
+        guard callBlockingEnabled != enabled else { return }
+        callBlockingEnabled = enabled
+        scheduleSave()
+        if notifyGateway { onTogglesChanged?(callBlockingEnabled, smsBlockingEnabled) }
+    }
+
+    func setSMSBlocking(_ enabled: Bool, notifyGateway: Bool = true) {
+        guard smsBlockingEnabled != enabled else { return }
+        smsBlockingEnabled = enabled
+        scheduleSave()
+        if notifyGateway { onTogglesChanged?(callBlockingEnabled, smsBlockingEnabled) }
+    }
+
+    /// Applied when the gateway's key-scoped policy loaded (same-key devices
+    /// share it). Never fires onTogglesChanged back at the gateway.
+    func applyGatewayToggles(callBlocking: Bool, smsBlocking: Bool) {
+        performCloudApply {
+            callBlockingEnabled = callBlocking
+            smsBlockingEnabled = smsBlocking
+            scheduleSave()
+        }
+    }
+
+    // MARK: Screening history (local fallback)
+
+    func recordScreening(peer: String, kind: String, action: String, reason: String) {
+        let entry = ScreeningHistoryEntry(
+            id: UUID(), date: Date(), peer: peer, kind: kind, action: action, reason: reason)
+        screeningHistory.insert(entry, at: 0)
+        if screeningHistory.count > 200 { screeningHistory.removeLast(screeningHistory.count - 200) }
+        scheduleSave()
+    }
+
+    func clearScreeningHistory() {
+        screeningHistory = []
+        scheduleSave()
+    }
+
+    /// Rules/lists converted to gateway payloads for the ONE-TIME EXPLICIT
+    /// 导入现有规则 action. Imported list numbers default to label; the owner
+    /// must deliberately choose reject elsewhere. This is never automatic.
+    func gatewayImportPayload() -> [HarassmentImportPayload] {
+        var payloads: [HarassmentImportPayload] = []
+        for rule in rules where rule.enabled {
+            guard let converted = Self.gatewayPayload(for: rule) else { continue }
+            payloads.append(converted)
+        }
+        // Enabled conservative presets are keyword/regex groups; import them
+        // as ordinary rules instead of silently discarding them.
+        for preset in enabledPresets {
+            for word in preset.keywords {
+                payloads.append(HarassmentImportPayload(number: word, matchKind: "keyword", mode: "block", action: "reject"))
+            }
+            for pattern in preset.regexes {
+                payloads.append(HarassmentImportPayload(number: pattern, matchKind: "regex", mode: "block", action: "reject"))
+            }
+        }
+        // Owner "mark known" senders are explicit trust decisions: carry them
+        // over as trust entries (still only on the explicit import action).
+        for sender in knownSenders {
+            payloads.append(HarassmentImportPayload(number: sender, matchKind: "exact", mode: "trust", action: nil))
+        }
+        for list in lists where list.mode != .off && !list.isBundled {
+            let action = list.mode == .reject ? "reject" : "label"
+            for number in list.numbers {
+                payloads.append(HarassmentImportPayload(
+                    number: number, matchKind: "exact", mode: "block", action: action))
+            }
+        }
+        return payloads
+    }
+
+    /// Local-only items the gateway import cannot migrate; disclosed to the
+    /// owner instead of being claimed as successfully migrated. The bundled
+    /// historical list is app-owned read-only data and is intentionally kept
+    /// on-device; the contact whitelist travels as a SWITCH only (contacts
+    /// themselves are never uploaded by an import).
+    func gatewayImportRetainedLocal() -> [String] {
+        var retained: [String] = []
+        if lists.contains(where: { $0.isBundled && $0.mode != .off }) {
+            retained.append("内置历史名单（保留本机）")
+        }
+        return retained
+    }
+
+    private static func gatewayPayload(for rule: SpamRule) -> HarassmentImportPayload? {
+        let value = rule.value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        switch rule.kind {
+        case .senderExact: return HarassmentImportPayload(number: value, matchKind: "exact", mode: "block", action: "reject")
+        case .numberPrefix: return HarassmentImportPayload(number: value, matchKind: "prefix", mode: "block", action: "reject")
+        case .keyword: return HarassmentImportPayload(number: value, matchKind: "keyword", mode: "block", action: "reject")
+        case .regex: return HarassmentImportPayload(number: value, matchKind: "regex", mode: "block", action: "reject")
+        case .whitelistSender: return HarassmentImportPayload(number: value, matchKind: "exact", mode: "trust", action: nil)
+        case .whitelistKeyword: return HarassmentImportPayload(number: value, matchKind: "keyword", mode: "trust", action: nil)
+        }
     }
 
     // MARK: Rules
@@ -100,6 +217,9 @@ final class SpamFilterStore: ObservableObject {
     var onListModeChange: ((NumberList) -> Void)?
     var onListRemoved: ((UUID) -> Void)?
     var onListAdded: ((NumberList) -> Void)?
+    /// Mirrors master-switch edits to a harassment-capable gateway; unset on
+    /// old gateways, where the switches stay local.
+    var onTogglesChanged: ((Bool, Bool) -> Void)?
 
     func list(mode: NumberListMode, for listID: UUID) {
         guard let index = lists.firstIndex(where: { $0.id == listID }) else { return }
@@ -218,7 +338,9 @@ final class SpamFilterStore: ObservableObject {
         if preCloudSnapshot == nil {
             preCloudSnapshot = SavedFilter(
                 rules: rules, enabledPresets: enabledPresets, lists: lists,
-                knownSenders: knownSenders, hiddenThreadKeys: hiddenThreadKeys)
+                knownSenders: knownSenders, hiddenThreadKeys: hiddenThreadKeys,
+                callBlockingEnabled: callBlockingEnabled, smsBlockingEnabled: smsBlockingEnabled,
+                screeningHistory: screeningHistory)
         }
         performCloudApply {
             rules = synced.rules
@@ -278,6 +400,35 @@ final class SpamFilterStore: ObservableObject {
 
     // MARK: Sender overrides
 
+    /// Remove local rules of the given kinds whose value is the same
+    /// canonical number as `rawPeer` (contextual block/trust replacement).
+    /// Prefix/keyword/regex rules are never touched: only exact-number
+    /// conflicts are replaced.
+    @discardableResult
+    func removeRules(matching rawPeer: String, kinds: [SpamRule.Kind]) -> Int {
+        let keys = Set(PhoneNormalizer.canonicalKeys(rawPeer))
+        guard !keys.isEmpty else { return 0 }
+        let removed = rules.filter { rule in
+            kinds.contains(rule.kind) && !keys.isDisjoint(with: PhoneNormalizer.canonicalKeys(rule.value))
+        }
+        guard !removed.isEmpty else { return 0 }
+        let ids = Set(removed.map(\.id))
+        rules.removeAll { ids.contains($0.id) }
+        scheduleSave()
+        return removed.count
+    }
+
+    /// Drop a sender from the known-sender set (contextual block).
+    @discardableResult
+    func removeKnownSenders(matching rawPeer: String) -> Int {
+        let keys = Set(PhoneNormalizer.canonicalKeys(rawPeer))
+        let before = knownSenders.count
+        knownSenders = knownSenders.filter { !keys.contains($0) }
+        let removed = before - knownSenders.count
+        if removed > 0 { scheduleSave() }
+        return removed
+    }
+
     /// Trust a sender permanently (restore / "标记为已知发件人").
     func markSenderKnown(_ rawPeer: String) {
         for key in PhoneNormalizer.canonicalKeys(rawPeer) { knownSenders.insert(key) }
@@ -321,6 +472,9 @@ final class SpamFilterStore: ObservableObject {
         enabledPresets = saved.enabledPresets
         knownSenders = saved.knownSenders
         hiddenThreadKeys = saved.hiddenThreadKeys
+        callBlockingEnabled = saved.callBlockingEnabled ?? false
+        smsBlockingEnabled = saved.smsBlockingEnabled ?? false
+        screeningHistory = saved.screeningHistory ?? []
         // Bundled list is always owned by the app (provenance/count fixed);
         // preserve the owner's chosen mode, keep custom lists verbatim.
         let custom = saved.lists.filter { $0.isBundled == false }
@@ -333,7 +487,9 @@ final class SpamFilterStore: ObservableObject {
         saveTask?.cancel()
         let snapshot = SavedFilter(
             rules: rules, enabledPresets: enabledPresets, lists: lists,
-            knownSenders: knownSenders, hiddenThreadKeys: hiddenThreadKeys
+            knownSenders: knownSenders, hiddenThreadKeys: hiddenThreadKeys,
+            callBlockingEnabled: callBlockingEnabled, smsBlockingEnabled: smsBlockingEnabled,
+            screeningHistory: screeningHistory
         )
         let target = url
         saveTask = Task { [weak self] in
@@ -348,7 +504,9 @@ final class SpamFilterStore: ObservableObject {
         saveTask?.cancel()
         persist(SavedFilter(
             rules: rules, enabledPresets: enabledPresets, lists: lists,
-            knownSenders: knownSenders, hiddenThreadKeys: hiddenThreadKeys
+            knownSenders: knownSenders, hiddenThreadKeys: hiddenThreadKeys,
+            callBlockingEnabled: callBlockingEnabled, smsBlockingEnabled: smsBlockingEnabled,
+            screeningHistory: screeningHistory
         ), to: url)
     }
 
@@ -420,6 +578,31 @@ private struct SavedFilter: Codable {
     var lists: [NumberList]
     var knownSenders: Set<String>
     var hiddenThreadKeys: Set<String>
+    // Optional so a file written by an older build still decodes (nil means
+    // the conservative default OFF / empty).
+    var callBlockingEnabled: Bool?
+    var smsBlockingEnabled: Bool?
+    var screeningHistory: [ScreeningHistoryEntry]?
+}
+
+/// One locally screened call/SMS row for the no-gateway fallback history.
+struct ScreeningHistoryEntry: Codable, Identifiable, Equatable, Sendable {
+    let id: UUID
+    let date: Date
+    let peer: String
+    /// "call" | "sms"
+    let kind: String
+    /// "reject" | "label"
+    let action: String
+    let reason: String
+}
+
+/// One rule/list row converted for the explicit gateway import.
+struct HarassmentImportPayload: Equatable, Sendable {
+    let number: String
+    let matchKind: String
+    let mode: String
+    let action: String?
 }
 
 extension NumberListRemote.RefreshError {

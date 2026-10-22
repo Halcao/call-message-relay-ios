@@ -145,6 +145,63 @@ enum DiagnosticsRedactor {
     }
 }
 
+/// One redacted multi-path route-selection decision for the diagnostics
+/// export's `route_selection` section (build 61). Contains ONLY transport
+/// metrics — no IPs, no tokens, and no network-epoch strings (the epoch
+/// token is a path identifier and never leaves the device).
+struct RouteSelectionRecord: Codable, Equatable {
+    struct Candidate: Codable, Equatable {
+        var kind: String        // RouteCandidateKind rawValue
+        var rttMs: Double
+        var jitterMs: Double
+        var lossFraction: Double
+        var reorderFraction: Double
+        var queueCostMs: Double
+        var available: Bool
+        var confidence: Double
+        var mediaReady: Bool
+        /// Build-67 evidence honesty: age of the underlying measurement at
+        /// this evaluation (ms). Consecutive rows can carry the SAME rtt
+        /// because they re-evaluate one cached sample (field trace: one
+        /// 252 ms RTT reused for ~7 s); the age makes a reused reading
+        /// distinguishable from a fresh one instead of looking like a
+        /// per-second live measurement. Optional for backward compatibility
+        /// with older exported records.
+        var sampleAgeMs: Double?
+    }
+
+    var at: Date
+    var chosen: String          // RouteCandidateKind rawValue
+    var reason: String          // RouteSelectionReason rawValue
+    var detail: String
+    /// All candidates seen by this evaluation, sorted by kind for a
+    /// deterministic export.
+    var candidates: [Candidate]
+
+    init(at: Date,
+         decision: RouteSelectionDecision,
+         samples: [RouteCandidateKind: RouteCandidateSample]) {
+        self.at = at
+        self.chosen = decision.chosen.rawValue
+        self.reason = decision.reason.rawValue
+        self.detail = decision.detail
+        self.candidates = samples
+            .sorted { $0.key.rawValue < $1.key.rawValue }
+            .map { kind, sample in
+                Candidate(kind: kind.rawValue,
+                          rttMs: sample.rttMs,
+                          jitterMs: sample.jitterMs,
+                          lossFraction: sample.lossFraction,
+                          reorderFraction: sample.reorderFraction,
+                          queueCostMs: sample.queueCostMs,
+                          available: sample.available,
+                          confidence: sample.confidence,
+                          mediaReady: sample.mediaReady,
+                          sampleAgeMs: max(0, at.timeIntervalSince(sample.measuredAt) * 1000))
+            }
+    }
+}
+
 /// Bounded, persisted, exportable diagnostic log.
 ///
 /// Engineering detail lives ONLY in this dedicated surface (and the exported
@@ -170,17 +227,26 @@ final class DiagnosticsStore: ObservableObject {
         var counters: [String: Int]
         var microphonePermission: String
         var notificationsAuthorized: Bool?
+        /// Build-61 multi-path route-selection decisions (redacted records,
+        /// newest last). Empty on gateways/calls that never ran the policy.
+        var routeSelection: [RouteSelectionRecord] = []
     }
 
     static let shared = DiagnosticsStore()
 
     @Published private(set) var entries: [Entry] = []
     @Published private(set) var counters: [String: Int] = [:]
+    /// Build-61 route-selection ring buffer feeding the export's
+    /// `route_selection` section (bounded like the entries buffer).
+    @Published private(set) var routeSelectionRecords: [RouteSelectionRecord] = []
 
     private let maxEntries: Int
     /// Hard cap on every stored message, so a pathological error string can
     /// never blow up the buffer or the on-disk file.
     private let maxMessageLength = 512
+    /// Bound on the route-selection record ring buffer (one record per
+    /// policy evaluation that the coordinator published).
+    private let maxRouteSelectionRecords = 100
     /// Bound on the SERIALIZED persisted entries file (unicode makes byte
     /// size unrelated to entry count, so the encoded size is what matters).
     private let maxFileBytes: Int
@@ -283,6 +349,14 @@ final class DiagnosticsStore: ObservableObject {
         persistCounters()
     }
 
+    /// Appends one redacted route-selection decision (build 61), bounded.
+    func recordRouteSelection(_ record: RouteSelectionRecord) {
+        routeSelectionRecords.append(record)
+        if routeSelectionRecords.count > maxRouteSelectionRecords {
+            routeSelectionRecords.removeFirst(routeSelectionRecords.count - maxRouteSelectionRecords)
+        }
+    }
+
     // MARK: Export / clear
 
     /// Current notification authorization, cached for the snapshot (push
@@ -311,7 +385,8 @@ final class DiagnosticsStore: ObservableObject {
             entries: entries,
             counters: counters,
             microphonePermission: AVAudioSessionRecordPermissionProbe.current,
-            notificationsAuthorized: await notificationAuthorization())
+            notificationsAuthorized: await notificationAuthorization(),
+            routeSelection: routeSelectionRecords)
     }
 
     /// Writes a FRESH export file (one snapshot per call) and returns its
@@ -331,6 +406,7 @@ final class DiagnosticsStore: ObservableObject {
     func clear() {
         entries.removeAll()
         counters.removeAll()
+        routeSelectionRecords.removeAll()
         DiagnosticsCensus.shared.reset()
         try? FileManager.default.removeItem(at: entriesURL)
         try? FileManager.default.removeItem(at: countersURL)

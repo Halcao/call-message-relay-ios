@@ -45,16 +45,6 @@ struct InCallRouteMenu: View {
                         Text(model.routeDiagnostics.relay.label())
                             .foregroundStyle(.secondary)
                     }
-                    if model.routeDiagnostics.inCall {
-                        ForEach(model.routeDiagnostics.liveTelemetryRows(), id: \.label) { row in
-                            HStack {
-                                Text(row.label)
-                                Spacer()
-                                Text(row.value)
-                                    .foregroundStyle(row.isCurrent ? Color.secondary : Color.secondary.opacity(0.6))
-                            }
-                        }
-                    }
                 }
                 // 2026-10-06 routing policy: explicit direct/relay selections
                 // and one explicit auto evaluation are LIVE actions. The
@@ -73,20 +63,12 @@ struct InCallRouteMenu: View {
             .accessibilityLabel(accessibilityLabel)
             .accessibilityValue(accessibilityValue)
 
+            // One non-blocking notice bar, never a modal alert on top of a
+            // live call: the bar already carries the same recovery action
+            // (switch to auto) and an explicit dismiss control.
             if let notice = model.routeNotice {
                 noticeBar(notice)
             }
-        }
-        .alert(String(localized: "线路切换"), isPresented: Binding(
-            get: { model.routeNotice != nil },
-            set: { presented in if !presented { model.dismissRouteNotice() } }
-        )) {
-            if model.routeNoticeOffersAuto {
-                Button(String(localized: "改用自动模式")) { model.switchRouteToAuto() }
-            }
-            Button(String(localized: "保持当前线路"), role: .cancel) { model.dismissRouteNotice() }
-        } message: {
-            Text(model.routeNotice ?? "")
         }
     }
 
@@ -186,7 +168,7 @@ struct InCallRouteMenu: View {
         case .direct, .relay:
             return state.statusLine
         case .none:
-            return state.probing ? String(localized: "探测直连…") : state.mode.shortLabel
+            return state.probing ? String(localized: "正在测试直连…") : state.mode.shortLabel
         }
     }
 
@@ -285,6 +267,65 @@ struct RouteModePickerView: View {
                     .buttonStyle(.plain)
                 }
             }
+            // Build-61: QUIC-capable gateways get a direct-transport
+            // sub-chooser (自动 / QUIC 直连 / 现有直连). Hidden entirely on
+            // older gateways so nothing new appears where QUIC is not
+            // advertised. Forced picks persist per gateway; a live call keeps
+            // its pinned route until the coordinator enforces the choice.
+            if model.directTransportChoicesAvailable {
+                Section {
+                    ForEach(DirectTransportChoice.allCases) { choice in
+                        Button {
+                            model.setDirectTransportChoice(choice)
+                        } label: {
+                            HStack {
+                                Text(choice.title)
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                                if model.preferredDirectTransport == choice {
+                                    Image(systemName: "checkmark")
+                                        .foregroundStyle(Color.accentColor)
+                                }
+                            }
+                            .frame(minHeight: 44)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                } header: {
+                    Text(String(localized: "直连方式"))
+                }
+                .accessibilityIdentifier("directTransportPicker")
+            }
+            // Chosen-path status: one row per candidate with its freshest
+            // measured stats (RTT / 抖动 / 丢包). Queue/backlog numbers carry
+            // the explicit "（估计）" suffix — they are estimates, never
+            // presented as measured. Missing ⇒ 未测量; not usable ⇒ 不可用.
+            if model.directTransportChoicesAvailable {
+                Section {
+                    ForEach(RouteCandidateKind.allCases, id: \.self) { kind in
+                        HStack {
+                            Text(kind.title)
+                                .foregroundStyle(.primary)
+                            Spacer()
+                            Text(routeCandidateStatusText(kind))
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.trailing)
+                            if model.chosenRouteKind == kind {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(.green)
+                                    .accessibilityHidden(true)
+                            }
+                        }
+                        .frame(minHeight: 44)
+                        .accessibilityIdentifier(kind == .quicDirect
+                                                 ? "routeQuicStatus"
+                                                 : "routeCandidateStatus_\(kind.rawValue)")
+                    }
+                } header: {
+                    Text(String(localized: "当前路径"))
+                }
+                .accessibilityIdentifier("chosenRoutePath")
+            }
             // Measured per-path transport status (direct candidate echo RTT /
             // WSS relay ping RTT) reusing the existing measurements. Values
             // are never zeroed or faked; stale shows its age.
@@ -305,6 +346,24 @@ struct RouteModePickerView: View {
                         .multilineTextAlignment(.trailing)
                 }
                 .accessibilityIdentifier("routeRelayStatus")
+                // Build-50 hot standby: truthful freshness of the warm spare
+                // (connected/ready or connecting/unavailable). Never a fake
+                // zero; RTT shows only when measured.
+                if let standby = model.hotStandbyState, let kind = standby.standby {
+                    HStack {
+                        Label(kind == .direct ? MediaRouteKind.direct.shortLabel : MediaRouteKind.relay.shortLabel,
+                              systemImage: "cable.connector")
+                        Spacer()
+                        Text(standby.promotionInFlight
+                             ? String(localized: "切换中")
+                             : standby.standbyFresh
+                             ? String(localized: "备用就绪")
+                             : String(localized: "备用不可用"))
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.trailing)
+                    }
+                    .accessibilityIdentifier("routeStandbyStatus")
+                }
                 if !model.routeDiagnostics.inCall {
                     Button {
                         model.recheckRouteMeasurement()
@@ -315,9 +374,7 @@ struct RouteModePickerView: View {
                     .accessibilityIdentifier("routeRecheckButton")
                 }
             } header: {
-                Text(String(localized: "线路测量"))
-            } footer: {
-                Text(model.routeDiagnostics.measurementFooter())
+                Text(String(localized: "线路延迟"))
             }
             // Live while the call runs, explicitly HISTORICAL after it ends:
             // a frozen sample must never sit under a "实时更新" footer
@@ -358,5 +415,30 @@ struct RouteModePickerView: View {
                 model.recheckRouteMeasurement()
             }
         }
+    }
+
+    /// Compact per-candidate value for the 当前路径 rows: fresh measured
+    /// "42 ms · 抖动 3 ms · 丢包 0.0%", a queue/backlog ESTIMATE fragment
+    /// with the explicit "（估计）" suffix, 不可用 when the path is not
+    /// usable, 未测量 when no sample exists. Values older than the freshness
+    /// TTL are not presented as current (same honesty contract as the
+    /// existing route rows).
+    private func routeCandidateStatusText(_ kind: RouteCandidateKind) -> String {
+        guard let sample = model.routeCandidateStats[kind] else {
+            return String(localized: "未测量")
+        }
+        let age = Date().timeIntervalSince(sample.measuredAt)
+        guard sample.available, age <= 10 else {
+            return String(localized: "不可用")
+        }
+        let rtt = Int(sample.rttMs.rounded())
+        let jitter = Int(sample.jitterMs.rounded())
+        let loss = String(format: "%.1f%%", max(0, sample.lossFraction) * 100)
+        var text = String(localized: "\(rtt) ms · 抖动 \(jitter) ms · 丢包 \(loss)")
+        if sample.queueCostMs > 0 {
+            let queue = Int(sample.queueCostMs.rounded())
+            text += " · " + String(localized: "缓冲 \(queue) ms（估计）")
+        }
+        return text
     }
 }

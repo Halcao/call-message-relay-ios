@@ -134,6 +134,20 @@ struct GatewayOrigin: Hashable, Sendable {
         return (comps.port ?? defaultPort(for: otherScheme)) == (port ?? defaultPort(for: scheme))
     }
 
+    /// Canonical identity of the API this origin serves (scheme + host +
+    /// effective port + base path + wire version, never any credential or
+    /// query). The durable history scope combines it with the paired gateway
+    /// id and device id, so two hosts resolving to one machine (port-based
+    /// deployments) and the same gateway behind different routes can never
+    /// share — or leak — a cache file.
+    var canonicalScopeID: String {
+        let effectivePort = port ?? defaultPort(for: scheme)
+        let path = baseURL.path.hasSuffix("/") && baseURL.path != "/"
+            ? String(baseURL.path.dropLast())
+            : baseURL.path
+        return "\(scheme)://\(host):\(effectivePort)\(path)/api/\(apiVersion)"
+    }
+
     private func defaultPort(for scheme: String?) -> Int {
         scheme == "https" || scheme == "wss" ? 443 : 80
     }

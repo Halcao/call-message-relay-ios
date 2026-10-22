@@ -61,7 +61,10 @@ final class CallRouteController {
         let retireRelay: () -> Void
         /// Opens a FRESH WSS host attach WITHOUT taking audio ownership;
         /// true only after `ready`. The session is staged in the coordinator.
-        let stageRelay: () async -> Bool
+        /// Build-49: carries the recovery attempt identity so the staged
+        /// socket's fresh-media proof is the CAPTURED identity, never a
+        /// delivery-time lookup (nil for ordinary route handovers).
+        let stageRelay: (MediaRecoveryController.ProofIdentity?) async -> Bool
         /// Exclusive handover: starts the staged relay's capture/playback
         /// graph and closes the adopted direct peer when one is live. Called
         /// with nil when no local peer was adopted (server reconciliation /
@@ -100,6 +103,8 @@ final class CallRouteController {
 
     private var ice: ICEConfiguration
     private var candidate: DirectProbeControlling?
+    /// Build-68 incremental exchange for the current pre-commit probe.
+    private var trickleExchange: TrickleCandidateExchange?
     private var activeDirect: DirectProbeControlling?
     /// The probe whose commit HTTP request is in flight. Never cancelled by
     /// a policy change; its outcome must always be reconciled.
@@ -117,6 +122,10 @@ final class CallRouteController {
     /// never cancelled through this (its server-side outcome must reconcile).
     private var selectionEpoch: UInt64 = 0
     private var tearingDown = false
+    /// Build-50: true for a capability-enabled normal call. The hot-standby
+    /// side is the single routing decision owner; automatic startup upgrade,
+    /// failure monitoring and server reconciliation stay suppressed.
+    private let hotStandbyOwned: Bool
     /// True once the call-start selection settled: the route is pinned and
     /// quality-driven switching is disabled for the rest of the call.
     private var pinned = false
@@ -146,6 +155,29 @@ final class CallRouteController {
     /// direct path carries call media (~0.5 s at the 50 pps audio cadence).
     static let promotionReproofPackets: UInt64 = 25
     private var state = CallRouteState()
+
+    /// Build-61: while the QUIC three-path authority is active, the legacy
+    /// AUTOMATIC promotion (startup upgrade, sustained promotion) stands
+    /// down so two selectors can never adopt audio independently. Manual
+    /// forced choices still work.
+    var automaticStandDown = false
+    /// Set while a direct candidate is connected AND media-ready (the
+    /// exact gate the automatic path would use); the three-path authority
+    /// consults it before proposing a RTC adoption.
+    private(set) var directCandidateReady = false
+
+    /// Build-61 policy seam: a proven ready RTC candidate exists.
+    func hasProvenReadyDirectCandidateForPolicy() -> Bool {
+        state.active == .direct || directCandidateReady
+    }
+
+    /// Build-61 policy seam: adopt the direct candidate through the SAME
+    /// fenced path a manual direct request uses (make-before-break,
+    /// rollback on failure) — without touching the persisted preference.
+    func adoptProvenDirectForPolicy() async -> Bool {
+        await performRequestDirect()
+        return state.active == .direct
+    }
 
     /// ONE serialization gate for every route transaction. FIFO waiters, so
     /// the latest mode wins and no probe/attach overlaps another.
@@ -238,6 +270,14 @@ final class CallRouteController {
          initialDirect: DirectProbeControlling? = nil,
          probeFactory: @escaping @MainActor () -> DirectProbeControlling = { MediaProbeController() },
          cadence: Cadence = Cadence(),
+         /// Build-50 single route owner: true when the gateway advertises
+         /// mediaStandby for this call. The HotStandbyController + its
+         /// watchdog are the ONLY routing decision owner; this controller's
+         /// automatic startup upgrade, failure monitor and server
+         /// reconciliation are suppressed from the moment of creation, so no
+         /// legacy probe/attach can race the standby install. Truthful
+         /// telemetry and explicitly requested actions still run.
+         hotStandbyOwnsRouting: Bool = false,
          advisorFactory: @escaping () -> MediaRouteAdvisor = {
              MediaRouteAdvisor(minimumSamples: 4, improvementThreshold: 0.2,
                                minimumDwell: 6, maximumPromotions: 1, maximumFallbacks: 1,
@@ -253,6 +293,7 @@ final class CallRouteController {
         self.initialDirect = initialDirect
         self.probeFactory = probeFactory
         self.cadence = cadence
+        self.hotStandbyOwned = hotStandbyOwnsRouting
         self.makeAdvisor = advisorFactory
         self.advisor = advisorFactory()
         state.mode = initialMode
@@ -333,6 +374,46 @@ final class CallRouteController {
     }
 
     var routeState: CallRouteState { state }
+
+    /// Build-50 hot standby: applies a user-selected mode after a standby-
+    /// driven promotion WITHOUT touching the live transport (the promotion
+    /// already switched it). Persisting the mode here keeps the watchdog
+    /// from auto-switching a forced selection back.
+    func applyModeWithoutTeardown(_ mode: MediaRouteMode) {
+        self.mode = mode
+        publish {
+            $0.mode = mode
+            $0.pendingModeChange = false
+        }
+    }
+
+    /// Build-50 hot standby: records a route change the hot-standby
+    /// controller executed EXTERNALLY (fenced make-before-break promotion).
+    /// No probing/advisor involvement — the candidate was already measured
+    /// warm; this only keeps the published route truth consistent so the UI
+    /// and the next recovery decision see the real carrier.
+    func noteExternalPrimary(_ direct: Bool, adopted: DirectProbeControlling?) {
+        if direct {
+            self.activeDirect = adopted
+            self.transport = .direct
+        } else {
+            self.transport = .relay
+            // Build-50: the demoted direct peer is now owned by the
+            // hot-standby side (standbyDirect). Drop this controller's
+            // reference and cancel its legacy monitor/measure so neither can
+            // reattach or close the demoted peer after the swap.
+            self.activeDirect = nil
+            self.monitorTask?.cancel()
+            self.measure?.close()
+            self.measure = nil
+        }
+        self.publish {
+            $0.active = direct ? .direct : .relay
+            $0.switching = false
+            $0.probing = false
+            $0.directDegraded = false
+        }
+    }
 
     private var lastLoggedSummary = ""
 
@@ -421,7 +502,13 @@ final class CallRouteController {
                         state.lossFraction = nil
                         state.localBufferSeconds = telemetry.localBufferSeconds
                         state.gatewayBufferSeconds = telemetry.gatewayBufferSeconds
-                        state.telemetryAt = now
+                        // Build-67 freshness honesty: the sample timestamp is
+                        // the MEASUREMENT time, never the publish tick. A
+                        // reused pong (field trace: one RTT sample reused for
+                        // ~7 s while the main actor was busy with WebRTC
+                        // probe work) must age visibly in the UI instead of
+                        // being re-stamped "now" every second.
+                        state.telemetryAt = sample.map { min($0.at, now) } ?? now
                     case .direct:
                         let probe = self.activeDirect
                         let fresh = probe?.freshQualitySamples(within: 8, now: now) ?? []
@@ -437,7 +524,11 @@ final class CallRouteController {
                         // local/gateway buffer values under a direct label.
                         state.localBufferSeconds = nil
                         state.gatewayBufferSeconds = nil
-                        state.telemetryAt = now
+                        // Same freshness honesty as the relay branch: the
+                        // anchor is the newest real echo sample's timestamp.
+                        let newestEcho = probe?
+                            .freshTimestampedQualitySamples(within: 8, now: now).last?.at
+                        state.telemetryAt = newestEcho.map { min($0, now) } ?? now
                     case .none:
                         break
                     }
@@ -481,6 +572,19 @@ final class CallRouteController {
 
     func setMode(_ newMode: MediaRouteMode) async {
         guard !tearingDown else { return }
+        if hotStandbyOwned {
+            // Single-owner defense: the coordinator routes explicit choices
+            // through the hot-standby owner; this controller merely records
+            // the mode — no legacy handover, probe or primary commit.
+            mode = newMode
+            publish {
+                $0.mode = newMode
+                $0.pendingModeChange = false
+                $0.notice = nil
+                $0.offersAutoFallback = false
+            }
+            return
+        }
         // Build-36 manual escape: an explicit relay choice IS a live action
         // while the adopted direct peer carries the call. The user's field
         // report (build 35) showed the menu accepted "relay" but the pinned
@@ -629,6 +733,17 @@ final class CallRouteController {
                 callbacks.discardPreflight(handoff)
             }
         }
+        if hotStandbyOwned {
+            // Build-50 single owner: no startup probe or upgrade — the
+            // standby attach owns the non-primary transport (its own probe
+            // offer/attach + standby commit) and the watchdog owns every
+            // promotion decision. Two probe requests cannot race because
+            // this selection never issues one; the route just pins the
+            // already-audible carrier and keeps publishing telemetry.
+            pinned = true
+            publish { $0.pinned = true }
+            return
+        }
         if transport == .direct {
             // Pre-pin mode change while a commit already adopted direct
             // (e.g. the user picked another mode during the commit): keep or
@@ -683,6 +798,8 @@ final class CallRouteController {
                     let promoted = await sustainedPromotionCheck(
                         probe: handoff.probe, gen: epoch, expiresAt: handoff.expiresAt)
                     candidate = nil
+            directCandidateReady = false
+                    directCandidateReady = false
                     publish { $0.probing = false }
                     if promoted {
                         adoptedHandoff = handoff
@@ -790,6 +907,10 @@ final class CallRouteController {
     /// commits it make-before-break. Any failure — establishment, commitment,
     /// or the post-adoption audio gate — leaves or restores the relay.
     private func performStartupUpgrade(gen: UInt64, freshWindow: Bool = false) async {
+        guard !automaticStandDown else {
+            DiagnosticsStore.shared.log("route", "startup upgrade stood down (three-path authority active)")
+            return
+        }
         let sel = selectionEpoch
         DiagnosticsStore.shared.log("route", "startup opportunity begin mode=auto")
         let startedAt = Date()
@@ -832,6 +953,7 @@ final class CallRouteController {
     private func sustainedPromotionCheck(probe: DirectProbeControlling, gen: UInt64,
                                          expiresAt: Date? = nil,
                                          freshWindow: Bool = false) async -> Bool {
+        guard !automaticStandDown else { return false }
         let readyAt = Date()
         let selection = selectionEpoch
         // A startup opportunity is bounded both by the absolute window from
@@ -969,7 +1091,12 @@ final class CallRouteController {
         DiagnosticsStore.shared.log("route", "warm direct-first handoff adopted id=\(callId)")
         startMeasureSocket(gen: epoch)
         startDirectMonitoring(autoFallback: mode == .auto)
-        startDirectAudioGate(probe: probe, gen: epoch)
+        if !hotStandbyOwned {
+            // Legacy single-path call: the post-adoption audio gate owns
+            // bounded rollback. In hot-standby calls the watchdog owns
+            // failure detection; running this gate could race its swaps.
+            startDirectAudioGate(probe: probe, gen: epoch)
+        }
         pinned = true
         publish { $0.pinned = true }
     }
@@ -991,6 +1118,10 @@ final class CallRouteController {
     /// True while the active transport is the adopted direct peer (no WSS
     /// graph exists on a warm direct-first call).
     var activeTransportIsDirect: Bool { transport == .direct && activeDirect != nil }
+    /// Build-50 hot standby: read-only access to the adopted direct peer so
+    /// the coordinator can DEMOTE it to the standby role after an external
+    /// (standby-driven) promotion instead of closing it.
+    var currentDirectProbe: DirectProbeControlling? { activeDirect }
 
     /// Self-activation fallback for a warm direct-first in-app answer whose
     /// system activation never arrived.
@@ -1010,6 +1141,8 @@ final class CallRouteController {
     func teardown() {
         tearingDown = true
         epoch &+= 1
+        trickleExchange?.cancel()
+        trickleExchange = nil
         stopRelayRttPublisher()
         policyTask?.cancel()
         monitorTask?.cancel()
@@ -1104,13 +1237,16 @@ final class CallRouteController {
     /// cancellable by a newer selection/teardown. A stalled tunnel therefore
     /// cannot pin the single route transaction: the user's newer selection
     /// applies immediately.
-    private func attachWithBound(_ offer: String, signal: AbortSignal) async throws -> WebRTCAnswer {
+    private func attachWithBound(_ offer: String, signal: AbortSignal, trickle: Bool) async throws -> WebRTCAnswer {
         let api = self.api
         let callId = self.callId
         let timeout = cadence.attachTimeout
         return try await withThrowingTaskGroup(of: WebRTCAnswer.self) { group in
             group.addTask {
-                try await api.attachMediaProbe(callId: callId, sdp: offer)
+                if trickle, let trickleAPI = api as? TrickleMediaAPI {
+                    return try await trickleAPI.attachMediaProbe(callId: callId, sdp: offer, trickle: true)
+                }
+                return try await api.attachMediaProbe(callId: callId, sdp: offer)
             }
             group.addTask {
                 try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
@@ -1157,12 +1293,25 @@ final class CallRouteController {
         attachAbort = abortSignal
         defer { if attachAbort === abortSignal { attachAbort = nil } }
 
+        // Build 68 incremental handshake: when the gateway advertises trickle
+        // the offer goes out before gathering finishes and the candidate
+        // exchange runs while the connection checks already begin. Otherwise
+        // the exact full-SDP handshake is used.
+        var trickleProbe: TrickleProbeCapable?
+        if ice.mediaTrickle, api is TrickleMediaAPI, let capable = probe as? TrickleProbeCapable {
+            trickleProbe = capable
+        }
         do {
-            let offer = try await probe.makeOffer(ice: ice)
+            var offer: String
+            if let trickleProbe {
+                offer = try await trickleProbe.makeOfferTrickle(ice: ice).sdp
+            } else {
+                offer = try await probe.makeOffer(ice: ice)
+            }
             guard !isCancelled() else { return .unavailable("") }
             let answer: WebRTCAnswer
             do {
-                answer = try await attachWithBound(offer, signal: abortSignal)
+                answer = try await attachWithBound(offer, signal: abortSignal, trickle: trickleProbe != nil)
             } catch CandidateAttachError.superseded {
                 return .unavailable("")
             } catch CandidateAttachError.timedOut {
@@ -1172,6 +1321,41 @@ final class CallRouteController {
             guard !isCancelled() else { return .unavailable("") }
             try await probe.applyAnswer(answer.sdp)
             guard !isCancelled() else { return .unavailable("") }
+            if let trickleProbe, let attachId = answer.attachId {
+                let exchange = TrickleCandidateExchange { message in
+                    DiagnosticsStore.shared.log("route", message)
+                }
+                trickleExchange?.cancel()
+                trickleExchange = exchange
+                let callId = self.callId
+                let api = self.api
+                exchange.start(
+                    attachId: attachId,
+                    initialRemoteCursor: answer.candidateCursor ?? 0,
+                    localCandidates: { [weak trickleProbe] in
+                        trickleProbe?.locallyGatheredCandidates ?? []
+                    },
+                    localGatheringComplete: { [weak trickleProbe] in
+                        trickleProbe?.gatheringFinished ?? true
+                    },
+                    post: { [weak self] attachId, candidates in
+                        guard let trickleAPI = self?.api as? TrickleMediaAPI else {
+                            throw APIError.notReady("当前配对不支持增量直连协商。")
+                        }
+                        try await trickleAPI.postProbeCandidates(callId: callId, attachId: attachId,
+                                                                 candidates: candidates)
+                    },
+                    poll: { [weak self] attachId, after in
+                        guard let trickleAPI = self?.api as? TrickleMediaAPI else {
+                            throw APIError.notReady("当前配对不支持增量直连协商。")
+                        }
+                        return try await trickleAPI.pollProbeCandidates(callId: callId,
+                                                                        attachId: attachId, after: after)
+                    },
+                    apply: { [weak trickleProbe] candidate in
+                        trickleProbe?.addRemoteCandidate(candidate)
+                    })
+            }
         } catch APIError.http(let status, let code, _) {
             let cancelled = isCancelled()
             if candidate === probe { cancelCandidate() }
@@ -1193,6 +1377,76 @@ final class CallRouteController {
     }
 
     // MARK: Forced direct
+
+    /// Build-48 recovery ALTERNATE attempt (auto mode only): try the OTHER
+    /// transport through the same proven, single-owner machinery. Never
+    /// changes the user's persisted preference or the call's mode; returns
+    /// true when the alternate transport became the carrier.
+    ///
+    /// Build-49: the recovery attempt identity travels with the attempt, and
+    /// `onFreshMedia` is invoked with it when the ADOPTED alternate transport
+    /// proves fresh inbound media (first real inbound audio evidence — never
+    /// CONNECTED/RTT), so a successful alternate recovery clears the episode
+    /// exactly like a same-route recovery.
+    func recoverAlternate(
+        proof: MediaRecoveryController.ProofIdentity?,
+        onFreshMedia: (@MainActor (MediaRecoveryController.ProofIdentity) -> Void)?
+    ) async -> Bool {
+        guard !tearingDown, mode == .auto else { return false }
+        let previous = transport
+        await withTransaction { [weak self] in
+            guard let self else { return }
+            switch previous {
+            case .relay:
+                await self.performRecoveryDirect(proof: proof, onFreshMedia: onFreshMedia)
+            case .direct:
+                await self.performRelayHandover(trigger: .degraded, recoveryProof: proof)
+            default:
+                break
+            }
+        }
+        return transport != previous
+    }
+
+    /// Candidate direct attempt that accepts AUTO (recovery), unlike the
+    /// manual path which requires an explicit direct selection. Commit
+    /// failure keeps the relay and reports through the normal notice path.
+    private func performRecoveryDirect(
+        proof: MediaRecoveryController.ProofIdentity?,
+        onFreshMedia: (@MainActor (MediaRecoveryController.ProofIdentity) -> Void)?
+    ) async {
+        guard !tearingDown, transport == .relay else { return }
+        let gen = epoch
+        let sel = selectionEpoch
+        publish { $0.switching = true }
+        switch await establishCandidate(gen, selection: sel) {
+        case .ready(let probe):
+            guard sel == selectionEpoch, gen == epoch, !tearingDown,
+                  mode == .auto || mode == .direct else {
+                if candidate === probe { cancelCandidate() }
+                publish { $0.switching = false }
+                return
+            }
+            // Wire the CAPTURED recovery identity on the candidate BEFORE the
+            // commit: the first inbound audio evidence after this moment
+            // fires onFreshMedia with exactly this attempt's proof — a stale
+            // transport, CONNECTED alone or an RTT sample can never clear the
+            // episode (build-49 review).
+            if let proof, let onFreshMedia {
+                probe.setRecoveryFreshMedia { [weak self] in
+                    Task { @MainActor in
+                        guard let self, !self.tearingDown else { return }
+                        onFreshMedia(proof)
+                    }
+                }
+            }
+            await performCommit(probe, gen: gen, forced: true)
+            publish { $0.switching = false }
+        case .unavailable(let message):
+            publish { $0.switching = false }
+            if !message.isEmpty { notice(message, offersAuto: true) }
+        }
+    }
 
     private func performRequestDirect() async {
         guard !tearingDown else { return }
@@ -1310,6 +1564,7 @@ final class CallRouteController {
     }
 
     private func adopt(probe: DirectProbeControlling, gen: UInt64) async {
+        directCandidateReady = true
         guard gen == epoch, !tearingDown else {
             probe.cancel()
             expectingRelayClose = false
@@ -1354,7 +1609,12 @@ final class CallRouteController {
         }
         startMeasureSocket(gen: gen)
         startDirectMonitoring(autoFallback: mode == .auto)
-        startDirectAudioGate(probe: probe, gen: gen)
+        if !hotStandbyOwned {
+            // Legacy single path: the audio gate owns bounded rollback. In
+            // hot-standby calls the watchdog (auto) or the forced selection
+            // owns post-adoption failure behavior.
+            startDirectAudioGate(probe: probe, gen: gen)
+        }
     }
 
     /// Bounded proof that the ADOPTED direct transport carries live local
@@ -1519,6 +1779,10 @@ final class CallRouteController {
     // MARK: Continuous quality on the active peer
 
     private func startMeasureSocket(gen: UInt64) {
+        guard !hotStandbyOwned else {
+            // Build-50: measure sockets only fed the legacy monitor.
+            return
+        }
         Task { [weak self] in
             guard let self, gen == self.epoch, !self.tearingDown else { return }
             do {
@@ -1535,6 +1799,11 @@ final class CallRouteController {
     }
 
     private func startDirectMonitoring(autoFallback: Bool) {
+        guard !hotStandbyOwned else {
+            // Build-50: the hot-standby watchdog is the single owner of
+            // failure detection; a legacy monitor would race its promotions.
+            return
+        }
         monitorTask?.cancel()
         let gen = epoch
         // An already-adopted peer (e.g. manual direct -> auto) must remain
@@ -1550,7 +1819,11 @@ final class CallRouteController {
             while !Task.isCancelled, gen == self.epoch, !self.tearingDown, self.transport == .direct {
                 try? await Task.sleep(nanoseconds: UInt64(self.cadence.monitorInterval * 1_000_000_000))
                 guard !Task.isCancelled, gen == self.epoch, !self.tearingDown else { return }
-                guard let peer = self.activeDirect else { return }
+                // An external (hot-standby) promotion may have swapped the
+                // carrier DURING the sleep: re-check the transport and the
+                // peer identity before touching anything, so a stale monitor
+                // round never reattaches/closes the demoted peer.
+                guard self.transport == .direct, let peer = self.activeDirect else { return }
                 let direct = peer.freshQualitySamples(within: 20, now: Date())
                 var relay = self.measure?.freshSamples(within: 30) ?? []
                 if relay.isEmpty { relay = await self.callbacks.relaySamples() }
@@ -1664,14 +1937,15 @@ final class CallRouteController {
     /// route latches the honest degraded/recovery state (never a kept-line
     /// or healthy-relay claim) until fresh inbound RTP re-proves the direct
     /// path or a bounded re-handover succeeds.
-    private func performRelayHandover(trigger: RollbackTrigger) async {
+    private func performRelayHandover(trigger: RollbackTrigger,
+                                      recoveryProof: MediaRecoveryController.ProofIdentity? = nil) async {
         guard !tearingDown else { return }
         audioGateTask?.cancel()
         audioGateTask = nil
         publish { $0.switching = true }
         let gen = epoch
         let peer = activeDirect
-        let ok = await stageRelayBounded()
+        let ok = await stageRelayBounded(recoveryProof: recoveryProof)
         // A teardown during staging owns the state: never publish or notice
         // against it (teardown already cleared `switching`).
         guard gen == epoch, !tearingDown else { return }
@@ -1740,10 +2014,10 @@ final class CallRouteController {
     /// transient attach failure cannot strand the call on a failing direct
     /// path. Bounded by `stageRelayAttempts` and teardown checks; the result
     /// is still never claimed as relay unless the attach truly reached ready.
-    private func stageRelayBounded() async -> Bool {
+    private func stageRelayBounded(recoveryProof: MediaRecoveryController.ProofIdentity? = nil) async -> Bool {
         let attempts = max(1, cadence.stageRelayAttempts)
         for attempt in 0..<attempts {
-            if await callbacks.stageRelay() { return true }
+            if await callbacks.stageRelay(recoveryProof) { return true }
             guard !tearingDown else { return false }
             if attempt < attempts - 1 {
                 try? await Task.sleep(nanoseconds: UInt64(cadence.stageRetryDelay * 1_000_000_000))
@@ -1758,6 +2032,8 @@ final class CallRouteController {
     private func cancelCandidate() {
         let old = candidate
         candidate = nil
+        trickleExchange?.cancel()
+        trickleExchange = nil
         old?.cancel()
         publish { $0.probing = false }
     }

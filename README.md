@@ -1,169 +1,150 @@
 # CallRelay
 
-一个用于自有 **Linux 蜂窝电话网关**的原生 iPhone 客户端。SIM 和蜂窝模块连接在
-Linux 主机上，iPhone 通过 CallKit 与原生 WebRTC 接打网关 SIM 的电话。
-默认界面语言为简体中文。
+<img src="CallRelay/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon.png" width="128" alt="CallRelay 应用图标" align="left">
 
-首版已实现：Ed25519 一次性配对与网关身份绑定、Keychain 私钥/令牌、HTTPS REST 与
-授权 WebSocket 事件、令牌轮换与幂等、拨号 / **短信** / 最近通话 / 设置四个标签、
-来电与通话控制、原生 WebRTC（PCMU 8kHz）音频、PushKit/CallKit 来电路径，以及
-完全离线的 **演示模式**。界面跟随 iPhone 系统浅色/深色外观。网关协议参考
-[CellBridge v2.0.6](https://github.com/mccding/CellBridge/tree/v2.0.6)。
+<br>
 
-本仓库只包含独立客户端，不含模块刷机资料、固件、云端凭据或私人设备数据。
+**把你的手机变成自己蜂窝模块的随身终端。** CallRelay 让你把 SIM 卡与蜂窝模块插在自有
+Linux 网关上，然后在 iPhone / iPad 上用**系统通话界面**接打这卡的电话、收发短信、
+管理通话历史。业务数据由你自己的网关处理，作者不运营通话中转或推送服务。
 
-## 网关运行平台
+本仓库包含完整项目：
 
-网关端基于 Linux，**不限定 H28K**。H28K 是参考部署设备；其他 ARM 或 x86 Linux
-主机也可以作为部署目标，前提是具备所用模块的驱动、USB/串口访问、AT 控制和
-UAC/ALSA 音频支持，并运行兼容的网关服务。本 App 通过 HTTP/WebSocket/WebRTC
-与网关交互，不直接依赖主机型号或 CPU 架构。
+- **iOS/iPadOS 客户端**（`CallRelay/`，Swift/SwiftUI，iOS 17.0 起）；
+- **自托管网关**（`gateway/`，Go；由 [CellBridge](https://github.com/mccding/CellBridge)
+  派生并扩展为多线路统一网关，上游 MIT 许可与归属保留）；
+- **可移植构建工具**（`tools/`）与文档（`docs/`）。
 
-当前协议参考 CellBridge v2.0.6，音频路径参考 QDC507 的 UAC 实现；其他主机或模块
-需要核对服务与驱动兼容性。尚未逐一实测所有 Linux 平台。
-iPhone App 本身需要 iOS 17+；Linux 指网关服务的运行平台。
+界面默认简体中文，内置简体中文 / 繁体中文 / 英文三语；跟随系统浅色 / 深色外观。
 
-## 功能范围
+## 产品功能
 
-- **拨号**：Phone 风格拨号盘、线路与 SIM/注册/信号状态；已授权线路显示完整本机号码。
-  默认拨出线路持久保存（设置页选择），拨号键盘可按次临时切换且不改变默认；默认缺失、
-  停用或无外呼权限时必须显式选择，绝不静默改用其他线路。持有网关“管理号码”授权的密钥
-  可在 App 内编辑本机号码或恢复 SIM 自动读取，改动保存在网关并对其他已授权手机生效。
-- **短信**：按号码聚合的对话列表、对话气泡、新建短信（可粘贴收件人、多行正文）、
-  打开对话自动已读；发送按网关真实状态显示排队/已提交/已发送/失败，**不显示虚假送达**；
-  失败可重试——同一逻辑提交重试沿用同一幂等键，网关已持久化的失败短信则作为新逻辑
-  提交重发（避免重放已存失败）；轮询+事件刷新，载入失败可重试，离线/空列表有明确状态。
-  发送门槛是 SIM 就绪 + 已注册 + `sms=ready`，不依赖语音能力。
-- **最近通话**：原生「通话」样式，圆形头像、灰字副信息、未接来电红色号码、
-  蓝色回拨按钮，点按可拨号或发短信；按天分组。
-- **联系人**：新增原生联系人页（系统 CNContactStore，含 iCloud 已同步的统一联系人）。
-  仅在你点按授权后读取，准确处理未决定/拒绝/受限/iOS 18 受限访问；可搜索、选择号码
-  拨号或发短信，并在最近通话/短信中显示联系人姓名。支持**非破坏性去重导出**：预览
-  完全重复项与“共用号码但姓名不同”项（后者默认不合并），用系统
-  `CNContactVCardSerialization` 生成真实 vCard(.vcf) 分享；系统通讯录不会被修改。
-- **垃圾拦截（短信/来电）**：本地、可编辑、默认保守——未知号码本身**绝不**算垃圾；
-  规则包含完全号码、号码前缀、关键词、正则、信任号码/关键词，以及 4 组可选中文/英文
-  预设（贷款理财、赌博刷单、营销退订、English promo，全部默认关闭）。含 4–8 位数字的
-  验证码/取件码等结构化通知受保护，不会因为含“订单/验证码”字样被误拦。命中短信进入可
-  恢复的「垃圾信息」隔离区（可删除/标记为已知发件人/恢复），不删除网关数据。来电支持
-  手动/导入名单的**精确号码**匹配，可选择仅标记或在系统来电报告后立即结束（始终先满足
-  PushKit/CallKit 上报要求；客户端拦截不能保证运营商侧不响铃）。可粘贴、从文件或 HTTPS
-  链接导入号码名单（无鉴权头、不上传任何内容、2MB/5 万号码上限、失败保留上一份），随
-  App 内置一份 **Apache-2.0、2020 年、34 个号码**的中文历史社区名单，默认关闭、
-  仅标记，可查看来源/日期/数量后自行启用拦截。
-- **可靠重连**：事件流与状态轮询采用带抖动的有界指数退避；网络恢复（NWPath）和回到
-  前台立即重试，429 遵循 Retry-After，瞬时 5xx/网络错误退避，4xx/授权失效停止自动重试；
-  WebSocket 重连/前台后做快照对账（按稳定 id 幂等合并，绝不重复发短信/拨号）；待发短信
-  持久化到受保护文件并在短信线路恢复后用同一幂等键补发；通话中 ICE 短暂断开进入「恢复中」
-  并给同一 PeerConnection 一个有界恢复窗口，超时才如实结束，绝不自动重拨。
-- **iCloud 同步（可选）**：同一 iCloud 账号下用**私人数据库 + `CKRecord.encryptedValues`**
-  （CloudKit 服务端静态加密字段；属于“加密存储/at rest”，并非在任何账号设置下都保证
-  端到端加密）同步短信/通话历史与本地过滤规则，按网关隔离（历史互不相混；云记录逻辑 id
-  带网关 scope 前缀，两个网关的相同原始 id 也不会互相覆盖）、可复制的墓碑记录删除、
-  离线排队、乐观并发（change tag / serverRecordChanged 冲突收敛）、增量 token（过期自动
-  全量重置基线）、账号切换世代隔离；每次同步先拉取后推送，下载的历史只读，绝不会因此再
-  发短信或拨号；不同步配对私钥、网关令牌或设备待发短信。自签名/Feather 基线没有生效的
-  iCloud 权限：开关先解析 embedded.mobileprovision（必须精确包含配置容器且声明 CloudKit
-  服务），再在 ObjC `@try/@catch` 保护下用 `CKContainer.accountStatus`/`fetchUserRecordID`
-  实测生效权限与账号身份（描述文件权限可能比实际签名权限更宽；也不使用 iCloud Drive 的
-  ubiquityIdentityToken 判断 CloudKit 登录）；权限缺失时安全显示“不可用”，不会崩溃。
-  需用含 CloudKit 能力的描述文件重签后才能真正双机同步。联系人的 iCloud 同步由系统
-  “iCloud 联系人”提供。
+- **系统通话体验**：iOS 17.4+ 使用 Apple 原生 LiveCommunicationKit 上报来电、展示系统
+  通话界面（不是第三方 LiveKit）；iOS 17.0–17.3 自动回退 CallKit。拨出、接听、拒绝、
+  挂断、静音、DTMF、听筒/扬声器/蓝牙路由均由系统接管；「已接通」以网关 `active` 且
+  媒体连通为准，接口成功不冒充接通。
+- **短信**：按号码聚合的对话、气泡界面、新建短信、自动已读；发送状态如实显示网关的
+  排队 / 已提交 / 已发送 / 失败。**「已提交」只代表交给网关，不承诺运营商最终送达。**
+  临时断网时保存待发任务，恢复连接后重试；重启后结果不确定的发送需要手动确认，避免重复发出。
+- **多卡多线路与多设备授权**：网关可挂多条蜂窝线路；每个配对密钥按线路获得**接收来电 /
+  接收短信 / 发送短信 / 拨打**等独立权限，可标记「全部线路」或「管理号码」。默认拨出
+  线路持久保存、按次临时切换，绝不静默换卡。App 内置网关管理台：查看/新建/撤销密钥与
+  设备、管理线路与号码、语音信箱与录音库、脱敏诊断（需支持管理 API 的网关版本）。
+- **通讯录**：读取系统通讯录（含 iCloud 联系人，授权后才读），拨号与短信支持姓名/号码
+  联想；**非破坏性去重导出 vCard**（系统通讯录不被修改）；可把联系人**上传同步到网关**
+  （仅新增/更新、绝不删除；按同步主体隔离），供网关侧解析姓名与白名单使用。
+- **通话历史**：本机持久缓存最近通话与短信（超出上限如实标注），条件式刷新；支持
+  **批量标记已读 / 批量删除**，按网关隔离的删除墓碑保证重启后不复活。
+- **语音信箱、通话录音、会议**：网关语音信箱收件、播放、删除；1:1 通话与会议的手动
+  录音（网关侧存储，受网关保留策略约束）；多通电话合并会议与分线保持（以上能力以所用
+  网关版本的实际支持为准）。
+- **骚扰拦截**：本机可编辑规则（号码/前缀/关键词/正则/信任项 + 默认关闭的中文/英文
+  预设，对验证码类通知提供保护），命中短信进可恢复的隔离区；来电名单精确匹配，可
+  仅标记或系统上报后立即结束。兼容网关还支持**按密钥的网关侧拦截**，两台设备共享一份
+  策略、不同密钥互相隔离。内置 2020 年中文历史名单为 Apache-2.0 归档，默认关闭。
+- **快捷指令 / Siri**：三个 App Intents——「用 CallRelay 拨打」「编写短信」「打开
+  CallRelay（拨号/短信/语音信箱）」；保存的线路失效时保留草稿并要求重选，绝不退化。
+- **iCloud 同步（可选）**：同一 iCloud 账号下同步短信、通话历史与拦截规则，按网关隔离；
+  数据在 CloudKit 中加密存储，不作端到端加密承诺。每台设备的私钥与访问令牌保持独立，
+  配对恢复凭据可通过 iCloud 钥匙串同步。需要登录个人 iCloud 账号，并使用具有匹配
+  CloudKit 容器权限的签名；账户或权限不满足时会显示不可用。配置见 [BUILD.md](BUILD.md)。
+- **音频自动选路**：手机与网关之间的网络跳在 **直连 WebRTC、QUIC 直连与认证 WSS 中继**
+  三条路径间按真实测量评分自动选择（也可手动强制）。网络跳协商 **Opus（16–64 kbps，
+  带内 FEC 与闭环码率自适应）**，与旧客户端互通时回退 PCMU；蜂窝模块到运营商的一段
+  仍是传统 **8 kHz 窄带电话音质**，整条链路不是宽带 HD。直连并不必然优于中继；通话中
+  断链进入有界恢复窗口（45 秒内以真实媒体帧为准判活），恢复不了才如实结束，绝不自动
+  重拨。不承诺零延迟，也不承诺弱网完全无中断。
+- **推送与后台来电（全部自托管）**：作者不提供推送中转服务，也不分发 APNs 密钥；
+  第三方网关不能借用作者 App 的 APNs 身份。原生后台来电的前提是**与实际签名团队 / App ID
+  匹配的自有 APNs 配置**：App 把 PushKit 令牌注册到你自己的网关，由网关用你自己的密钥
+  直接发送。PWA 方案则是每个网关在自己域名自托管 VAPID 标准 Web Push，**用户点通知后**
+  打开网页处理来电——不等同于后台直接弹系统电话。
+- **演示模式**：完全离线的内存网关 + 保留的 555 模拟号码，不联网、不发短信、不触发
+  真实来电，可先行走查全部界面与状态。
+- **配对安全**：粘贴或扫码网关配对数据；Ed25519 私钥永远留在本机 Keychain；
+  先匿名校验网关指纹再发证明；v2 注册密钥安装留存「恢复凭据」，重装或换机可在**你自己的
+  iCloud 钥匙串**范围内重新注册而无需再碰控制台（可一键清除）。
 
-- **设置**：连接状态（含短信能力）、铃声与来电说明（CallKit 系统响铃、不自行响铃/抢音频）、
-  网关信息、解除配对（删除本机私钥与令牌）、演示模式入口。
-- **配对**：粘贴或扫码网关一次性配对数据；Ed25519 私钥留在 iPhone
-  （Keychain `afterFirstUnlockThisDeviceOnly`），先匿名校验网关 id/公钥指纹再发证明。
-- **通话**：CallKit 系统通话界面，拨出/接听/拒绝/挂断/静音/DTMF/扬声器；真实“已接通”
-  需要网关 `active` 且媒体连通，REST 201 不会显示已接通。
-- **音频**：stasel/WebRTC M151，非 trickle ICE，与上游一致的 **PCMU/8kHz**，开启
-  WebRTC 回声消除/降噪/自动增益，音频会话遵循 CallKit 所有权。
-- **推送**：PushKit VoIP + 普通 APNs 令牌注册；非 UUID 的网关呼叫 id 用确定性
-  UUIDv5 稳定映射，推送/事件/轮询收敛到同一通系统通话。
-- **演示模式**：内存假网关，保留的 555 模拟号码，绝不联网、发短信或触发真实来电；
-  可在设置中模拟收发短信与发送失败，方便走查全部状态。
+## 适用人群
 
-## 系统电话集成
+- 手里有蜂窝模块（如 DJI IG830 / Quectel QDC507 等）与一台常开 Linux 主机，想把实体
+  SIM 变成全家可用的「云端手机」；
+- 希望掌控通话与短信传输、存储位置的自托管用户；
+- 开发者与研究者：本项目源码公开，可自行构建、审计与派生（许可证见文末）。
 
-- 来电响铃与系统通话界面完全由 **CallKit** 负责，App 不自行播放铃声或抢占音频；
-  音量、听筒/扬声器/蓝牙遵循系统通话音频会话。
-- 拨出通话通过 `INStartCallIntent` 捐赠进入系统电话「最近通话」，从系统电话/联系人
-  入口点回时经同一网关拨号路径处理；未配对或离线时给出解释，**不会**改用蜂窝 `tel:`
-  直接呼出。视频 Intent 不支持。
-- 成为系统「默认通话 App」需要 iOS 18.2+ 并在签名描述文件中启用
-  `com.apple.developer.calling-app` 能力后自行核验，侧载预览包未声明该能力。
+不适合：需要运营商级号码托管、99.9% 可用性承诺或开箱即用免部署的用户。
 
-## 快速开始
+## 快速上手
 
-需要 Xcode（部署目标 iOS 17+）、XcodeGen。首次：
+1. **部署网关**：在常开 Linux 主机上构建并运行 `gateway/`（模块驱动、AT 与音频链路
+   要求见 [docs/self-hosting.md](docs/self-hosting.md)；架构与协议见
+   [docs/architecture.md](docs/architecture.md) 与 [PROTOCOL.md](PROTOCOL.md)）。
+2. **生成配对数据**：在网关控制台（或 App 管理台）为一条或多条线路创建密钥，得到
+   配对串/二维码（例如 `relay.example.com` 或测试环境 `192.0.2.10` 的配对载荷；正文示例
+   联系人一律为张三/李四、号码一律为保留 555 段）。
+3. **安装并配对 App**：从源码构建安装（见下），或使用公开未签名包（见「版本与安装」）；
+   粘贴/扫码配对数据，授权通知与联系人后即可使用。
+
+### 从源码构建（客户端 + 网关一览）
 
 ```sh
-./Scripts/bootstrap.sh     # 下载并校验固定校验和的 WebRTC M151
-xcodegen generate         # 生成 CallRelay.xcodeproj
+git clone https://github.com/JiangNanGenius/call-message-relay-ios.git
+cd call-message-relay-ios
+./Scripts/bootstrap.sh        # 拉取并校验固定校验和的 WebRTC M151 二进制
+xcodegen generate             # 生成 CallRelay.xcodeproj
+./Scripts/xcodebuild.sh build -project CallRelay.xcodeproj -scheme CallRelay \
+  -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO
+
+cd gateway && ../tools/go.sh build ./...   # 网关（按目标平台准备 Go、C 工具链与音频依赖）
 ```
 
-构建、测试、无签名真机编译、签名与 APNs 说明见 [BUILD.md](BUILD.md)。
-协议事实、安全设计与“已验证/未验证”边界见 [PROTOCOL.md](PROTOCOL.md)。
+完整步骤、缓存接口、测试、真机签名与 APNs/CloudKit 说明见 [BUILD.md](BUILD.md)。
 
-## Feather 安装源与发布
+## 版本与安装
 
-当前预览版：[CallRelay 0.3.6 (13)](https://github.com/JiangNanGenius/call-message-relay-ios/releases/tag/v0.3.6)，支持 iOS 17+。
+- 本仓库**源码**当前版本为 **0.3.60（构建 71）**；上文功能以源码为准。
+- GitHub **Releases 最新公开安装包为 v0.3.39（构建 46）预发布**：Feather 纯原生与
+  App Store PWA 两个**未签名** IPA + `SHA256SUMS`。0.3.40–0.3.60 的新功能目前**只以
+  源码形式发布，没有对应的公开 IPA**；本应用也**未上架 App Store**。
+- 在 Feather「源」中添加（仅指向纯原生未签名版本，历史条目不改、不会指向不存在的资产）：
 
-在 Feather「源」中添加：
+  ```
+  https://raw.githubusercontent.com/JiangNanGenius/call-message-relay-ios/main/feather.json
+  ```
 
-```
-https://raw.githubusercontent.com/JiangNanGenius/call-message-relay-ios/main/feather.json
-```
+- Feather 安装需要你用**自己的** Apple 证书与描述文件重签。并非任意重签都能获得全部
+  能力：iCloud 同步与原生锁屏来电各需要与实际签名身份匹配的容器 / APNs 配置（自建时
+  必要时改用你自己的 App ID 与 CloudKit 容器），重签成功也不代表推送或真实网关通话已
+  验收。安装前提与配置步骤见 [BUILD.md](BUILD.md)。
 
-源只指向**纯原生版未签名 IPA**（不含任何网页推送桥接），由 Feather 使用你自己的
-证书与描述文件签名后安装。下载地址、版本、大小与 SHA-256 均取自 GitHub Release 的
-实际产物，发布后逐一核对。后台 VoIP 来电仍需匹配 Bundle ID、Push Notifications
-描述文件和自建 APNs 服务；重新签名安装成功不代表后台推送或真实网关通话已经验收。
+## 测试与兼容性
 
-每次更新同时发布两个未签名构建，版本号与核心修复一致：Feather 纯原生版与
-App Store PWA 版；Feather 源始终只指向原生版。构建、校验与发布清单见
-[docs/release.md](docs/release.md)。
+构建与测试记录分为三个层面：
 
-| 界面（历史 0.1.0 预览） | 白天 | 夜间 |
-| --- | --- | --- |
-| 拨号 | <img src="https://github.com/JiangNanGenius/call-message-relay-ios/releases/download/v0.1.0/callrelay-dialer-light.png" width="220" alt="白天拨号界面"> | <img src="https://github.com/JiangNanGenius/call-message-relay-ios/releases/download/v0.1.0/callrelay-dialer-dark.png" width="220" alt="夜间拨号界面"> |
-| 短信 | <img src="https://github.com/JiangNanGenius/call-message-relay-ios/releases/download/v0.1.0/callrelay-messages-light.png" width="220" alt="白天短信列表"> | <img src="https://github.com/JiangNanGenius/call-message-relay-ios/releases/download/v0.1.0/callrelay-messages-dark.png" width="220" alt="夜间短信列表"> |
+1. **自动化测试**：模拟器单元测试 + XCUITest，结果以本仓库 GitHub Actions 为准
+   （个别历史时序敏感用例存在波动）；
+2. **服务健康**：网关自身的健康检查只说明服务在跑；
+3. **真机验收**：系统来电界面、PushKit/APNs、真实音频与运营商短信收发必须在签名真机 +
+   真实网关上由使用者本人验收。README 与测试绿灯都不代表物理真机已通过。
 
-## 音质边界（重要）
+## 文档地图
 
-当前**网关实现**（CellBridge v2.0.6 的 UAC + WebRTC）固定 **8kHz / PCMU 64kbps
-窄带**，即传统电话音质，**不是 HD/宽带**。QDC507 硬件或刷机后固件是否支持 16kHz
-宽带 / 运营商 AMR-WB 尚未验证；若将来实测支持，需要网关与 App 整条链路升级编码协商，
-首版不扩展宽带编码，也不对延迟或 DSP 效果做无依据承诺。
+- [BUILD.md](BUILD.md) — 构建、缓存、测试、签名与 CloudKit/APNs 配置
+- [docs/release.md](docs/release.md) — 双变体发布流程与私有签名边界
+- [docs/self-hosting.md](docs/self-hosting.md) — 网关自托管部署
+- [docs/architecture.md](docs/architecture.md) — 系统架构
+- [docs/transport-quality.md](docs/transport-quality.md) — 音质/传输路径的工程事实
+- [PROTOCOL.md](PROTOCOL.md) — 协议与安全设计
+- [PRODUCT.md](PRODUCT.md) — 产品定义
 
-真机仍需逐项验收：双向可听、回声/降噪、听筒/扬声器/蓝牙路由、音频中断恢复，以及
-Wi‑Fi/蜂窝切换和弱网（含 TURN 中继）。
+## 许可与第三方归属
 
-## 尚未验证的关卡
-
-- 真实网关短信：收件、中文与长短信、发送失败重试、未读/已读同步。
-
-- 真实 H28K/QDC507 的 AT/UAC 与双向音频、私有 TURN/coturn 中继。
-- 自有云受限控制通道与 APNs Push Broker；真机锁屏 VoIP 来电（sandbox/production）。
-- 物理 iPhone 的签名、描述文件与后台 VoIP 行为。模拟器与测试目标已编译通过，测试执行结果以本仓库 CI 为准；
-  但 CallKit/PushKit/真实音频必须在签名真机与真实网关上验收。
-- 垃圾规则为本地启发式预设，非“认证骚扰号码库”；内置中文名单是 2020 年历史归档，
-  不代表当前仍为骚扰号码，也不做号段/归属地式的宽泛拦截。客户端拦截发生在网关来电到达
-  之后，不能保证运营商线路不响铃；系统电话/信息过滤扩展（CallDirectory/IdentityLookup）
-  不在本 App 范围。
-- 通讯录访问与 vCard 导出、CloudKit 双机同步需要在含对应能力的签名真机上验收；
-  未签名 Feather 包中 iCloud 开关会显示不可用，联系人 iCloud 同步依赖系统设置。
-
-## 使用范围与许可证
-
-本项目源码公开，采用 **PolyForm Noncommercial 1.0.0**，仅授权非商业用途；完整条款见
-[LICENSE](LICENSE)。第三方组件（Google WebRTC 等）沿用
-各自许可证，见 [ThirdPartyNotices.md](ThirdPartyNotices.md)；接口参考不代表复制或
-重新授权上游代码。内置中文历史骚扰电话名单来自 blessing-gao/rubbish-phone
-（Apache-2.0，2020 年归档，34 个号码），默认关闭，归属与许可证见
-`CallRelay/Resources/Licenses/SpamList-CN-Historical-NOTICE.txt`。垃圾拦截预设关键词
-为本项目原创编写，灵感仅来自公开的本地过滤项目（boommanpro/ios-sms-guard、
-adibendahan/SimplyFilterSMS、SysAdminDoc/CallShield）的分类思路，未复制其规则或号码库。
-
-项目用于自行构建与安装；私有签名包只交给所有者，GitHub 只公开未签名构建。
-App Store PWA 版仅在明确授权后提交，Feather 源始终为纯原生版。
+- 本项目原创代码（客户端与网关自有部分）适用 **PolyForm Noncommercial 1.0.0**，
+  仅授权非商业用途，全文见 [LICENSE](LICENSE)。
+- 网关基于 CellBridge（MIT）派生：上游 MIT 许可与归属声明随
+  [gateway/THIRD_PARTY_NOTICES.md](gateway/THIRD_PARTY_NOTICES.md) 保留，上游代码**不**因
+  本仓库的 PolyForm 许可而改变授权。
+- 第三方组件（Google WebRTC、libopus、SpeexDSP、内置历史骚扰名单等）各自保留其许可证，
+  见 [ThirdPartyNotices.md](ThirdPartyNotices.md)。
+- HINLINK、DJI、Quectel、Apple 等商标仅用于兼容性描述，无隶属或背书关系（见
+  [NOTICE](NOTICE)）。

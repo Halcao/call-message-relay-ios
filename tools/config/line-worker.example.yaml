@@ -1,0 +1,106 @@
+# Per-line CELLBRIDGE worker configuration — portable EXAMPLE.
+#
+# This is the configuration for ONE worker process (the binary built from
+# cmd/cellbridge-gateway, installed as /opt/callrelay/bin/callrelay-worker).
+# The unified daemon (callrelayd) talks to the worker over the loopback
+# INTERNAL port with a shared token; the control/listen port is the worker's
+# own CellBridge v1 API. Generate one file per line (e.g. from
+# tools/prepare-line.example.sh) and store it outside the public tree, e.g.
+# /run/callrelay/line1.yaml, mode 0600.
+#
+# This example contains no real secrets: token_file points at a
+# machine-generated random file; SIM/IMEI identity is discovered at runtime
+# by the worker itself and stays masked in reports.
+
+network:
+  # "tailnet" and "pocket" are the supported modes; both bind loopback here
+  # because the unified daemon is the only intended caller.
+  mode: tailnet
+  transport: tailnet
+  # Must remain false: the worker is never exposed publicly.
+  public_fallback: false
+
+server:
+  # Worker control plane (v1 API). Loopback only.
+  listen: 127.0.0.1:9701
+
+internal:
+  # Trusted loopback endpoint used by callrelayd for privileged operations.
+  listen: 127.0.0.1:9801
+  # Random per-gateway shared secret. prepare-line.example.sh creates it
+  # (32 random bytes, hex, mode 0600) if missing; same file for all workers
+  # of one gateway is fine and matches tools/config/lines.json.example.
+  token_file: /etc/callrelay/internal.token
+
+data:
+  # Per-line state directory (SQLite, SMS spool, recordings index).
+  dir: /var/lib/cellbridge/line1
+
+modem:
+  # NOTE on multi-line hosts: do NOT leave tty "auto" in production. The
+  # auto-discovery scans the same /dev candidates in every worker, so two
+  # workers could claim the SAME module. tools/prepare-line.example.sh
+  # renders an EXPLICIT per-line serial path here (registry "tty" field or
+  # per-line AT_TTY env file); prefer a stable udev by-id symlink over a
+  # bare ttyUSB number that renumbers on replug. The service user needs
+  # dialout/uucp group membership (or a udev rule for the module VID:PID)
+  # for read-write serial access.
+  adapter: auto
+  tty: auto
+  baud: 9600
+  allow_usb_identity_changes: false
+
+voice:
+  enabled: true
+  # backend auto picks: raw-pcm FIFOs (raw_pipe), ALSA capture/playback
+  # (arecord/aplay — requires the `alsa-utils` package and audio group
+  # access), or the qdc507 vendor runtime for module-internal voice paths.
+  # qdc507 requires the CLOSED-SOURCE vendor runtime (qdc507_aprv3.ko,
+  # qdc507_voice.ko, mavo-pcm-bridge.armv7, alsaucm) on the MODULE side;
+  # it is not distributed with this repository. Obtain it from the cellular
+  # module vendor and flash/prepare the module BEFORE enabling this backend;
+  # the EDL provisioning step is operator work outside these services.
+  backend: auto
+  codec: pcmu
+  sample_rate: 8000
+  # raw-pcm/alsa backends: byte FIFO or ALSA device paths. With arecord the
+  # classic form is a command FIFO; the production hosts use the module's
+  # own PCM device exposed through the runtime below.
+  rx_path: ""
+  tx_path: ""
+  # qdc507 backend only: local directory holding the vendor runtime
+  # artifacts that get pushed to the module over adb.
+  runtime_dir: ""
+  bootstrap: false
+
+webrtc:
+  remote_ice_policy: relay
+  local_ice_policy: all
+  media_network_policy: tailnet-turn
+  turn_credential_ttl: 10m
+  private_turn:
+    enabled: false
+
+push:
+  # "broker" routes wake-up through a push broker; the unified gateway
+  # normally drives devices itself, so leave the broker URL empty.
+  mode: broker
+  broker_url: ""
+
+recording:
+  enabled: true
+  retention_days: 90
+  minimum_free_bytes: 524288000
+  auto_mode: off
+
+security:
+  pairing_local_only: true
+  admin_local_only: true
+  redact_logs: true
+
+sip:
+  enabled: false
+  listen: 127.0.0.1:5060
+  realm: callrelay-worker
+  push_token: ""
+  users: []

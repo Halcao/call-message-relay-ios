@@ -191,11 +191,11 @@ struct RefreshRequest: Encodable {
 
 // MARK: - Calls
 
-enum CallDirection: String, Decodable, Equatable, Sendable {
+enum CallDirection: String, Decodable, Encodable, Equatable, Sendable {
     case inbound, outbound
 }
 
-enum CallState: String, Decodable, Equatable, Sendable {
+enum CallState: String, Decodable, Encodable, Equatable, Sendable {
     case idle
     case incomingRinging = "incoming_ringing"
     case outgoingDialing = "outgoing_dialing"
@@ -233,7 +233,7 @@ enum CallState: String, Decodable, Equatable, Sendable {
 
 /// A call as returned by `/calls`, embedded in events, or delivered live.
 /// Timestamps are Unix milliseconds.
-struct CallRecord: Decodable, Equatable, Identifiable, Sendable {
+struct CallRecord: Decodable, Encodable, Equatable, Identifiable, Sendable {
     let id: String
     let gatewayID: String?
     let lineID: String?
@@ -291,6 +291,12 @@ struct CallRecord: Decodable, Equatable, Identifiable, Sendable {
     var endedDate: Date? { endedAt.map(Date.init(unixMilliseconds:)) }
 
     var isFinished: Bool { endedAt != nil || state == .idle }
+
+    /// Server-confirmed manual recording still in flight for this call (the
+    /// gateway owns the state; this is only a read of the last server truth).
+    var recordingInProgress: Bool {
+        ["recording", "starting", "finalizing"].contains(recordingState ?? "")
+    }
 }
 
 extension CallRecord {
@@ -337,7 +343,7 @@ extension CallRecord {
 //     additionally expose the `X-CellBridge-Has-More` response header.
 //   * `message.created` / `message.updated` events carry this same object.
 
-enum MessageDirection: String, Decodable, Equatable, Sendable {
+enum MessageDirection: String, Decodable, Encodable, Equatable, Sendable {
     case inbound, outbound
 }
 
@@ -357,7 +363,7 @@ enum MessageStatus: String, Decodable, Encodable, Equatable, Sendable {
     }
 }
 
-struct MessageRecord: Decodable, Equatable, Identifiable, Sendable {
+struct MessageRecord: Decodable, Encodable, Equatable, Identifiable, Sendable {
     let id: String
     let gatewayID: String?
     let lineID: String?
@@ -404,13 +410,21 @@ struct MessageRecord: Decodable, Equatable, Identifiable, Sendable {
     }
 }
 
-struct MessageThread: Decodable, Equatable, Identifiable, Sendable {
+struct MessageThread: Decodable, Encodable, Equatable, Identifiable, Sendable {
     let key: String
     let peer: String
-    let unreadCount: Int
+    /// `var` (build-67): the unread badge is cleared OPTIMISTICALLY while the
+    /// gateway persists the read marking (pending user intent), and restored
+    /// if the gateway rejects it.
+    var unreadCount: Int
     let lastMessage: MessageRecord
+    /// Build-55 per-key folder from a quarantine-capable gateway: normal or
+    /// junk. Absent (nil) on older gateways, where the client classifies
+    /// locally.
+    var folder: String? = nil
 
     var id: String { key }
+    var isGatewayJunk: Bool { folder == "junk" }
 }
 
 struct SendMessageRequest: Encodable {
@@ -437,6 +451,10 @@ struct WebRTCAnswer: Decodable, Equatable {
     let sdp: String
     let type: String
     let iceMode: String
+    /// Build 68 incremental attach (present only for trickle attaches).
+    var attachId: String? = nil
+    var candidateCursor: Int? = nil
+    var gatheringComplete: Bool? = nil
 }
 
 struct ICEServer: Decodable, Equatable {
@@ -455,12 +473,45 @@ struct ICEConfiguration: Decodable, Equatable {
     /// When it contains "ws", the authenticated WSS PCMU path is preferred
     /// because it rides the same reachable HTTPS route.
     let mediaTransports: [String]?
+    /// Build-50: the gateway advertises the hot-standby media protocol
+    /// (capabilities.mediaStandby). False unless explicitly advertised;
+    /// clients must keep single-path behavior on older gateways.
+    let mediaStandby: Bool
+    /// Build-68: the gateway accepts an incremental (trickle) client offer
+    /// and serves its own gathered candidates incrementally
+    /// (capabilities.iceTrickle). False unless explicitly advertised; clients
+    /// MUST keep the full-SDP handshake on older gateways.
+    var mediaTrickle: Bool = false
+    /// Build-61: the gateway serves the QUIC DATAGRAM direct audio endpoint
+    /// (capabilities.mediaQuic). False unless explicitly advertised; clients
+    /// must keep the ice/ws matrix on older gateways.
+    let mediaQuic: Bool
 
-    init(policy: String, iceServers: [ICEServer], expiresAt: String, mediaTransports: [String]? = nil) {
+    init(policy: String, iceServers: [ICEServer], expiresAt: String, mediaTransports: [String]? = nil, mediaStandby: Bool = false, mediaTrickle: Bool = false, mediaQuic: Bool = false) {
         self.policy = policy
         self.iceServers = iceServers
         self.expiresAt = expiresAt
         self.mediaTransports = mediaTransports
+        self.mediaStandby = mediaStandby
+        self.mediaTrickle = mediaTrickle
+        self.mediaQuic = mediaQuic
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case policy, iceServers, expiresAt, mediaTransports, mediaStandby, mediaQuic
+    }
+
+    // Explicit decoding: `mediaStandby`/`mediaQuic` are absent on older
+    // gateways and must default to false instead of failing the whole
+    // `/ice` decode.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.policy = try c.decode(String.self, forKey: .policy)
+        self.iceServers = try c.decode([ICEServer].self, forKey: .iceServers)
+        self.expiresAt = try c.decode(String.self, forKey: .expiresAt)
+        self.mediaTransports = try c.decodeIfPresent([String].self, forKey: .mediaTransports)
+        self.mediaStandby = try c.decodeIfPresent(Bool.self, forKey: .mediaStandby) ?? false
+        self.mediaQuic = try c.decodeIfPresent(Bool.self, forKey: .mediaQuic) ?? false
     }
 
     var expiryDate: Date? {
@@ -583,6 +634,7 @@ enum EventType: String, Decodable, Equatable {
     case messageCreated = "message.created"
     case messageUpdated = "message.updated"
     case threadDeleted = "thread.deleted"
+    case threadRead = "thread.read"
     case callIncoming = "call.incoming"
     case callUpdated = "call.updated"
     case callEnded = "call.ended"
@@ -650,6 +702,17 @@ struct GatewayEvent: Decodable, Equatable {
     func threadDeletion() -> ThreadDeletionPayload? {
         guard let data, type == .threadDeleted else { return nil }
         return try? JSONDecoder().decode(ThreadDeletionPayload.self, from: data)
+    }
+
+    /// `recording.*` payload: the gateway's key-scoped recording lifecycle
+    /// event. A device from another key never receives it at all.
+    func recording() -> RecordingRecord? {
+        guard let data, eventTypeIsRecording else { return nil }
+        return try? JSONDecoder().decode(RecordingRecord.self, from: data)
+    }
+
+    private var eventTypeIsRecording: Bool {
+        rawType.hasPrefix("recording.")
     }
 }
 

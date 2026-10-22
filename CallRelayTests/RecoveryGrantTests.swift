@@ -6,7 +6,7 @@ final class RecoveryGrantTests: XCTestCase {
         RecoveryGrant(
             gatewayId: "gw-\(UUID().uuidString)",
             gatewayName: "Unified Gateway",
-            endpoint: "https://callrelay.cloudforzhao.com",
+            endpoint: "https://gw.example.com",
             fingerprint: "sha256:\(V2Fixtures.secret())",
             enrollmentKey: V2Fixtures.enrollmentKey(),
             defaultLineId: "line-a"

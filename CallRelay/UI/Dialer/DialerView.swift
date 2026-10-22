@@ -134,7 +134,7 @@ struct DialerView: View {
                 Button("知道了", role: .cancel) { model.blockedDialAttempt = nil }
             } message: {
                 if let attempt = model.blockedDialAttempt {
-                    Text("号码 \(attempt.peer) 命中：\(attempt.reason)。这是本机拦截，未通过网关呼出；可在短信/通话规则里修改。")
+                    Text("号码 \(attempt.peer) 已被拦截规则阻止，可在“骚扰拦截”中修改。")
                 }
             }
             .onDisappear { KeypadTonePlayer.shared.stop() }

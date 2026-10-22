@@ -429,7 +429,7 @@ final class OutgoingLineSelectionTests: XCTestCase {
         await model.testingRefreshAuthorizedLines()
         XCTAssertTrue(model.authorizedLines.isEmpty)
         XCTAssertNil(model.defaultLineId)
-        XCTAssertEqual(model.lineListState, .empty("此设备当前没有已授权的线路。请在网关的配对密钥中授权线路，或重新配对。"))
+        XCTAssertEqual(model.lineListState, .empty("当前没有已授权的线路，请在网关为本机授权，或重新配对。"))
         XCTAssertTrue(model.shouldShowLinePicker)
         // The driver default is pushed to nil too (observable via dials using
         // the model's nil resolved line).

@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#0b1220">
+<title>CallRelay</title>
+<link rel="manifest" href="/pwa/manifest.webmanifest">
+<link rel="icon" href="/pwa/icon-192.png">
+<link rel="apple-touch-icon" href="/pwa/icon-192.png">
+<link rel="stylesheet" href="/pwa/client.css">
+</head>
+<body>
+<main id="app">
+
+  <!-- 配对 -->
+  <section id="pair-view" class="hidden">
+    <header class="brand">
+      <img src="/pwa/icon-192.png" alt="" class="logo">
+      <h1>CallRelay</h1>
+    </header>
+    <div class="card">
+      <h2>绑定此浏览器</h2>
+      <p class="muted">粘贴网关连接密钥即可拨打电话和收发短信。</p>
+      <input id="enroll-key" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="连接密钥">
+      <input id="enroll-name" autocomplete="off" maxlength="64" placeholder="设备名称（可选）">
+      <button id="enroll-btn" class="primary" type="button">配对（无需 App）</button>
+      <details id="app-bind-details">
+        <summary>已有 CallRelay App？使用 App 生成的通知绑定码</summary>
+        <p class="muted">在 App「设置 → 网页通知」生成绑定码。</p>
+        <form id="bind-form" class="row">
+          <input id="bind-code" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="12" placeholder="绑定码">
+          <button type="submit" class="primary">绑定</button>
+        </form>
+      </details>
+      <p id="pair-error" class="error hidden"></p>
+    </div>
+  </section>
+
+  <!-- 主界面 -->
+  <section id="main-view" class="hidden">
+    <header id="topbar">
+      <select id="line-picker" aria-label="发送线路"></select>
+      <span id="conn-dot" title="连接状态"></span>
+      <button id="messages-select-all" class="topbar-action hidden" type="button">全选</button>
+      <button id="messages-edit" class="topbar-action hidden" type="button" aria-label="编辑短信">编辑</button>
+      <button id="rules-link" class="topbar-action" type="button" aria-label="骚扰拦截与录音">骚扰拦截</button>
+      <a id="settings-link" href="/pwa/" aria-label="通知与设置">
+        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M19.1 13.1c.1-.4.1-.8.1-1.1s0-.7-.1-1.1l2.1-1.6a.5.5 0 0 0 .1-.7l-2-3.4a.5.5 0 0 0-.6-.2l-2.4 1a7.3 7.3 0 0 0-1.9-1.1L13.8 2a.5.5 0 0 0-.5-.4h-4a.5.5 0 0 0-.5.4l-.4 2.6a7.3 7.3 0 0 0-1.9 1.1l-2.4-1a.5.5 0 0 0-.6.2l-2 3.4a.5.5 0 0 0 .1.7l2.1 1.6c-.1.4-.1.8-.1 1.1s0 .7.1 1.1l-2.1 1.6a.5.5 0 0 0-.1.7l2 3.4c.1.2.4.3.6.2l2.4-1c.6.5 1.2.8 1.9 1.1l.4 2.6c0 .2.2.4.5.4h4c.2 0 .4-.2.5-.4l.4-2.6a7.3 7.3 0 0 0 1.9-1.1l2.4 1c.2.1.5 0 .6-.2l2-3.4a.5.5 0 0 0-.1-.7l-2.1-1.6zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"/></svg>
+      </a>
+    </header>
+
+    <!-- 拨号 -->
+    <section id="tab-dialer" class="tab">
+      <div id="dial-display" aria-live="polite"></div>
+      <div id="dial-suggestions" class="suggestions hidden"></div>
+      <div id="keypad"></div>
+      <div class="dial-actions">
+        <button class="key ghost" data-key="" aria-hidden="true" tabindex="-1"></button>
+        <button id="dial-call" class="call-btn" aria-label="拨打">
+          <svg viewBox="0 0 24 24" width="30" height="30"><path fill="currentColor" d="M6.6 10.8c1.4 2.8 3.8 5.1 6.6 6.6l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C10.8 21 3 13.2 3 4c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.2.2 2.4.6 3.6.1.3 0 .7-.2 1l-2.3 2.2z"/></svg>
+        </button>
+        <button id="dial-delete" class="key ghost" aria-label="删除一位">⌫</button>
+      </div>
+    </section>
+
+    <!-- 短信 -->
+    <section id="tab-messages" class="tab hidden">
+      <div id="thread-list"></div>
+      <div id="sms-editbar" class="sms-editbar hidden">
+        <button id="sms-mark-read" type="button">标记已读</button>
+        <button id="sms-delete" type="button" class="danger">删除</button>
+      </div>
+      <div id="thread-view" class="hidden">
+        <header id="thread-header">
+          <button id="thread-back" aria-label="返回">‹</button>
+          <div class="thread-peer"><div class="avatar" id="thread-avatar"></div><span id="thread-name"></span></div>
+          <select id="thread-line" aria-label="对话线路"></select>
+          <button id="thread-call" aria-label="呼叫该号码">☎</button>
+          <button id="thread-menu" aria-label="更多">⋯</button>
+        </header>
+        <div id="thread-messages"></div>
+        <footer id="composer">
+          <textarea id="composer-input" rows="1" maxlength="10000" placeholder="信息·短信"></textarea>
+          <button id="composer-send" class="send-btn" aria-label="发送">↑</button>
+        </footer>
+      </div>
+      <div id="compose-view" class="hidden">
+        <header id="compose-header">
+          <button id="compose-cancel">取消</button>
+          <strong>新信息</strong>
+          <button id="compose-send" class="link">发送</button>
+        </header>
+        <div class="compose-row"><label for="compose-to">收件人</label>
+          <input id="compose-to" autocomplete="off" inputmode="tel" placeholder="输入号码">
+        </div>
+        <div id="compose-suggestions" class="suggestions hidden"></div>
+        <div class="compose-row"><label for="compose-from">发件人</label>
+          <select id="compose-from" aria-label="发件线路"></select>
+        </div>
+        <textarea id="compose-body" rows="6" maxlength="10000" placeholder="信息·短信"></textarea>
+      </div>
+    </section>
+
+    <!-- 通讯录 -->
+    <section id="tab-contacts" class="tab hidden">
+      <div id="contacts-toolbar">
+        <input id="contacts-search" autocomplete="off" placeholder="搜索姓名、号码或拼音">
+        <button id="contacts-import" class="topbar-action" type="button">导入 .vcf</button>
+        <button id="contacts-export" class="topbar-action" type="button">导出</button>
+        <input id="contacts-file" type="file" accept=".vcf,text/vcard,text/x-vcard" class="hidden">
+      </div>
+      <div id="contacts-preview" class="hidden">
+        <div class="preview-head">
+          <strong id="contacts-preview-title">导入预览</strong>
+          <span id="contacts-preview-summary" class="muted"></span>
+        </div>
+        <div id="contacts-preview-list"></div>
+        <div class="preview-actions">
+          <button id="contacts-preview-cancel" type="button">取消</button>
+          <button id="contacts-preview-commit" class="primary" type="button">确认导入</button>
+        </div>
+      </div>
+      <div id="contacts-list"></div>
+      <p id="contacts-note" class="muted hidden"></p>
+    </section>
+
+    <nav id="tabbar">
+      <button class="tabbtn active" data-tab="dialer" aria-label="拨号键盘">
+        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M3 5a2 2 0 0 1 2-2h3l2 5-2.2 1.6a13 13 0 0 0 6.6 6.6L16 14l5 2v3a2 2 0 0 1-2 2C9.8 21 3 14.2 3 5z"/></svg>
+        <span>拨号</span></button>
+      <button class="tabbtn" data-tab="messages" aria-label="短信">
+        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M4 4h16a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H8l-5 4V6a2 2 0 0 1 1-2z"/></svg>
+        <span>短信</span></button>
+      <button class="tabbtn" data-tab="contacts" aria-label="通讯录">
+        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M5 3h12a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zm2 4v2h8V7H7zm0 4v2h8v-2H7zm0 4v2h5v-2H7z"/></svg>
+        <span>通讯录</span></button>
+    </nav>
+  </section>
+
+  <!-- 骚扰拦截与录音（规则/录音库，key 级） -->
+  <section id="rules-view" class="hidden">
+    <header id="rules-bar">
+      <button id="rules-back" class="topbar-action" type="button">返回</button>
+      <strong>骚扰拦截</strong>
+      <span id="rules-status"></span>
+    </header>
+    <div id="rules-body">
+      <div id="rules-unsupported" class="hidden">当前网关版本不支持骚扰拦截设置。</div>
+      <section id="rules-toggles">
+        <label><input type="checkbox" id="rules-call-toggle"> 拦截来电</label>
+        <label><input type="checkbox" id="rules-sms-toggle"> 拦截短信</label>
+        <p class="hint">未知号码默认放行。</p>
+      </section>
+      <h3>拦截号码</h3>
+      <ul id="rules-blocked"></ul>
+      <div class="rules-add">
+        <input id="rules-block-number" type="text" inputmode="tel" placeholder="完整号码或前缀">
+        <select id="rules-block-kind"><option value="exact">完整号码</option><option value="prefix">号码前缀</option></select>
+        <button id="rules-block-add" type="button">添加</button>
+      </div>
+      <h3>信任号码</h3>
+      <ul id="rules-trusted"></ul>
+      <div class="rules-add">
+        <input id="rules-trust-number" type="text" inputmode="tel" placeholder="完整号码">
+        <button id="rules-trust-add" type="button">添加</button>
+      </div>
+      <h3>导入名单（默认仅标记）</h3>
+      <textarea id="rules-import-text" rows="3" placeholder="每行一个号码"></textarea>
+      <button id="rules-import" type="button">导入为新名单</button>
+      <ul id="rules-lists"></ul>
+      <h3>拦截记录</h3>
+      <ul id="rules-history"></ul>
+      <button id="rules-history-clear" type="button">清空拦截记录</button>
+      <h3>垃圾短信</h3>
+      <div class="rules-add">
+        <select id="rules-sms-folder"><option value="junk">垃圾箱</option><option value="normal">正常</option></select>
+        <button id="rules-sms-refresh" type="button">刷新</button>
+      </div>
+      <ul id="rules-threads"></ul>
+      <h3>通话录音</h3>
+      <label><input type="checkbox" id="rules-auto-record"> 自动录音（本机）</label>
+      <p class="hint" id="rules-auto-hint"></p>
+      <ul id="rules-recordings"></ul>
+    </div>
+  </section>
+
+  <!-- 通话 -->
+  <section id="call-view" class="hidden">
+    <div class="call-card">
+      <div class="avatar large" id="call-avatar"></div>
+      <p id="call-peer">—</p>
+      <p id="call-state" class="muted">—</p>
+      <div class="call-controls" id="call-controls"></div>
+    </div>
+  </section>
+
+  <p id="toast" class="hidden" role="status"></p>
+</main>
+<script src="/pwa/pcmu.js"></script>
+<script src="/pwa/audio.js"></script>
+<script src="/pwa/webrtc.js"></script>
+<script src="/pwa/denoise.js"></script>
+<script src="/pwa/fixture.js"></script>
+<script>
+  // Keep the fixture marker when navigating to the settings page in preview.
+  if (/[?&]fixture=1/.test(location.search)) {
+    document.getElementById('settings-link').href = '/pwa/?fixture=1';
+  }
+</script>
+<script src="/pwa/session.js"></script>
+<script src="/pwa/callflow.js"></script>
+<script src="/pwa/callevents.js"></script>
+<script src="/pwa/threadlogic.js"></script>
+<script src="/pwa/contactslogic.js"></script>
+<script src="/pwa/client.js"></script>
+<script src="/pwa/rules.js"></script>
+</body>
+</html>

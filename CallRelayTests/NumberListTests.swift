@@ -94,6 +94,13 @@ final class NumberListParserTests: XCTestCase {
         let list = store.lists.first { !$0.isBundled }!
         store.list(mode: .reject, for: list.id)
 
+        // Build-55 master switch: the production store defaults OFF, so an
+        // explicit reject list only silences once the call channel is on.
+        XCTAssertEqual(store.policy().screenCall(
+            peer: "13800007777", listHits: store.callListHits(for: "13800007777")), .allow,
+            "nothing may be silenced while the call switch is off")
+        store.setCallBlocking(true, notifyGateway: false)
+
         let decision = store.policy().screenCall(
             peer: "+86 138-0000-7777", listHits: store.callListHits(for: "13800007777"))
         guard case .reject = decision else { return XCTFail("reject list must silence the call") }

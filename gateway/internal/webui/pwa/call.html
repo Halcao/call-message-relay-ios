@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#0b1220">
+<title>CallRelay 来电</title>
+<link rel="manifest" href="/pwa/manifest.webmanifest">
+<link rel="icon" href="/pwa/icon-192.png">
+<link rel="apple-touch-icon" href="/pwa/icon-192.png">
+<link rel="stylesheet" href="/pwa/styles.css">
+</head>
+<body>
+<main class="card">
+  <header class="brand">
+    <img src="/pwa/icon-192.png" alt="" class="logo">
+    <div>
+      <h1 data-i18n="title">CallRelay 来电</h1>
+      <p class="muted" id="line-name"></p>
+    </div>
+  </header>
+
+  <section id="ringing" class="hidden">
+    <p class="peer" id="peer">—</p>
+    <p class="muted" id="state-text"></p>
+    <div class="row">
+      <a id="open-app" class="button primary hidden" href="callrelay://incoming">在 CallRelay 中打开</a>
+    </div>
+    <p class="muted small" id="auto-hint" data-i18n="autoHint">正在尝试自动打开 CallRelay……如果没有跳转，请点上方按钮。</p>
+    <p class="muted small hidden" id="no-app-hint" data-i18n="noAppHint">未安装 App 时此按钮可能无反应。</p>
+  </section>
+
+  <section id="ended" class="hidden">
+    <p class="muted" data-i18n="ended">该来电已结束。</p>
+  </section>
+
+  <section id="need-bind" class="hidden">
+    <p class="warn" data-i18n="needBind">此浏览器尚未绑定，请先在 App 中生成绑定码。</p>
+    <div class="row">
+      <a class="button" href="/pwa/" data-i18n="openSetup">打开设置</a>
+      <a class="button primary" href="callrelay://incoming" data-i18n="openAppAnyway">仍要打开 App</a>
+    </div>
+  </section>
+
+  <section id="browser-answer" class="hidden">
+    <p class="muted" id="browser-answer-hint">此浏览器已绑定网页客户端，可直接在网页中接听（需要麦克风权限）。</p>
+    <div class="row">
+      <a class="button primary" id="browser-answer-open" href="#">在网页中接听</a>
+      <a class="button" href="callrelay://incoming" data-i18n="openAppInstead">改用 App 接听</a>
+    </div>
+  </section>
+</main>
+<script src="/pwa/fixture.js"></script>
+<script src="/pwa/session.js"></script>
+<script src="/pwa/call.js"></script>
+</body>
+</html>

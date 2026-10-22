@@ -8,7 +8,7 @@ final class UnifiedEnrollmentTests: XCTestCase {
     func testEnrollmentPayloadParsesWithoutPairingSecrets() {
         let key = V2Fixtures.enrollmentKey()
         let json = """
-        {"gatewayId":"gw-1","gatewayName":"Unified","baseURL":"https://callrelay.cloudforzhao.com",
+        {"gatewayId":"gw-1","gatewayName":"Unified","baseURL":"https://gw.example.com",
          "enrollmentKey":"\(key)","fingerprint":"sha256:abc","apiVersion":"v2"}
         """
         guard case .success(let payload) = PairingPayloadParser.parse(json) else {
@@ -20,7 +20,7 @@ final class UnifiedEnrollmentTests: XCTestCase {
         XCTAssertEqual(payload.apiVersion, "v2")
         XCTAssertEqual(payload.gatewayName, "Unified")
         XCTAssertEqual(payload.enrollmentKey, key)
-        XCTAssertEqual(payload.baseURL, "https://callrelay.cloudforzhao.com")
+        XCTAssertEqual(payload.baseURL, "https://gw.example.com")
     }
 
     func testEnrollmentPayloadDefaultsToV2WhenVersionAbsent() {
@@ -99,7 +99,7 @@ final class UnifiedEnrollmentTests: XCTestCase {
 final class GatewayOriginV2Tests: XCTestCase {
     func testV2APIPathsAndWebSocketUseVersionSegment() throws {
         guard case .success(let origin) = GatewayOrigin.validate(
-            "https://callrelay.cloudforzhao.com", apiVersion: "v2"
+            "https://gw.example.com", apiVersion: "v2"
         ) else { return XCTFail("expected valid origin") }
 
         XCTAssertEqual(origin.apiVersion, "v2")

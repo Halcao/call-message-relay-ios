@@ -88,15 +88,27 @@ protocol GatewayAPI: Sendable {
     /// v2: authorized WebSocket upgrade request for a call's WSS PCMU audio
     /// channel (the cellular-reachable media transport). Throws notReady on
     /// v1/demo bindings.
-    func mediaWebSocketRequest(callId: String) async throws -> URLRequest
+    func mediaWebSocketRequest(callId: String, denoise: DenoiseChoice?) async throws -> URLRequest
+    /// Build-50 (mediaStandby-gated): attaches a SECOND WSS socket in the
+    /// hot-standby role; never evicts the primary. Throws notReady on older
+    /// gateways — the caller gates on ICEConfiguration.mediaStandby.
+    func mediaWebSocketStandbyRequest(callId: String) async throws -> URLRequest
     /// v2: same, for the hosted conference's client audio channel.
-    func conferenceMediaWebSocketRequest(conferenceId: String) async throws -> URLRequest
+    func conferenceMediaWebSocketRequest(conferenceId: String, denoise: DenoiseChoice?) async throws -> URLRequest
     /// v2: side-effect-free measurement socket (ping/pong only) used to
     /// sample relay RTT while media runs over direct ICE.
     func mediaMeasureWebSocketRequest(callId: String) async throws -> URLRequest
     /// v2: call-independent relay measurement socket (ping/pong only) used by
     /// the foreground idle route screen. Never attaches to a call's media.
     func mediaRelayProbeWebSocketRequest() async throws -> URLRequest
+    /// Build-61 (mediaQuic-gated): the QUIC capability + TLS pin document
+    /// (GET /api/v2/media/quic). The caller verifies the pin signature
+    /// against the gateway identity key it already trusts before dialing.
+    func quicMediaInfo() async throws -> QUICMediaInfo
+    /// Build-61 (mediaQuic-gated): posts the phone's srflx candidate for a
+    /// live call and receives the coordinated punch window (token, gateway
+    /// candidate, start/deadline). One-time punch token; dies with the call.
+    func postQUICCandidate(callId: String, candidate: String, networkEpoch: String) async throws -> QUICPunchInfo
     /// v2: attaches a DETACHED echo probe for candidate-quality measurement.
     /// The probe never disturbs the live media path; the answer is a normal
     /// SDP answer for the isolated probe peer connection.
@@ -107,6 +119,15 @@ protocol GatewayAPI: Sendable {
     /// A non-nil preflightId adopts the caller's device-scoped preflight
     /// candidate (fresh foreground measurement) instead of a call probe.
     func commitMediaProbe(callId: String, preflightId: String?) async throws
+    /// Build-50 (mediaStandby-gated): commit variant that installs the probe
+    /// into the gateway's hot-standby slot instead of replacing the primary.
+    /// Returns the fencing epoch/token for later promotion commands.
+    func commitMediaProbe(callId: String, preflightId: String?, asStandby: Bool) async throws -> V2StandbyFence
+    /// Build-50 (mediaStandby-gated): fenced hot-standby role swap.
+    @discardableResult
+    func promoteStandby(callId: String, transport: String, token: String, expectEpoch: UInt64, nonce: String) async throws -> V2PromoteStandbyResponse
+    /// Build-50 (mediaStandby-gated): transport roles for reconciliation.
+    func mediaState(callId: String) async throws -> V2MediaStateResponse
     /// v2: cancels the call's probe (safe no-op when absent).
     func discardMediaProbe(callId: String) async throws
     /// v2: ICE configuration WITHOUT a call, for foreground direct-path
@@ -140,6 +161,11 @@ protocol GatewayAPI: Sendable {
 
     // MARK: SMS
     func listThreads() async throws -> [MessageThread]
+    /// Build-55 per-key quarantine listing: folder is "normal" | "junk" |
+    /// "all". Same-key devices share the folder; another key is isolated.
+    func listThreads(folder: String) async throws -> [MessageThread]
+    /// Restores a quarantined conversation for THIS key (pinned normal).
+    func restoreThread(threadKey: String) async throws
     /// All messages in chronological (ascending) order, paged by `after`.
     func listMessages(after: Int64, limit: Int) async throws -> [MessageRecord]
     /// One thread page. A nil cursor starts at the newest messages; the result
@@ -147,14 +173,34 @@ protocol GatewayAPI: Sendable {
     func listThreadMessages(
         threadKey: String, beforeCreatedAt: Int64?, beforeID: String?, limit: Int
     ) async throws -> ThreadMessagePage
+
+    // MARK: Conditional history GETs (ETag / If-None-Match).
+    //
+    // These are the ONLY allowed caching/validation surfaces (thread list,
+    // message pages, call history). Admin/auth/keys/token/ICE endpoints must
+    // never be routed through them. A `.notModified` means the local copy is
+    // still current and the transfer cost ZERO body bytes; `.changed` carries
+    // a fresh body plus (when advertised) the new validator. The default
+    // implementations degrade to an unconditional full fetch so demo/old
+    // transports and fakes behave exactly as before.
+    func listThreadsConditional(folder: String?, lineId: String?) async throws -> ConditionalOutcome<[MessageThread]>
+    func listThreadMessagesConditional(
+        threadKey: String, beforeCreatedAt: Int64?, beforeID: String?, limit: Int
+    ) async throws -> ConditionalOutcome<ThreadMessagePage>
+    func listCallsConditional(limit: Int) async throws -> ConditionalOutcome<[CallRecord]>
+
     /// Sends an SMS. The same logical submission must always reuse the same
     /// `idempotencyKey` so retries cannot create duplicate messages.
     func sendMessage(to: String, body: String, idempotencyKey: String) async throws -> MessageRecord
+    func performSMSActions(_ actions: [SMSConversationAction]) async throws -> SMSActionResponse
+    func supportsSMSActions() async throws -> Bool
     func markMessageRead(id: String, idempotencyKey: String) async throws
 
     // MARK: Unified gateway (apiVersion v2); defaults live in the extension
     func authorizedLines() async throws -> [AuthorizedLine]
     func setDefaultLine(_ lineId: String, idempotencyKey: String) async throws
+    /// Build-48 directional denoise switches (PATCH presence semantics).
+    func setDenoisePreferences(uplink: Bool?, downlink: Bool?) async throws
     /// Set (non-empty) or reset (empty) a line's own number. The server only
     /// accepts it for a key holding the explicit manage-number capability.
     @discardableResult
@@ -181,7 +227,44 @@ protocol GatewayAPI: Sendable {
     /// Authorized DELETE. A 404 (already deleted on another device) is
     /// normalized to success by the implementation so deletes converge.
     func deleteVoicemail(id: String) async throws
+
+    // MARK: Manual call recording (v2). Start/stop act on one live 1:1 call
+    // the device owns; conference start/stop act on a conference this device
+    // hosts (host device/key only). List/get/delete/audio are scoped to this
+    // device's enrollment key by the gateway.
+    func startCallRecording(callId: String) async throws -> RecordingRecord
+    func stopCallRecording(callId: String) async throws -> RecordingRecord
+    func startConferenceRecording(conferenceId: String) async throws -> RecordingRecord
+    func stopConferenceRecording(conferenceId: String) async throws -> RecordingRecord
+    func listRecordings() async throws -> [RecordingRecord]
+    func recordingAudio(id: String) async throws -> Data
+    /// Authorized DELETE; a 404 converges to success like voicemail.
+    func deleteRecording(id: String) async throws
     func enroll(_ request: EnrollmentRequest) async throws -> EnrollmentResponse
+
+    // MARK: Harassment (骚扰拦截, v2). Scope is always the authenticated
+    // enrollment key; same-key devices share one policy, a different key on
+    // the same line is isolated. Old gateways answer 404 and the default
+    // protocol extension throws APIError.notReady so the app falls back to
+    // local-only rules.
+    func harassmentSettings() async throws -> HarassmentSettingsRecord
+    func updateHarassmentSettings(callBlocking: Bool, smsBlocking: Bool, contactWhitelist: Bool?, version: Int64?) async throws -> HarassmentSettingsRecord
+    func harassmentEntries() async throws -> [HarassmentEntryRecord]
+    func addHarassmentEntry(number: String, matchKind: String, mode: String, action: String?, replaceOpposite: Bool) async throws -> HarassmentEntryAddResult
+    func deleteHarassmentEntry(id: String) async throws
+    func harassmentLists() async throws -> [HarassmentListRecord]
+    func importHarassmentList(name: String, numbers: [String], defaultAction: String) async throws -> HarassmentListRecord
+    func deleteHarassmentList(id: String) async throws
+    func harassmentHistory() async throws -> [HarassmentEventRecord]
+    func clearHarassmentHistory() async throws
+    func testHarassment(kind: String, number: String, body: String) async throws -> HarassmentDecisionRecord
+
+    // MARK: Recording configuration (v2). Auto recording requires BOTH the
+    // gateway operator mode (default off) and this DEVICE's preference
+    // (default OFF).
+    func recordingSettings() async throws -> RecordingSettingsRecord
+    @discardableResult
+    func updateDeviceAutoRecord(_ enabled: Bool) async throws -> Bool
 
     // MARK: Optional web push bridge (v2); the app works without ever calling
     // these. Part of the App Store PWA edition only (PWA_BRIDGE).
@@ -201,9 +284,25 @@ protocol GatewayAPI: Sendable {
 
 /// Newest-first page of one thread plus the gateway's X-CellBridge-Has-More
 /// flag (there are older messages on the server).
-struct ThreadMessagePage: Equatable, Sendable {
+struct ThreadMessagePage: Codable, Equatable, Sendable {
     let messages: [MessageRecord]
     let hasMore: Bool
+}
+
+/// Result of a conditional (ETag / `If-None-Match`) history GET. The gateway
+/// answers a matching validator with `304` and NO body; a `304` means "keep
+/// the local copy" and transfers zero payload bytes.
+enum ConditionalOutcome<T> {
+    /// The gateway sent a fresh full body (200). `validator` carries the
+    /// (key, ETag) pair the caller must commit TOGETHER with this body via
+    /// the durable history store — never separately, so a snapshot's
+    /// metadata always describes the exact persisted body. nil on a
+    /// transport without a durable cache or on an old gateway that never
+    /// advertises ETags (behavior then stays exactly as before: full fetch).
+    case changed(T, validator: HistoryValidator?)
+    /// `304 Not Modified`: the caller must keep its current data and must NOT
+    /// treat this as a failure or re-download.
+    case notModified
 }
 
 // MARK: - Unified gateway (apiVersion v2)
@@ -320,7 +419,7 @@ struct AuthorizedLine: Decodable, Equatable, Identifiable, Sendable {
         if actualNumber != nil { return nil }
         switch identity?.numberSource {
         case "empty":
-            return "SIM 未存储号码"
+            return "未设置号码"
         case "unsupported":
             return "暂不可用"
         case "sim_changed":
@@ -423,7 +522,9 @@ struct DeviceEnvelope: Decodable, Equatable, Sendable {
     let device: DeviceInfo
     let key: KeyInfo
     let lines: [AuthorizedLine]
+    var capabilities: SMSCapabilities? = nil
 }
+struct SMSCapabilities: Decodable, Equatable, Sendable { let smsThreadActions: Bool? }
 
 /// Gateway push readiness from the anonymous `/health` endpoint.
 struct GatewayPushHealth: Decodable, Equatable, Sendable {
@@ -464,6 +565,121 @@ struct VoicemailRecord: Decodable, Equatable, Identifiable, Sendable {
     let expiresAt: Int64
 }
 
+/// One manual call recording as returned by the unified gateway. `state` is
+/// the server truth (starting/recording/finalizing/ready/failed/deleted) and
+/// never inferred locally; `keyId` confirms the gateway-side key scope.
+/// `kind` is "call" for a 1:1 segment and "conference" for a hosted
+/// conference segment (`conferenceId` names the conference in that case).
+struct RecordingRecord: Decodable, Equatable, Identifiable, Sendable {
+    let id: String
+    let callId: String
+    let lineId: String
+    let lineName: String?
+    let direction: String?
+    let peer: String?
+    let state: String
+    let triggerMode: String?
+    let startedAt: Int64?
+    let stoppedAt: Int64?
+    let durationMs: Int64
+    let sizeBytes: Int64
+    let failureCode: String?
+    let failureReason: String?
+    let createdAt: Int64
+    let expiresAt: Int64?
+    let keyId: String?
+    /// "call" | "conference"; absent on older gateways means a 1:1 segment.
+    let kind: String?
+    /// Set only for conference segments; the id used to start/stop them.
+    let conferenceId: String?
+
+    init(id: String,
+         callId: String,
+         lineId: String,
+         lineName: String? = nil,
+         direction: String? = nil,
+         peer: String? = nil,
+         state: String,
+         triggerMode: String? = nil,
+         startedAt: Int64? = nil,
+         stoppedAt: Int64? = nil,
+         durationMs: Int64 = 0,
+         sizeBytes: Int64 = 0,
+         failureCode: String? = nil,
+         failureReason: String? = nil,
+         createdAt: Int64,
+         expiresAt: Int64? = nil,
+         keyId: String? = nil,
+         kind: String? = nil,
+         conferenceId: String? = nil) {
+        self.id = id
+        self.callId = callId
+        self.lineId = lineId
+        self.lineName = lineName
+        self.direction = direction
+        self.peer = peer
+        self.state = state
+        self.triggerMode = triggerMode
+        self.startedAt = startedAt
+        self.stoppedAt = stoppedAt
+        self.durationMs = durationMs
+        self.sizeBytes = sizeBytes
+        self.failureCode = failureCode
+        self.failureReason = failureReason
+        self.createdAt = createdAt
+        self.expiresAt = expiresAt
+        self.keyId = keyId
+        self.kind = kind
+        self.conferenceId = conferenceId
+    }
+
+    var isReady: Bool { state == "ready" }
+    var isFailed: Bool { state == "failed" }
+    var isActive: Bool { state == "recording" || state == "starting" || state == "finalizing" }
+    var isConference: Bool { kind == "conference" || !(conferenceId ?? "").isEmpty }
+    var createdDate: Date { Date(unixMilliseconds: createdAt) }
+    var startedDate: Date? { startedAt.map(Date.init(unixMilliseconds:)) }
+
+    var durationLabel: String {
+        let totalSeconds = max(Int(durationMs / 1000), 0)
+        let minutes = totalSeconds / 60
+        let seconds = totalSeconds % 60
+        return String(format: "%d:%02d", minutes, seconds)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, callId, lineId, lineName, direction, peer, state, triggerMode
+        case startedAt, stoppedAt, durationMs, sizeBytes, failureCode, failureReason
+        case createdAt, expiresAt, keyId, kind, conferenceId
+    }
+
+    /// Tolerant decode: the gateway omits zero/empty optional fields and is
+    /// allowed to add fields over time, so a missing counter must never drop
+    /// an entire lifecycle event (which would freeze the in-call indicator).
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        callId = try c.decode(String.self, forKey: .callId)
+        lineId = try c.decode(String.self, forKey: .lineId)
+        lineName = try c.decodeIfPresent(String.self, forKey: .lineName)
+        direction = try c.decodeIfPresent(String.self, forKey: .direction)
+        peer = try c.decodeIfPresent(String.self, forKey: .peer)
+        state = (try c.decodeIfPresent(String.self, forKey: .state)) ?? "unknown"
+        triggerMode = try c.decodeIfPresent(String.self, forKey: .triggerMode)
+        startedAt = try c.decodeIfPresent(Int64.self, forKey: .startedAt)
+        stoppedAt = try c.decodeIfPresent(Int64.self, forKey: .stoppedAt)
+        durationMs = (try c.decodeIfPresent(Int64.self, forKey: .durationMs)) ?? 0
+        sizeBytes = (try c.decodeIfPresent(Int64.self, forKey: .sizeBytes)) ?? 0
+        failureCode = try c.decodeIfPresent(String.self, forKey: .failureCode)
+        failureReason = try c.decodeIfPresent(String.self, forKey: .failureReason)
+        createdAt = (try c.decodeIfPresent(Int64.self, forKey: .createdAt)) ?? 0
+        expiresAt = try c.decodeIfPresent(Int64.self, forKey: .expiresAt)
+        keyId = try c.decodeIfPresent(String.self, forKey: .keyId)
+        kind = try c.decodeIfPresent(String.self, forKey: .kind)
+        conferenceId = try c.decodeIfPresent(String.self, forKey: .conferenceId)
+    }
+}
+
 struct ConferenceRecord: Decodable, Equatable, Identifiable, Sendable {
     let id: String
     let hostDeviceId: String
@@ -471,6 +687,17 @@ struct ConferenceRecord: Decodable, Equatable, Identifiable, Sendable {
     let createdAt: Int64
     let graceDeadline: Int64?
     let legs: [CallRecord]
+    /// Server-confirmed manual conference recording state (host device only).
+    /// Empty after a merge finalized the prior 1:1 segment: the conference
+    /// starts unrecorded and the user starts a conference segment manually.
+    var recordingId: String? = nil
+    var recordingState: String? = nil
+    var recordingDurationMs: Int64? = nil
+
+    var isRecording: Bool { recordingState == "recording" }
+    var recordingInProgress: Bool {
+        ["recording", "starting", "finalizing"].contains(recordingState ?? "")
+    }
 }
 
 /// `voicemail.deleted` event payload; the gateway publishes one per successful
@@ -486,13 +713,54 @@ struct ThreadDeletionPayload: Decodable, Equatable, Sendable {
     let key: String
     let lineId: String?
     let deletedAt: Int64?
+    var throughID: String? = nil
 }
+struct ThreadReadPayload: Decodable { let key: String; let throughCreatedAt: Int64; let throughID: String }
 
 /// Unified-gateway-only surface. Defaults keep the demo/v1 transports
 /// compiling; the HTTP transport implements them for apiVersion v2.
 extension GatewayAPI {
+    func supportsSMSActions() async throws -> Bool { false }
+    func performSMSActions(_ actions: [SMSConversationAction]) async throws -> SMSActionResponse { throw APIError.notReady("请更新网关后重试。") }
     func authorizedLines() async throws -> [AuthorizedLine] {
         throw APIError.notReady("当前配对不是统一网关，无法获取线路列表。")
+    }
+
+    // MARK: Conditional history GETs — defaults.
+    //
+    // A transport that does not implement ETag revalidation (demo, a fake
+    // simulating an old gateway) degrades to an unconditional full fetch,
+    // exactly the pre-cache behavior. The live HTTP transport overrides these
+    // to actually send If-None-Match; validators returned with a changed
+    // body are committed durably ONLY by the caller that applies the body,
+    // in the same snapshot write (bodies and their ETags never tear).
+    func listThreadsConditional(folder: String?, lineId: String?) async throws -> ConditionalOutcome<[MessageThread]> {
+        if let folder {
+            return .changed(try await listThreads(folder: folder), validator: nil)
+        }
+        return .changed(try await listThreads(lineId: lineId), validator: nil)
+    }
+
+    func listThreadMessagesConditional(
+        threadKey: String, beforeCreatedAt: Int64?, beforeID: String?, limit: Int
+    ) async throws -> ConditionalOutcome<ThreadMessagePage> {
+        .changed(try await listThreadMessages(
+            threadKey: threadKey, beforeCreatedAt: beforeCreatedAt, beforeID: beforeID, limit: limit),
+            validator: nil)
+    }
+
+    func listCallsConditional(limit: Int) async throws -> ConditionalOutcome<[CallRecord]> {
+        .changed(try await listCalls(limit: limit), validator: nil)
+    }
+
+    /// Old gateways have no per-key folders: the caller falls back to local
+    /// classification instead of pretending.
+    func listThreads(folder: String) async throws -> [MessageThread] {
+        throw APIError.notReady("当前网关版本不支持垃圾信息隔离。")
+    }
+
+    func restoreThread(threadKey: String) async throws {
+        throw APIError.notReady("当前网关版本不支持垃圾信息恢复。")
     }
 
     /// v1/demo fallback: active = recent calls that never finished. The live
@@ -502,6 +770,11 @@ extension GatewayAPI {
     }
 
     func setDefaultLine(_ lineId: String, idempotencyKey: String) async throws {
+        throw APIError.notReady("当前配对不是统一网关。")
+    }
+
+    /// Default for v1/demo clients: no gateway-side denoise preference.
+    func setDenoisePreferences(uplink: Bool?, downlink: Bool?) async throws {
         throw APIError.notReady("当前配对不是统一网关。")
     }
 
@@ -584,8 +857,12 @@ extension GatewayAPI {
         throw APIError.notReady("当前配对不支持多方会议。")
     }
 
-    func mediaWebSocketRequest(callId: String) async throws -> URLRequest {
+    func mediaWebSocketRequest(callId: String, denoise: DenoiseChoice?) async throws -> URLRequest {
         throw APIError.notReady("当前配对不支持 WebSocket 音频。")
+    }
+
+    func mediaWebSocketStandbyRequest(callId: String) async throws -> URLRequest {
+        throw APIError.notReady("当前配对不支持备用通道。")
     }
 
     func attachMediaProbe(callId: String, sdp: String) async throws -> WebRTCAnswer {
@@ -594,6 +871,19 @@ extension GatewayAPI {
 
     func commitMediaProbe(callId: String, preflightId: String?) async throws {
         throw APIError.notReady("当前配对不支持媒体探测。")
+    }
+
+    func commitMediaProbe(callId: String, preflightId: String?, asStandby: Bool) async throws -> V2StandbyFence {
+        throw APIError.notReady("当前配对不支持备用通道。")
+    }
+
+    @discardableResult
+    func promoteStandby(callId: String, transport: String, token: String, expectEpoch: UInt64, nonce: String) async throws -> V2PromoteStandbyResponse {
+        throw APIError.notReady("当前配对不支持备用通道。")
+    }
+
+    func mediaState(callId: String) async throws -> V2MediaStateResponse {
+        throw APIError.notReady("当前配对不支持备用通道。")
     }
 
     func discardMediaProbe(callId: String) async throws {
@@ -616,7 +906,7 @@ extension GatewayAPI {
         throw APIError.notReady("当前配对不支持媒体探测。")
     }
 
-    func conferenceMediaWebSocketRequest(conferenceId: String) async throws -> URLRequest {
+    func conferenceMediaWebSocketRequest(conferenceId: String, denoise: DenoiseChoice?) async throws -> URLRequest {
         throw APIError.notReady("当前配对不支持 WebSocket 音频。")
     }
 
@@ -628,6 +918,15 @@ extension GatewayAPI {
         throw APIError.notReady("当前配对不支持线路质量测量。")
     }
 
+    /// v1/demo bindings have no QUIC direct audio surface.
+    func quicMediaInfo() async throws -> QUICMediaInfo {
+        throw APIError.notReady("当前配对不支持 QUIC 直连音频。")
+    }
+
+    func postQUICCandidate(callId: String, candidate: String, networkEpoch: String) async throws -> QUICPunchInfo {
+        throw APIError.notReady("当前配对不支持 QUIC 直连音频。")
+    }
+
     func listVoicemails() async throws -> [VoicemailRecord] { [] }
 
     func voicemailAudio(id: String) async throws -> Data {
@@ -636,6 +935,32 @@ extension GatewayAPI {
 
     func deleteVoicemail(id: String) async throws {
         throw APIError.notReady("当前配对不支持语音留言。")
+    }
+
+    func startCallRecording(callId: String) async throws -> RecordingRecord {
+        throw APIError.notReady("当前配对不支持通话录音。")
+    }
+
+    func stopCallRecording(callId: String) async throws -> RecordingRecord {
+        throw APIError.notReady("当前配对不支持通话录音。")
+    }
+
+    func startConferenceRecording(conferenceId: String) async throws -> RecordingRecord {
+        throw APIError.notReady("当前配对不支持会议录音。")
+    }
+
+    func stopConferenceRecording(conferenceId: String) async throws -> RecordingRecord {
+        throw APIError.notReady("当前配对不支持会议录音。")
+    }
+
+    func listRecordings() async throws -> [RecordingRecord] { [] }
+
+    func recordingAudio(id: String) async throws -> Data {
+        throw APIError.notReady("当前配对不支持通话录音。")
+    }
+
+    func deleteRecording(id: String) async throws {
+        throw APIError.notReady("当前配对不支持通话录音。")
     }
 
     func enroll(_ request: EnrollmentRequest) async throws -> EnrollmentResponse {

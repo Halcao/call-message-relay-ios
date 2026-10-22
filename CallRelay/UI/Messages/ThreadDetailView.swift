@@ -238,7 +238,7 @@ struct ThreadDetailView: View {
 
     private func junkBanner(_ reason: String) -> some View {
         VStack(spacing: 8) {
-            Text("若未预期会收到来自未知发件人的这则信息，其可能为垃圾信息。命中规则：\(reason)")
+            Text("这可能是垃圾信息。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -402,6 +402,39 @@ struct ConversationInfoSheet: View {
                     }
                 }
 
+                Section("骚扰拦截") {
+                    if model.isHarassmentBlocked(peer) {
+                        Button(role: .destructive) {
+                            Task {
+                                await model.unblockHarassmentNumber(peer)
+                                dismiss()
+                            }
+                        } label: {
+                            Label("解除拦截此号码", systemImage: "shield.slash")
+                        }
+                        .accessibilityIdentifier("unblockSender")
+                    } else {
+                        Button {
+                            Task {
+                                _ = await model.blockHarassmentNumber(peer, channel: "sms")
+                                dismiss()
+                            }
+                        } label: {
+                            Label("拦截此号码", systemImage: "hand.raised")
+                        }
+                        .accessibilityIdentifier("blockSender")
+                    }
+                    Button {
+                        Task {
+                            _ = await model.trustHarassmentNumber(peer)
+                            dismiss()
+                        }
+                    } label: {
+                        Label("信任此号码", systemImage: "checkmark.shield")
+                    }
+                    .accessibilityIdentifier("trustSender")
+                }
+
                 Section {
                     Button {
                         dismiss()
@@ -440,6 +473,14 @@ struct ConversationInfoSheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("完成") { dismiss() }
                 }
+            }
+            .alert("操作未完成", isPresented: Binding(
+                get: { model.harassment.actionNotice != nil },
+                set: { if !$0 { model.harassment.clearActionNotice() } }
+            )) {
+                Button("知道了", role: .cancel) { model.harassment.clearActionNotice() }
+            } message: {
+                Text(model.harassment.actionNotice ?? "")
             }
             .confirmationDialog(
                 String(localized: "删除与 \(displayName) 的对话？"),

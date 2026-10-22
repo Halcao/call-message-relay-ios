@@ -13,6 +13,8 @@
 # embedded.mobileprovision, no _CodeSignature, no signing identity/device data.
 set -euo pipefail
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/build-env.sh"
+
 usage() {
   sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit 2

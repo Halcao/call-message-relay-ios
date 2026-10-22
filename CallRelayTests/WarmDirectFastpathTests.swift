@@ -160,7 +160,7 @@ final class WarmDirectFastpathCoordinatorTests: XCTestCase {
             probe: probe, preflightId: "prb_warm",
             attachedAt: now.addingTimeInterval(-age),
             expiresAt: now.addingTimeInterval(30),
-            samples: samples)
+            samples: samples, pathGeneration: 0)
     }
 
     private func makeAPI(transports: [String] = ["ws", "ice"]) -> FakeGatewayAPI {

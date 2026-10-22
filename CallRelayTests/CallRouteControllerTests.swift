@@ -74,27 +74,52 @@ final class FakeDirectProbe: DirectProbeControlling {
         applyAnswerCount += 1
         if let applyError { throw applyError }
     }
-    func adopt(activatedSession session: AVAudioSession?) { adoptCount += 1 }
+    /// Build-50: models the real probe's RTCAudioDemand ownership so
+    /// rollback demand-balance is testable.
+    private(set) var audioDemandHeld = false
+    func adopt(activatedSession session: AVAudioSession?) { adoptCount += 1; audioDemandHeld = true }
     func setMuted(_ muted: Bool) { mutedCalls.append(muted) }
     /// Ordered-handover tracking (build 44): the coordinator suspends the
     /// ADM before the staged graph starts and resumes it on rollback.
     private(set) var suspendAudioCount = 0
     private(set) var resumeAudioCount = 0
     func suspendAudioDeviceForHandover() { suspendAudioCount += 1 }
-    func resumeAudioDeviceAfterFailedHandover() { resumeAudioCount += 1 }
+    func resumeAudioDeviceAfterFailedHandover() { resumeAudioCount += 1; audioDemandHeld = true }
+    /// Advance BOTH media counters (the bidirectional fresh-media gate
+    /// requires new inbound AND outbound progress per promotion).
+    func advanceMediaForTest(inbound: UInt64, outbound: UInt64) {
+        inboundAudioPackets = max(inboundAudioPackets, inbound)
+        outboundAudioPackets = max(outboundAudioPackets, outbound)
+    }
     func cancel() {
         cancelCount += 1
         connected = false
         mediaReady = false
+        audioDemandHeld = false
         let waiter = offerWaiter
         offerWaiter = nil
         waiter?.resume(throwing: MediaError.closed)
     }
-    func closeTransport() { closeCount += 1 }
+    func closeTransport() { closeCount += 1; audioDemandHeld = false }
     var samples: [TimeInterval] { samplesToReturn }
     /// Scripted inbound RTP total: the post-rollback media re-proof input
     /// (fresh packets past the rollback snapshot clear the degraded latch).
     var inboundAudioPackets: UInt64 = 0
+    var outboundAudioPackets: UInt64 = 0
+    /// Build-49: recovery fresh-media hook storage + test trigger. The
+    /// coordinator wires this with the attempt identity when an AUTO
+    /// recovery crosses to direct; tests fire it to simulate the first
+    /// inbound audio evidence on the adopted peer.
+    private(set) var recoveryFreshMediaWired = false
+    private var recoveryFreshMediaCallback: (() -> Void)?
+    func setRecoveryFreshMedia(_ callback: (() -> Void)?) {
+        recoveryFreshMediaWired = callback != nil
+        recoveryFreshMediaCallback = callback
+    }
+    func fireRecoveryFreshMediaForTest() { recoveryFreshMediaCallback?() }
+    /// Build-50: models the real probe — a DEMOTED peer stays adopted so the
+    /// standby re-promotion takes the resume path, never the guarded adopt.
+    var isAdoptedPeer: Bool { adoptCount > 0 }
     func freshQualitySamples(within window: TimeInterval, now: Date = Date()) -> [TimeInterval] {
         samplesToReturn
     }
@@ -121,6 +146,9 @@ final class CallRouteControllerTests: XCTestCase {
         let api = FakeGatewayAPI()
         var retiredRelay = 0
         var attachRelayCalls = 0
+        /// Build-49: recovery identities observed by the stageRelay callback
+        /// (nil for ordinary handovers).
+        var stagedRelayProofs: [MediaRecoveryController.ProofIdentity?] = []
         var attachRelayResult = true
         var transportReported: String? = "ws"
         var transportFetchCount = 0
@@ -175,7 +203,7 @@ final class CallRouteControllerTests: XCTestCase {
             return RoutePreflightController.Handoff(
                 probe: probe, preflightId: "prb_test", attachedAt: Date(),
                 expiresAt: Date().addingTimeInterval(30),
-                samples: handoffSamples)
+                samples: handoffSamples, pathGeneration: 0)
         }
 
         @MainActor
@@ -185,8 +213,9 @@ final class CallRouteControllerTests: XCTestCase {
                 isMuted: { [weak self] in self?.isMuted ?? false },
                 isConference: { [weak self] in self?.isConference ?? false },
                 retireRelay: { [weak self] in self?.retiredRelay += 1 },
-                stageRelay: { [weak self] in
+                stageRelay: { [weak self] proof in
                     self?.attachRelayCalls += 1
+                    self?.stagedRelayProofs.append(proof)
                     return self?.attachRelayResult ?? false
                 },
                 promoteStagedRelay: { [weak self] peer in

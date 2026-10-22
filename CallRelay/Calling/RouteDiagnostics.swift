@@ -217,16 +217,6 @@ struct RouteDiagnostics: Equatable {
             : String(localized: "测量已停止，以下为最后一次结果")
     }
 
-    /// Footer for the per-path measurement section. The idle preflight runs
-    /// automatically in the foreground; during a call it is deliberately
-    /// suspended (the pinned call never probes).
-    func measurementFooter() -> String {
-        if inCall { return String(localized: "通话中暂停自动测量，保持当前线路") }
-        if direct.state == .probing { return String(localized: "正在测量…") }
-        if relay.state == .probing { return String(localized: "正在测量…") }
-        return String(localized: "空闲时自动测量；数值按测量时间标注新鲜度")
-    }
-
     /// Folds a live route state in. A nil RTT clears only the "current"
     /// display, never the stored sample+timestamp (freshness decides).
     mutating func apply(call state: CallRouteState, now: Date = Date()) {
@@ -462,7 +452,7 @@ extension RouteDiagnostics {
         if lastActive == .relay {
             rows.append(RouteTelemetryRow(
                 label: String(localized: "丢包"),
-                value: String(localized: "不适用（TCP）"), isCurrent: false))
+                value: String(localized: "不适用"), isCurrent: false))
         } else {
             rows.append(historicalLossRow(age: age))
         }
@@ -546,7 +536,7 @@ extension RouteDiagnostics {
         if active == .relay {
             // The relay is a reliable ordered TCP transport: packet loss is
             // not a meaningful number there and is labelled honestly.
-            rows.append(RouteTelemetryRow(label: String(localized: "丢包"), value: String(localized: "不适用（TCP）"), isCurrent: false))
+            rows.append(RouteTelemetryRow(label: String(localized: "丢包"), value: String(localized: "不适用"), isCurrent: false))
         } else if active == .direct {
             rows.append(lossRow(freshness: freshness))
         }

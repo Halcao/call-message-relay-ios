@@ -52,6 +52,14 @@ struct ActiveCallViewState: Equatable, Identifiable {
     var isMuted: Bool
     var startedAt: Date?
     var connectedAt: Date?
+    /// Server-confirmed manual recording state (never derived locally):
+    /// "" (none), starting, recording, finalizing, ready, failed.
+    var recordingId: String? = nil
+    var recordingState: String = ""
+    var recordingDurationMs: Int64? = nil
+
+    var isRecording: Bool { recordingState == "recording" }
+    var recordingInProgress: Bool { recordingState == "recording" || recordingState == "starting" || recordingState == "finalizing" }
 }
 
 enum LinePhase: Equatable {
@@ -69,10 +77,11 @@ enum LinePhase: Equatable {
         case .online(let line):
             switch line.registration {
             case .registered:
+                // Plain state: the line's SIM is registered on its network.
                 if let op = line.operatorName, !op.isEmpty {
-                    return String(localized: "已注册 · \(op)")
+                    return String(localized: "线路可用 · \(op)")
                 }
-                return String(localized: "已注册到网络")
+                return String(localized: "线路可用")
             case .searching: return String(localized: "正在搜索网络…")
             case .denied: return String(localized: "网络注册被拒绝")
             case .unknown: return String(localized: "注册状态未知")

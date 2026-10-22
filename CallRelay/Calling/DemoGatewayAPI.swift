@@ -15,6 +15,32 @@ final class DemoGatewayAPI: GatewayAPI {
     var failNextOutgoingSMS = false
     private var idempotentSends: [String: MessageRecord] = [:]
 
+    // Build-55 synthetic harassment policy (fixture-only; only read while the
+    // harassment-gateway launch fixture is active).
+    private var harassmentEntriesData: [HarassmentEntryRecord] = [
+        HarassmentEntryRecord(id: "hx_demo_1", number: "+8613800001001", matchKind: "exact",
+                              mode: "block", action: "reject", source: "manual", listId: nil,
+                              enabled: true, createdAt: nil),
+        HarassmentEntryRecord(id: "hx_demo_2", number: "1069", matchKind: "prefix",
+                              mode: "block", action: "reject", source: "manual", listId: nil,
+                              enabled: true, createdAt: nil),
+        HarassmentEntryRecord(id: "hx_demo_3", number: "+8613800001002", matchKind: "exact",
+                              mode: "trust", action: "allow", source: "manual", listId: nil,
+                              enabled: true, createdAt: nil),
+    ]
+    private var harassmentListsData: [HarassmentListRecord] = [
+        HarassmentListRecord(id: "hl_demo_1", name: "旧手机导入名单", defaultAction: "label",
+                             source: "import", entryCount: 6, importedAt: nil),
+    ]
+    private var harassmentHistoryData: [HarassmentEventRecord] = [
+        HarassmentEventRecord(id: "he_demo_1", lineId: "line1", kind: "call", peer: "+8613800001003",
+                              action: "reject", reason: "prefix", refId: nil,
+                              createdAt: Date().unixMilliseconds - 3_600_000),
+        HarassmentEventRecord(id: "he_demo_2", lineId: "line1", kind: "sms", peer: "+8613800001004",
+                              action: "label", reason: "label", refId: nil,
+                              createdAt: Date().unixMilliseconds - 600_000),
+    ]
+
     init() {
         self.line = LineStatus.demoReady()
         seedHistory()
@@ -275,6 +301,65 @@ final class DemoGatewayAPI: GatewayAPI {
         guard let index = calls.firstIndex(where: { $0.id == id }) else { return }
         calls[index] = transform(calls[index])
     }
+
+    // MARK: Build-55 harassment / recording settings (fixture-only synthetic)
+
+    func harassmentSettings() async throws -> HarassmentSettingsRecord {
+        HarassmentSettingsRecord(callBlocking: true, smsBlocking: true,
+                                 contactWhitelist: false, version: 3, updatedAt: nil)
+    }
+
+    func updateHarassmentSettings(callBlocking: Bool, smsBlocking: Bool, contactWhitelist: Bool?, version: Int64?) async throws -> HarassmentSettingsRecord {
+        HarassmentSettingsRecord(callBlocking: callBlocking, smsBlocking: smsBlocking,
+                                 contactWhitelist: contactWhitelist, version: (version ?? 3) + 1, updatedAt: nil)
+    }
+
+    func harassmentEntries() async throws -> [HarassmentEntryRecord] { harassmentEntriesData }
+
+    func addHarassmentEntry(number: String, matchKind: String, mode: String, action: String?, replaceOpposite: Bool) async throws -> HarassmentEntryAddResult {
+        let entry = HarassmentEntryRecord(
+            id: "hx_demo_\(harassmentEntriesData.count + 1)", number: number, matchKind: matchKind,
+            mode: mode, action: action ?? (mode == "trust" ? "allow" : "reject"),
+            source: "manual", listId: nil, enabled: true, createdAt: nil)
+        harassmentEntriesData.insert(entry, at: 0)
+        return HarassmentEntryAddResult(entry: entry, replaced: 0, effective: true, note: nil)
+    }
+
+    func deleteHarassmentEntry(id: String) async throws {
+        harassmentEntriesData.removeAll { $0.id == id }
+    }
+
+    func harassmentLists() async throws -> [HarassmentListRecord] { harassmentListsData }
+
+    func importHarassmentList(name: String, numbers: [String], defaultAction: String) async throws -> HarassmentListRecord {
+        let list = HarassmentListRecord(id: "hl_demo_\(harassmentListsData.count + 1)", name: name,
+                                        defaultAction: defaultAction, source: "import",
+                                        entryCount: numbers.count, importedAt: nil)
+        harassmentListsData.insert(list, at: 0)
+        return list
+    }
+
+    func deleteHarassmentList(id: String) async throws {
+        harassmentListsData.removeAll { $0.id == id }
+    }
+
+    func harassmentHistory() async throws -> [HarassmentEventRecord] { harassmentHistoryData }
+
+    func clearHarassmentHistory() async throws { harassmentHistoryData = [] }
+
+    func testHarassment(kind: String, number: String, body: String) async throws -> HarassmentDecisionRecord {
+        HarassmentDecisionRecord(allow: true, action: "allow", reason: "default_allow",
+                                 matchedBy: nil, pattern: nil)
+    }
+
+    func recordingSettings() async throws -> RecordingSettingsRecord {
+        RecordingSettingsRecord(enabled: true, autoMode: "all", deviceAutoRecord: false,
+                                retentionDays: 30, minimumFreeBytes: 1_000_000_000,
+                                maxBytes: 8_000_000_000, storage: nil)
+    }
+
+    @discardableResult
+    func updateDeviceAutoRecord(_ enabled: Bool) async throws -> Bool { enabled }
 }
 
 // MARK: - Demo test helpers / builders
@@ -323,4 +408,13 @@ extension CallRecord {
             recordingDurationMs: recordingDurationMs
         )
     }
+    /// Screenshot fixture only: the offline demo normally has no recordings;
+    /// the launch-argument-gated visual fixture serves the synthetic list.
+    func listRecordings() async throws -> [RecordingRecord] {
+        if LaunchArguments.isRecordingPreview || LaunchArguments.isRecordingListPreview {
+            return AppModel.syntheticRecordingPreview()
+        }
+        return []
+    }
+
 }

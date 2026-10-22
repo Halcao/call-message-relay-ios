@@ -1,0 +1,33 @@
+# EXAMPLE — Caddy reverse proxy for a self-hosted CallRelay gateway.
+# Replace callrelay.example.com with YOUR domain (DNS must point at this
+# host; Caddy obtains TLS automatically). The daemon binds loopback only,
+# so Caddy (or nginx/your proxy of choice) is the single public listener.
+callrelay.example.com {
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		Cache-Control no-store
+	}
+	# Root opens the console.
+	@root path /
+	redir @root /console/ 302
+	# Unified management service: v2 API, console, event stream and the
+	# self-hosted PWA (web push setup page, service worker, manifest).
+	handle /api/v2/* {
+		reverse_proxy 127.0.0.1:8790
+	}
+	handle /console* {
+		reverse_proxy 127.0.0.1:8790
+	}
+	handle /pwa* {
+		reverse_proxy 127.0.0.1:8790
+	}
+	handle /healthz {
+		reverse_proxy 127.0.0.1:8790
+	}
+	# Anything else is closed so no client can bypass the unified ACL.
+	handle {
+		respond 404
+	}
+}

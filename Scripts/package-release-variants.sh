@@ -14,7 +14,7 @@
 #
 # Environment:
 #   DERIVED_DATA_ROOT    cache root for device builds
-#                        (default ~/Library/Caches/CodexBuild/callrelay/release-variants)
+#                        (default source-volume .codex-build/call-message-relay/<checkout>/xcode/release-variants)
 #
 # The native edition is never allowed to contain the web-push bridge and
 # the PWA edition must contain it; both IPAs are unsigned (CODE_SIGNING_ALLOWED=NO)
@@ -23,7 +23,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DERIVED_DATA_ROOT="${DERIVED_DATA_ROOT:-$HOME/Library/Caches/CodexBuild/callrelay/release-variants}"
+source "$ROOT_DIR/Scripts/build-env.sh"
 JOBS="${JOBS:-6}"
 NATIVE_APP=""
 PWA_APP=""
@@ -51,7 +51,7 @@ build_variant() { # configuration derived-data-suffix
   local config="$1"
   local suffix="$2"
   echo "== Building $config (unsigned, generic/platform=iOS) =="
-  ( cd "$ROOT_DIR" && xcodebuild build \
+  ( cd "$ROOT_DIR" && "$ROOT_DIR/Scripts/xcodebuild.sh" build \
       -project CallRelay.xcodeproj -scheme CallRelay \
       -configuration "$config" -destination 'generic/platform=iOS' \
       -derivedDataPath "$DERIVED_DATA_ROOT/$suffix" \

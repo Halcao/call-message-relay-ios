@@ -106,6 +106,17 @@ final class FakeMediaSocket: WebSocketCallMedia.MediaSocket, @unchecked Sendable
         lock.lock(); defer { lock.unlock() }
         return receiveHandler != nil
     }
+
+    /// Lock-owned snapshot of BINARY (data) sends. Safe from any queue while
+    /// the main thread is deliberately blocked, and immune to the shared
+    /// diagnostics census being drained by the app's periodic merge.
+    var dataSendCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return sends.reduce(0) { count, entry in
+            if case .data = entry.message { return count + 1 }
+            return count
+        }
+    }
 }
 
 @MainActor
@@ -181,6 +192,27 @@ final class WebSocketCallMediaLifecycleTests: XCTestCase {
         media.handleForTest(.string(#"{"type":"pong","t":999}"#))
         XCTAssertEqual(media.pingSamples.count, 1)
 
+        // Arrival-stamp semantics (build 60): the RTT and the sample's
+        // freshness anchor measure from the RECEIVE-context arrival stamp,
+        // never from the main-actor handling time behind a busy UI.
+        // Scenario: the pong arrived 0.2 s after the send, but the control
+        // handler only runs 0.5 s after the send (stalled main thread). A
+        // handler reading its own clock would record ~0.5 s; the pinned
+        // stamp must record ~0.2 s, and the freshness anchor must be the
+        // pinned stamp. This fails on the pre-build-60 code path.
+        let t0 = Date()
+        media.sendPingForTest()
+        let pinnedArrival = t0.addingTimeInterval(0.2)
+        try await Task.sleep(nanoseconds: 500_000_000)
+        media.handleForTest(.string(#"{"type":"pong","t":2}"#), arrivedAt: pinnedArrival)
+        XCTAssertEqual(media.pingSamples.count, 2)
+        XCTAssertGreaterThanOrEqual(media.pingSamples[1], 0.15,
+                                    "RTT must reflect the pinned network arrival")
+        XCTAssertLessThanOrEqual(media.pingSamples[1], 0.3,
+                                 "a 0.5 s main-actor handling delay must not inflate the RTT")
+        XCTAssertEqual(media.lastPingSample?.at, pinnedArrival,
+                       "the freshness anchor is the arrival stamp, not the handling time")
+
         // A binary 160-byte frame really reaches the playback graph.
         let pcmu = Data(PCMUCodec.encode([Int16](repeating: 8000, count: 160)))
         media.handleForTest(.data(pcmu))
@@ -188,6 +220,77 @@ final class WebSocketCallMediaLifecycleTests: XCTestCase {
 
         media.close()
         XCTAssertEqual(states.last, .closed)
+    }
+
+    /// Build-67 (user-confirmed stuck silence): content silence is still
+    /// DELIVERED audio — the relay streams one frame per 20 ms slot, and a
+    /// silent PCM frame must count as real media liveness (and reach the
+    /// playback graph). Missing frames, by contrast, are a dead media path.
+    func testSilentContentFrameStillProvesMediaLiveness() async throws {
+        let socket = FakeMediaSocket()
+        socket.scripted = [.message(.success(.string(#"{"type":"ready"}"#))), .park]
+        let graph = FakeAudioGraph()
+        let media = WebSocketCallMedia(socketFactory: { _, _ in socket }, audioGraph: graph)
+        try await media.connect(request: URLRequest(url: readyURL))
+        media.audioActivatedForTest(AVAudioSession.sharedInstance())
+        // The real-frame proof is delivered to the media OWNER (the
+        // coordinator registers this in production); a bare harness must
+        // register it too, otherwise emitInboundRealFrame has no consumer.
+        var realFrames = 0
+        media.onInboundRealFrame = { realFrames += 1 }
+
+        XCTAssertFalse(media.isInboundRealFrameFresh(within: 5),
+                       "no frame yet: the carrier has not proven media")
+        let silentPCMU = Data(PCMUCodec.encode([Int16](repeating: 0, count: 160)))
+        media.handleForTest(.data(silentPCMU))
+        await waitUntil { graph.pushedFrames == 1 }
+        await waitUntil { media.isInboundRealFrameFresh(within: 5) }
+        XCTAssertEqual(graph.pushedFrames, 1, "silent content must still reach playback")
+        XCTAssertTrue(media.isInboundRealFrameFresh(within: 5),
+                      "a delivered silent frame IS media liveness")
+        media.close()
+    }
+
+    /// Build-67 media-starvation evidence: an Opus payload that fails to
+    /// decode is counted (and logged once) instead of vanishing — a
+    /// sustained decode-failure run must be distinguishable from "no frames
+    /// on the wire" in the next field export.
+    func testOpusDecodeFailureIsCountedAndNotProofOfMedia() async throws {
+        DiagnosticsCensus.shared.reset()
+        let socket = FakeMediaSocket()
+        socket.scripted = [
+            .message(.success(.string(#"{"type":"ready","codec":"opus","fmt":"seq16"}"#))),
+            .park,
+        ]
+        let graph = FakeAudioGraph()
+        let media = WebSocketCallMedia(socketFactory: { _, _ in socket }, audioGraph: graph)
+        try await media.connect(request: URLRequest(url: readyURL))
+        XCTAssertTrue(media.framedForTest)
+        media.audioActivatedForTest(AVAudioSession.sharedInstance())
+        var realFrames = 0
+        media.onInboundRealFrame = { realFrames += 1 }
+
+        // A framed payload that cannot decode: counted, never liveness.
+        media.handleForTest(.data(WSSFrameCodec.frame(seq: 0, payload: [0xAA, 0xBB])))
+        await waitUntil { DiagnosticsCensus.shared.snapshot()["audio.wsOpusDecodeFailed"] == 1 }
+        XCTAssertEqual(DiagnosticsCensus.shared.snapshot()["audio.wsOpusDecodeFailed"], 1,
+                       "a failed decode must be counted, not silently dropped")
+        XCTAssertFalse(media.isInboundRealFrameFresh(within: 5),
+                       "a failed decode is not media liveness")
+        XCTAssertEqual(graph.pushedFrames, 0)
+
+        // A REAL encoded frame (low-level alternating signal avoids DTX)
+        // decodes normally and proves media.
+        let encoder = try OpusCodec.Encoder()
+        let pcm = (0..<160).map { Int16($0 % 2 == 0 ? 300 : -300) }
+        let payload = try encoder.encode(pcm)
+        XCTAssertFalse(payload.isEmpty, "the test signal must encode to a real payload")
+        media.handleForTest(.data(WSSFrameCodec.frame(seq: 1, payload: payload)))
+        await waitUntil { graph.pushedFrames == 1 }
+        XCTAssertTrue(media.isInboundRealFrameFresh(within: 5),
+                      "a decoded frame proves media liveness again")
+        XCTAssertEqual(graph.pushedFrames, 1)
+        media.close()
     }
 
     /// Wire contract (2026-10-06 latency review): the deployed gateway's WSS

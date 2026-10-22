@@ -152,29 +152,56 @@ final class AudioTransportConcurrencyTests: XCTestCase {
 
     // MARK: 3. Exact-once mic frame delivery
 
+    /// Exact-once proof with a DETERMINISTIC harness.
+    ///
+    /// History (build 55/56 full runs): the original version armed the 20 ms
+    /// timer BEFORE connecting and compared the census read afterwards with
+    /// socket sends. Two windows differed AND the census is a shared
+    /// realtime aggregate that `DiagnosticsStore.mergeCensus()` periodically
+    /// `drain()`s (clears) every 5 s, so `audio.micFrames` could be partially
+    /// cleared mid-test while sends stayed complete (reproduced under
+    /// `-test-iterations`: sends ≈50 with emitted 3…41). That is a TEST
+    /// measurement artifact of the shared counter, not evidence of a
+    /// duplicate send.
+    ///
+    /// This version disables the timer, connects first, then drives every
+    /// frame with `tickOnceForTest()` and short-poll-waits (main blocked on
+    /// purpose) on a LOCK-OWNED fake-socket send snapshot for THAT frame
+    /// before the next tick: the per-tick delta proves each emission reaches
+    /// the socket exactly once, and the final total must equal the driven
+    /// tick count with zero extra sends. The drainable global census is not
+    /// used for the assertion.
     func testMicFramesAreSentExactlyOnce() throws {
         let graph = WSAudioGraph()
         let sink = ControllableSink()
         XCTAssertTrue(graph.startHeadless(captureFormat: capture48k,
                                           playbackFormat: playback48k,
-                                          sink: sink, armTimer: true))
+                                          sink: sink, armTimer: false))
         let socket = FakeMediaSocket()
         socket.scripted = [.message(.success(.string(Self.readyMessage()))), .park]
         let media = WebSocketCallMedia(socketFactory: { _, _ in socket }, audioGraph: graph)
         try awaitConnect(media)
-        DiagnosticsCensus.shared.reset()
-        settle(for: 1.0)
-        graph.stop()            // stop emitting first…
-        settle(for: 0.4)        // …then let the drain flush the gate
-        let emitted = DiagnosticsCensus.shared.snapshot()["audio.micFrames"] ?? 0
-        let sends = socket.sends.filter { sentMessage in
-            if case .data = sentMessage.message { return true }
-            return false
-        }.count
+
+        let frameCount = 50
+        for index in 0..<frameCount {
+            graph.tickOnceForTest()
+            let expected = index + 1
+            // Bounded lock-poll with the MAIN THREAD BLOCKED on purpose: the
+            // send drain is a detached task, so progress here additionally
+            // proves the send path never needs the main executor.
+            let deadline = Date().addingTimeInterval(1.5)
+            while socket.dataSendCount < expected && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.002)
+            }
+            XCTAssertEqual(socket.dataSendCount, expected,
+                "tick \(expected) must reach the socket exactly once")
+        }
+        graph.stop()
+        let sends = socket.dataSendCount
         media.close()
-        XCTAssertGreaterThan(emitted, 10)
-        XCTAssertEqual(sends, emitted,
-            "each mic frame must reach the socket exactly once (sent \(sends) of \(emitted))")
+        XCTAssertGreaterThan(frameCount, 10)
+        XCTAssertEqual(sends, frameCount,
+            "every driven mic frame must reach the socket exactly once (sent \(sends) of \(frameCount))")
     }
 
     /// Steady-state uplink discriminator: when the socket send path stalls
@@ -238,9 +265,20 @@ final class AudioTransportConcurrencyTests: XCTestCase {
         DiagnosticsCensus.shared.reset()
         settle(for: 1.0)
         settle(for: 0.4)
-        let emitted = DiagnosticsCensus.shared.snapshot()["audio.micFrames"] ?? 0
+        // Build-63 determinism: the census counts a frame at its capture
+        // tick, but the socket send hops the main actor and can trail the
+        // census snapshot on a loaded runner (the build-62 flake was 69/70
+        // here). Quiesce capture/send before the EXACT-once comparison —
+        // the invariant is unchanged; only the measurement boundary is
+        // synchronized. A genuinely lost frame still fails the assert.
+        var emitted = DiagnosticsCensus.shared.snapshot()["audio.micFrames"] ?? 0
+        var secondSends = dataSends(second) - baseSecond
+        for _ in 0..<60 where secondSends != emitted {
+            settle(for: 0.1)
+            emitted = DiagnosticsCensus.shared.snapshot()["audio.micFrames"] ?? 0
+            secondSends = dataSends(second) - baseSecond
+        }
         let firstSends = dataSends(first) - baseFirst
-        let secondSends = dataSends(second) - baseSecond
         graph.stop()
         media2.close()
         XCTAssertGreaterThan(emitted, 10)

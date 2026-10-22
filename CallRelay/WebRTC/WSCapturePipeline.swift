@@ -65,6 +65,12 @@ final class WSCapturePipeline: @unchecked Sendable {
     /// can prove capture loss instead of inferring it.
     private var lastTapUptime: TimeInterval?
     private(set) var tapGapMax: TimeInterval = 0
+    /// Wall clock of the last ACCEPTED delivery for the build-67 mid-call
+    /// capture-stall verdict. Kept SEPARATE from `lastTapUptime`: the
+    /// mute/unmute boundary resets this clock (while muted the door drops
+    /// every buffer, so an aging last delivery is not starvation), and that
+    /// reset must never alter the tap-gap evidence.
+    private var lastDeliveryUptimeForStall: TimeInterval?
     /// Rolling recent inter-tap gaps (seconds) — diagnostics only (tap
     /// batching is healthy; cadence never drives a verdict).
     private var recentTapGaps: [TimeInterval] = []
@@ -142,6 +148,7 @@ final class WSCapturePipeline: @unchecked Sendable {
         guard accepting else { lock.unlock(); return }
         if tapDeliveryCount == 0 { firstDeliveryUptime = uptime }
         tapDeliveryCount += 1
+        lastDeliveryUptimeForStall = uptime
         if let last = lastTapUptime {
             let gap = uptime - last
             if gap > tapGapMax { tapGapMax = gap }
@@ -291,6 +298,25 @@ final class WSCapturePipeline: @unchecked Sendable {
         return Int(((firstDeliveryUptime - createdAt) * 1000).rounded())
     }
 
+    /// Seconds since the most recent ACCEPTED tap delivery; nil before any
+    /// delivery. The build-67 mid-call capture-stall verdict keys on this:
+    /// a tap that PROVED capture and then stopped delivering is local
+    /// starvation (the far end hears silence forever), while real content
+    /// silence keeps delivering silent samples and never ages this clock.
+    func lastDeliverySilenceSeconds(now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> TimeInterval? {
+        lock.lock(); defer { lock.unlock() }
+        guard let last = lastDeliveryUptimeForStall else { return nil }
+        return max(0, now - last)
+    }
+
+    /// Clears ONLY the stall clock (mute/unmute boundary): a gap spanning a
+    /// mute is a deliberate boundary, not capture starvation.
+    func resetDeliveryStallClock() {
+        lock.lock()
+        lastDeliveryUptimeForStall = nil
+        lock.unlock()
+    }
+
     /// Sample rate the converter was built for (immutable per pipeline).
     var sourceSampleRate: Double { sourceFormat.sampleRate }
 
@@ -307,20 +333,26 @@ final class WSCapturePipeline: @unchecked Sendable {
     }
 
     /// Rolling-window capture-conservation snapshot: (delivered samples,
-    /// wall seconds across the window's first→last delivery, ratio).
+    /// wall span across the window's first→last delivery, ratio).
     /// nil while the window holds fewer than two deliveries. Healthy batch
     /// capture of ANY cadence holds ratio ≈ 1; a starved render cycle (the
     /// periodic 200-on/200-off uplink class) holds it persistently < 1.
     /// The window ages out and resets at mute/flush boundaries, so a healthy
     /// opening minute can never mask later starvation (2026-10-05 review).
+    /// LIMITATION (build-67, kept explicit): the span ENDS at the last
+    /// delivery, so a tap that dies after a healthy start FREEZES this ratio
+    /// at its last value — it must never be read as proof that capture kept
+    /// running. The honest mid-call stall evidence is the delivery-stall
+    /// clock (`lastDeliverySilenceSeconds` / the watchdog verdict and its
+    /// stop-log line), not this ratio.
     var conservationSnapshot: (delivered: Int, elapsed: TimeInterval, ratio: Double)? {
         lock.lock(); defer { lock.unlock() }
         guard let first = windowDeliveries.first?.uptime,
               let last = windowDeliveries.last?.uptime, last > first else { return nil }
-        let elapsed = last - first
-        let expected = elapsed * sourceFormat.sampleRate
+        let span = last - first
+        let expected = span * sourceFormat.sampleRate
         guard expected > 0 else { return nil }
-        return (windowSamples, elapsed, Double(windowSamples) / expected)
+        return (windowSamples, span, Double(windowSamples) / expected)
     }
 
     /// Median of the recent inter-tap gaps (seconds), or nil before two

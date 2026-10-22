@@ -5,6 +5,8 @@ import SwiftUI
 /// call button. Tapping a row opens detail actions (call / SMS).
 struct RecentsView: View {
     @EnvironmentObject private var model: AppModel
+    @State private var showRecordings = false
+    @State private var recordingsFilter: String?
 
     var body: some View {
         NavigationStack {
@@ -34,14 +36,38 @@ struct RecentsView: View {
             .navigationTitle("通话")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("编辑") { }
-                        .disabled(true)
-                        .foregroundStyle(Color(UIColor.tertiaryLabel))
-                }
+                // No dead "Edit" control: recents rows already expose every
+                // action (tap = call/SMS, trailing = call back).
                 ToolbarItem(placement: .principal) {
                     Text("通话").font(.headline)
                 }
+                ToolbarItem(placement: .topBarTrailing) {
+                    // Compact native entry with an explicit visible 录音 text
+                    // (not an icon-only waveform): one tap opens the library.
+                    Button {
+                        recordingsFilter = nil
+                        showRecordings = true
+                    } label: {
+                        Text(String(localized: "录音"))
+                            .font(.body.weight(.medium))
+                    }
+                    .accessibilityLabel(String(localized: "通话录音"))
+                    .accessibilityIdentifier("recentsRecordings")
+                }
+            }
+            .sheet(isPresented: $showRecordings) {
+                NavigationStack {
+                    RecordingsView(filterCallId: recordingsFilter)
+                        .environmentObject(model)
+                }
+            }
+            .alert("操作未完成", isPresented: Binding(
+                get: { model.harassment.actionNotice != nil },
+                set: { if !$0 { model.harassment.clearActionNotice() } }
+            )) {
+                Button("知道了", role: .cancel) { model.harassment.clearActionNotice() }
+            } message: {
+                Text(model.harassment.actionNotice ?? "")
             }
         }
     }
@@ -53,6 +79,10 @@ struct RecentsView: View {
                     ForEach(section.calls) { call in
                         RecentRow(call: call,
                                   displayName: call.peer.flatMap { model.contacts.name(forPeer: $0) },
+                                  hasRecording: model.hasRecording(callId: call.id),
+                                  isBlocked: call.peer.map { model.isHarassmentBlocked($0) } ?? false,
+                                  onBlock: { if let peer = call.peer { Task { _ = await model.blockHarassmentNumber(peer, channel: "call") } } },
+                                  onUnblock: { if let peer = call.peer { Task { await model.unblockHarassmentNumber(peer) } } },
                                   onCall: {
                                       if let peer = call.peer {
                                           // Prefer the line the original call used, when it is
@@ -60,7 +90,11 @@ struct RecentsView: View {
                                           model.requestDial(peer, preferredLineId: call.lineID)
                                       }
                                   },
-                                  onMessage: { if let peer = call.peer { model.composeSMS(to: peer) } })
+                                  onMessage: { if let peer = call.peer { model.composeSMS(to: peer) } },
+                                  onRecordings: {
+                                      recordingsFilter = call.id
+                                      showRecordings = true
+                                  })
                     }
                 } header: {
                     Text(section.day)
@@ -69,7 +103,11 @@ struct RecentsView: View {
         }
         .listStyle(.plain)
         .accessibilityIdentifier("recentsList")
-        .refreshable { _ = await model.refreshRecentsPublic() }
+        .refreshable {
+            _ = await model.refreshRecentsPublic()
+            await model.refreshRecordings()
+        }
+        .task { await model.refreshRecordings() }
     }
 
     private struct DaySection {
@@ -92,8 +130,13 @@ struct RecentsView: View {
 private struct RecentRow: View {
     let call: CallRecord
     let displayName: String?
+    let hasRecording: Bool
+    let isBlocked: Bool
+    let onBlock: () -> Void
+    let onUnblock: () -> Void
     let onCall: () -> Void
     let onMessage: () -> Void
+    let onRecordings: () -> Void
     @State private var showActions = false
 
     var body: some View {
@@ -115,6 +158,17 @@ private struct RecentRow: View {
                 }
             }
             Spacer()
+            if hasRecording {
+                Button(action: onRecordings) {
+                    Image(systemName: "waveform.circle.fill")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 36, height: 40)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(String(localized: "查看本次通话录音"))
+                .accessibilityIdentifier("recentRecording-\(call.id)")
+            }
             Text(time)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -133,6 +187,16 @@ private struct RecentRow: View {
         .confirmationDialog("选择操作", isPresented: $showActions, titleVisibility: .visible) {
             Button("拨打 \(displayName ?? call.peer ?? "")", action: onCall)
             Button("发短信", action: onMessage)
+            if hasRecording {
+                Button(String(localized: "通话录音"), action: onRecordings)
+            }
+            if let peer = call.peer, !peer.isEmpty {
+                if isBlocked {
+                    Button(String(localized: "解除拦截此号码"), action: onUnblock)
+                } else {
+                    Button(String(localized: "拦截此号码"), action: onBlock)
+                }
+            }
             Button("取消", role: .cancel) {}
         }
         .accessibilityElement(children: .combine)

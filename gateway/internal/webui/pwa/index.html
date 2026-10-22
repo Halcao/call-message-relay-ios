@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#0b1220">
+<title>CallRelay</title>
+<link rel="manifest" href="/pwa/manifest.webmanifest">
+<link rel="icon" href="/pwa/icon-192.png">
+<link rel="apple-touch-icon" href="/pwa/icon-192.png">
+<link rel="stylesheet" href="/pwa/styles.css">
+</head>
+<body>
+<main class="card">
+  <header class="brand">
+    <img src="/pwa/icon-192.png" alt="" class="logo">
+    <h1>CallRelay</h1>
+  </header>
+
+  <!-- Installed PWA has no browser chrome: always offer a compact, visible
+       way back to the calling/SMS client. Fixture mode keeps its marker. -->
+  <p class="client-back"><a id="client-link" href="/pwa/client.html" data-i18n="clientBack">‹ 返回通话 / 短信客户端</a></p>
+
+  <section id="unsupported" class="hidden">
+    <p class="warn" data-i18n="unsupported">此浏览器不支持通知。请在 iPhone/iPad 上用 Safari 添加到主屏幕后再试。</p>
+  </section>
+
+  <section id="install-help" class="hidden">
+    <p class="muted" data-i18n="installHelp">请先用 Safari 将本页“添加到主屏幕”，再从主屏幕打开绑定。</p>
+  </section>
+
+  <section id="bind-view" class="hidden">
+    <h2 data-i18n="bindTitle">开启来电通知</h2>
+    <p class="muted" data-i18n="bindHint">在 App 的“设置 → 网页通知”中生成绑定码，输入到下方。</p>
+    <form id="bind-form" class="row">
+      <input id="bind-code" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="12" placeholder="绑定码" data-i18n-ph="bindPlaceholder">
+      <button type="submit" class="primary" data-i18n="bindButton">绑定</button>
+    </form>
+    <p id="bind-error" class="error hidden"></p>
+  </section>
+
+  <section id="status-view" class="hidden">
+    <dl class="kv">
+      <dt data-i18n="deviceLabel">已绑定设备</dt><dd id="st-device">—</dd>
+      <dt data-i18n="browserLabel">本浏览器</dt><dd id="st-browser">—</dd>
+      <dt data-i18n="modeLabel">通知方式</dt><dd id="st-mode">—</dd>
+      <dt data-i18n="subsLabel">浏览器订阅</dt><dd id="st-subs">—</dd>
+    </dl>
+
+    <div class="row">
+      <button id="enable-push" class="primary" data-i18n="enableButton">允许并开启通知</button>
+      <button id="test-push" data-i18n="testButton">发送测试通知</button>
+    </div>
+    <p id="action-error" class="error hidden"></p>
+    <p id="action-ok" class="ok hidden"></p>
+
+    <div class="row" role="radiogroup" id="mode-group">
+      <label><input type="radio" name="mode" value="native"><span data-i18n="modeNative">仅系统推送（App）</span></label>
+      <label><input type="radio" name="mode" value="both"><span data-i18n="modeBoth">系统推送 + 网页推送</span></label>
+      <label><input type="radio" name="mode" value="web"><span data-i18n="modeWeb">仅网页推送</span></label>
+    </div>
+
+    <ul id="sub-list" class="sublist"></ul>
+
+    <section id="denoise-section" class="denoise">
+      <h2 data-i18n="denoiseTitle">通话降噪</h2>
+      <label class="row">
+        <input type="checkbox" id="denoise-uplink">
+        <span data-i18n="denoiseUplink">我的声音降噪</span>
+      </label>
+      <label class="row">
+        <input type="checkbox" id="denoise-downlink">
+        <span data-i18n="denoiseDownlink">对方声音降噪</span>
+      </label>
+      <p class="muted" id="denoise-status" role="status" aria-live="polite"></p>
+    </section>
+
+    <details>
+      <summary data-i18n="unbindTitle">解除绑定</summary>
+      <button id="unbind" class="danger" data-i18n="unbindButton">解除本浏览器绑定</button>
+    </details>
+  </section>
+</main>
+<script src="/pwa/fixture.js"></script>
+<script src="/pwa/denoise.js"></script>
+<script>
+  // Keep the fixture marker on the ride back to the client in preview.
+  if (/[?&]fixture=1/.test(location.search)) {
+    document.getElementById('client-link').href = '/pwa/client.html?fixture=1';
+  }
+</script>
+<script src="/pwa/app.js"></script>
+</body>
+</html>

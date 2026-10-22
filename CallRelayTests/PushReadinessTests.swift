@@ -66,7 +66,9 @@ final class PushReadinessTests: XCTestCase {
     func testUnreadableGatewayHealthNeverClaimsMoreThanRegistration() {
         let readiness = evaluate(gateway: nil)
         XCTAssertEqual(readiness, .registered(environment: .sandbox, gatewayConfigured: nil, lastPushAt: nil))
-        XCTAssertTrue(readiness.detail?.contains("验证") ?? false)
+        // Plain-language honesty: registration without an observed push says
+        // exactly that (no delivery claim).
+        XCTAssertTrue(readiness.detail?.contains("尚未收到推送") ?? false)
     }
 
     func testRelativeTextIsHonestAtBoundaries() {

@@ -3,6 +3,7 @@ import UIKit
 
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var showUnpairConfirm = false
     @State private var detailLine: AuthorizedLine?
 
@@ -13,15 +14,16 @@ struct SettingsView: View {
                     demoSection
                 }
 
-                connectionSection
+                connectionSections
                 unifiedLineSection
 
                 Section("短信与来电") {
                     NavigationLink {
                         SpamRulesView(store: model.spamFilter)
                     } label: {
-                        Label("垃圾拦截规则", systemImage: "shield.lefthalf.filled")
+                        Label("骚扰拦截", systemImage: "shield.lefthalf.filled")
                     }
+                    .accessibilityIdentifier("harassmentSettingsLink")
                     Toggle("通讯录号码视为可信", isOn: Binding(
                         get: { model.contactWhitelistEnabled },
                         set: { model.contactWhitelistEnabled = $0 }
@@ -39,6 +41,8 @@ struct SettingsView: View {
                     }
 #endif
                 }
+
+                recordingSection
 
                 Section("iCloud 同步（可选）") {
                     NavigationLink {
@@ -95,6 +99,81 @@ struct SettingsView: View {
         }
     }
 
+    /// 通话录音 settings: the device's auto preference (default OFF), the
+    /// gateway operator auto mode it combines with, retention, and the
+    /// recordings library. Manual recording is always available in a call.
+    @ViewBuilder
+    private var recordingSection: some View {
+        Section("通话录音") {
+            if model.isDemo {
+                Text("演示模式不录音。")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else if model.recordingConfig.supported == false {
+                Text("当前网关版本不支持录音设置。")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                // Build 68 (plan audit): the switch must never LOOK effective
+                // while the gateway policy makes it a no-op. It is disabled
+                // exactly when the reason is known (gateway auto-recording off
+                // or storage unavailable) and shows the last gateway-confirmed
+                // value, never a fabricated one.
+                Toggle("自动录音（本机）", isOn: Binding(
+                    get: { model.recordingConfig.deviceAutoRecord },
+                    set: { value in Task { _ = await model.setDeviceAutoRecord(value) } }
+                ))
+                // A user must ALWAYS be able to opt out: the switch is
+                // disabled only while a write is pending, or while the policy
+                // blocks ENABLING it and it is currently off (see the store's
+                // `autoRecordToggleDisabled`, which the focused test pins).
+                .disabled(model.recordingConfig.autoRecordToggleDisabled)
+                .accessibilityIdentifier("autoRecordToggle")
+                // Build-67 honesty: a switch that bounced back must say WHY
+                // (the gateway rejected the save) instead of silently
+                // flipping off. The displayed value is always the last
+                // gateway-confirmed one after a rejection.
+                if let writeError = model.recordingConfig.lastError {
+                    Text(writeError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .accessibilityIdentifier("autoRecordError")
+                }
+                // Concise, source-backed reason (never a vague "不生效").
+                if let reason = model.recordingConfig.autoRecordReason {
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .accessibilityIdentifier("autoRecordReason")
+                }
+                // Retention is only shown once the gateway CONFIRMED it; a
+                // fabricated "手动删除" before load would be a guess.
+                if model.recordingConfig.loaded {
+                    detailRow(
+                        title: "保留",
+                        value: model.recordingConfig.retentionDays > 0
+                            ? "\(model.recordingConfig.retentionDays) 天"
+                            : "手动删除")
+                }
+                detailRow(title: "网关自动录音", value: model.recordingConfig.autoModeLabel)
+                // The gateway-level policy lives in the administrator console:
+                // offer the real route (the console login), not a dead row.
+                if model.supportsNativeManagement {
+                    NavigationLink {
+                        ManagementRecordingView(center: model.adminCenter)
+                    } label: {
+                        Label("网关录音策略", systemImage: "slider.horizontal.3")
+                    }
+                    .accessibilityIdentifier("gatewayRecordingPolicyEntry")
+                }
+            }
+            NavigationLink {
+                RecordingsView()
+            } label: {
+                Label("录音库", systemImage: "waveform")
+            }
+        }
+        .task { await model.refreshRecordingConfig() }
+    }
+
     private var demoSection: some View {
         Section("演示模式") {
             Label("完全离线，不联网、不发短信、不触发真实系统来电", systemImage: "wand.and.stars")
@@ -119,6 +198,28 @@ struct SettingsView: View {
     private var gatewaySection: some View {
         Section {
             detailRow(title: "名称", value: model.gatewayName.isEmpty ? "—" : model.gatewayName)
+            if !model.isDemo {
+                if model.supportsNativeManagement {
+                    NavigationLink {
+                        ManagementView()
+                    } label: {
+                        Label("网关管理", systemImage: "person.badge.key")
+                    }
+                    .accessibilityIdentifier("managementEntry")
+                } else if model.nativeManagementUnsupported {
+                    // Capability-gated, never a dead link: an old gateway has
+                    // no /api/v2/admin surface at all, so the row states the
+                    // real reason and what to do instead.
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label("网关管理", systemImage: "person.badge.key")
+                            .foregroundStyle(.secondary)
+                        Text("当前网关版本不支持在手机管理，请在网页控制台操作，或升级网关后再试。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityIdentifier("managementUnsupported")
+                }
+            }
             // Short, source-backed state instead of a constant instruction:
             // entitlement → device token → gateway registration → gateway
             // APNs configuration/environment → an actually received push.
@@ -140,6 +241,9 @@ struct SettingsView: View {
         } header: {
             Text("网关")
         }
+        // Unauthenticated capability probe: it decides whether the admin
+        // entry can work at all. Never blocks this screen.
+        .task { model.refreshNativeManagementAvailability() }
     }
 
     /// Ordinary service alerts: arrears and designated-backup availability,
@@ -159,7 +263,10 @@ struct SettingsView: View {
             }
             detailRow(title: "备用网络", value: backupNetworkText)
             if let incident = model.gatewayNotificationStatus?.incidents?.first {
-                Text("\(incident.lineId) · \(incident.cause == "arrears" ? "欠费提醒处理中" : "网络异常处理中")")
+                let incidentLine = model.gatewayNotificationStatus?.lineName
+                    ?? model.gatewayNotificationStatus?.lineId
+                    ?? incident.lineId
+                Text("\(incidentLine) · \(incident.cause == "arrears" ? "欠费提醒处理中" : "网络异常处理中")")
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
@@ -182,9 +289,10 @@ struct SettingsView: View {
             }
         } header: {
             Text("服务提醒")
-        } footer: {
-            Text("提醒通过普通通知发送，不会使用来电通道；不同配对密钥之间的通讯录互不可见。")
         }
+        // No explanatory footer: the notification channel and the pairing-key
+        // contact isolation are internal mechanics. The isolation itself is
+        // unchanged (and stays visible in diagnostics if needed).
     }
 
     private var backupNetworkText: String {
@@ -278,64 +386,93 @@ struct SettingsView: View {
         }
     }
 
+    @ViewBuilder
     private func lineRow(_ line: AuthorizedLine) -> some View {
         // Three independent controls (default selection vs. detail vs. number
         // edit); they must not be nested so each tap resolves unambiguously.
-        HStack(spacing: 8) {
-            Button {
-                Task { await model.selectDefaultLine(line.id) }
-            } label: {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(line.friendlyName)
-                    if line.actualNumber != nil {
-                        Text(line.name).font(.caption2).foregroundStyle(.secondary)
-                    } else if let unavailable = line.numberUnavailableText {
-                        Text(unavailable).font(.caption2).foregroundStyle(.secondary)
-                    }
-                    if !line.canDialNow {
-                        Text(line.unavailableReason).font(.caption2).foregroundStyle(.orange)
-                    } else if let operatorName = line.resolvedOperator {
-                        Text(operatorName).font(.caption2).foregroundStyle(.secondary)
-                    }
-                    HStack(spacing: 6) {
-                        Text(line.online ? "在线" : "离线")
-                        if line.ownNumberSource == "manual" { Text("手动号码") }
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        if dynamicTypeSize.isAccessibilitySize {
+            // Accessibility sizes: the line text gets the full width and the
+            // actions move to their own row below, instead of squeezing a
+            // long number into a narrow column (never shrink the text).
+            VStack(alignment: .leading, spacing: 10) {
+                lineSelectButton(line)
+                HStack(spacing: 20) {
+                    lineAccessoryButtons(line)
+                    Spacer()
+                    lineDefaultMark(line)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
+                .frame(minHeight: 44)
             }
-            .buttonStyle(.plain)
-
-            Button {
-                detailLine = line
-            } label: {
-                Image(systemName: "info.circle")
-                    .font(.body)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("查看\(line.friendlyName)详情")
-
-            if line.canManageNumber {
-                Button {
-                    model.beginEditingLineNumber(line)
-                } label: {
-                    Image(systemName: "square.and.pencil")
-                        .font(.body)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("编辑\(line.friendlyName)号码")
-            }
-            if model.defaultLineId == line.id {
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundStyle(.tint)
+        } else {
+            HStack(spacing: 8) {
+                lineSelectButton(line)
+                lineAccessoryButtons(line)
+                lineDefaultMark(line)
             }
         }
     }
 
-    private var connectionSection: some View {
+    private func lineSelectButton(_ line: AuthorizedLine) -> some View {
+        Button {
+            Task { await model.selectDefaultLine(line.id) }
+        } label: {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(line.friendlyName)
+                if line.actualNumber != nil {
+                    Text(line.name).font(.caption2).foregroundStyle(.secondary)
+                } else if let unavailable = line.numberUnavailableText {
+                    Text(unavailable).font(.caption2).foregroundStyle(.secondary)
+                }
+                if !line.canDialNow {
+                    Text(line.unavailableReason).font(.caption2).foregroundStyle(.orange)
+                } else if let operatorName = line.resolvedOperator {
+                    Text(operatorName).font(.caption2).foregroundStyle(.secondary)
+                }
+                // Provenance (SIM vs manual) belongs to the line detail
+                // screen; the row keeps only the live state.
+                Text(line.online ? "在线" : "离线")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private func lineAccessoryButtons(_ line: AuthorizedLine) -> some View {
+        Button {
+            detailLine = line
+        } label: {
+            Image(systemName: "info.circle")
+                .font(.body)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("查看\(line.friendlyName)详情")
+
+        if line.canManageNumber {
+            Button {
+                model.beginEditingLineNumber(line)
+            } label: {
+                Image(systemName: "square.and.pencil")
+                    .font(.body)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("编辑\(line.friendlyName)号码")
+        }
+    }
+
+    @ViewBuilder
+    private func lineDefaultMark(_ line: AuthorizedLine) -> some View {
+        if model.defaultLineId == line.id {
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.tint)
+        }
+    }
+
+    @ViewBuilder
+    private var connectionSections: some View {
         Section("连接状态") {
             HStack {
                 Image(systemName: icon)
@@ -348,6 +485,9 @@ struct SettingsView: View {
             if (!model.isDemo && model.isPaired) || LaunchArguments.isRouteSettingsPreview {
                 RouteModeSettingRow()
             }
+        }
+        if (!model.isDemo && model.isPaired) || LaunchArguments.isRouteSettingsPreview {
+            DenoiseSettingRow()
         }
     }
 

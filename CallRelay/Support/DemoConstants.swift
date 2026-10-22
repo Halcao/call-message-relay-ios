@@ -48,6 +48,30 @@ enum LaunchArguments {
     static let routeSettingsPreview = "-callrelayRouteSettingsPreview"
     /// Screenshot-only: renders 0..4 signal-bar states in one strip.
     static let signalBarsPreview = "-callrelaySignalBarsPreview"
+    /// Screenshot-only: deterministic demo active call already recording plus
+    /// synthetic 张三/李四 recordings for the in-call indicator and the
+    /// RecordingsView list. Offline, no credentials, no real audio.
+    static let recordingPreview = "-callrelayRecordingPreview"
+    /// Screenshot-only: the recordings LIST fixture without an active call
+    /// (the in-call cover would otherwise hide the tab bar).
+    static let recordingListPreview = "-callrelayRecordingListPreview"
+    /// Screenshot-only: deterministic demo active conference with its own
+    /// manual recording state (host leg + synthetic 张三/李四 members) so the
+    /// in-call conference recording surfaces render offline.
+    static let conferenceRecordingPreview = "-callrelayConferenceRecordingPreview"
+    /// Screenshot-only: a synthetic harassment-CAPABLE gateway so the
+    /// supported branch (gateway list/history/import) renders offline.
+    static let harassmentGatewayPreview = "-callrelayHarassmentGatewayPreview"
+    /// Screenshot-only: the native gateway-administrator console rendered from
+    /// a purely synthetic signed-in session (lines/keys/devices/calls/
+    /// voicemails/recording/settings/diagnostics). Never contacts a gateway,
+    /// never logs in, no real credentials.
+    static let managementPreview = "-callrelayManagementPreview"
+    /// DEBUG-only: the same paired fixture WITHOUT a seeded session, so the
+    /// administrator login renders with a real (synthetic) gateway origin —
+    /// enabled fields and the session-expiry recovery state — never a dead
+    /// form. No password, no network.
+    static let managementLoginPreview = "-callrelayManagementLoginPreview"
 
     static var isRoutePreview: Bool {
         ProcessInfo.processInfo.arguments.contains(routePreview)
@@ -57,6 +81,35 @@ enum LaunchArguments {
     }
     static var isSignalBarsPreview: Bool {
         ProcessInfo.processInfo.arguments.contains(signalBarsPreview)
+    }
+    static var isRecordingPreview: Bool {
+        ProcessInfo.processInfo.arguments.contains(recordingPreview)
+    }
+    static var isRecordingListPreview: Bool {
+        ProcessInfo.processInfo.arguments.contains(recordingListPreview)
+    }
+    static var isConferenceRecordingPreview: Bool {
+        ProcessInfo.processInfo.arguments.contains(conferenceRecordingPreview)
+    }
+    static var isHarassmentGatewayPreview: Bool {
+        ProcessInfo.processInfo.arguments.contains(harassmentGatewayPreview)
+    }
+    static var isManagementLoginPreview: Bool {
+        #if DEBUG
+        ProcessInfo.processInfo.arguments.contains(managementLoginPreview)
+        #else
+        false
+        #endif
+    }
+
+    static var isManagementPreview: Bool {
+        #if DEBUG
+        ProcessInfo.processInfo.arguments.contains(managementPreview)
+        #else
+        // Release builds have no screenshot fixture: the flag is inert and
+        // the seeding code is not compiled at all.
+        false
+        #endif
     }
 
     static var isUITestReset: Bool {

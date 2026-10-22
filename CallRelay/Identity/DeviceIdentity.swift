@@ -11,7 +11,7 @@ import Security
 /// so this is a Keychain-backed software key; PRODUCT.md makes no Secure Enclave
 /// claim.
 public final class DeviceIdentity {
-    let privateKey: Curve25519.Signing.PrivateKey
+    let privateKey: Curve25519.Signing.PrivateKey // gitleaks:allow -- Type declaration; key bytes are generated at runtime.
 
     init(privateKey: Curve25519.Signing.PrivateKey) {
         self.privateKey = privateKey

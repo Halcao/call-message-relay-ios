@@ -26,3 +26,15 @@ xcuserdata/
 # Vendored WebRTC binary is fetched+checksum-verified by Scripts/bootstrap.sh
 Vendor/WebRTC/WebRTC.xcframework/
 Vendor/WebRTC/*.zip
+
+# Portable fallback when not building from an external volume
+.build-cache/
+
+# Local execution, evidence and numbered delivery directories are private.
+.runtime/
+.runtime-tmp/
+.codex-build/
+build[0-9]*/
+build-evidence/
+__pycache__/
+*.py[cod]

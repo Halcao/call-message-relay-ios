@@ -22,6 +22,8 @@ protocol CallDriver: AnyObject {
     var onQuality: ((MediaQuality) -> Void)? { get set }
     /// Live routing snapshot for the compact in-call route menu.
     var onRouteState: ((CallRouteState) -> Void)? { get set }
+    /// Build-50 hot-standby snapshot (nil = no standby this call).
+    var onHotStandbyState: ((HotStandbyController.HotStandbyState?) -> Void)? { get set }
     /// A failed route selection: message + whether to offer "switch to auto".
     var onRouteNotice: ((String, Bool) -> Void)? { get set }
     /// Honest, minimal copy while audio ownership is unavailable (another
@@ -78,8 +80,13 @@ protocol CallDriver: AnyObject {
     func holdConferenceLeg(callId: String, held: Bool)
     func playConferenceDTMF(_ digit: String, callId: String?)
     func splitConference(callId: String)
+    /// Manual start/stop of the hosted conference's recording segment.
+    func toggleConferenceRecording()
     /// Changes the Auto/Direct/Relay mode for the active call.
     func selectRouteMode(_ mode: MediaRouteMode)
+    /// Build-48 live directional denoise toggle for the active call; nil
+    /// leaves that direction unchanged.
+    func setDenoiseLive(uplink: Bool?, downlink: Bool?)
     /// The bound gateway's persisted default route mode.
     var routeModeDefault: MediaRouteMode { get }
 }
@@ -100,6 +107,10 @@ extension CallDriver {
         get { nil }
         set { /* demo: routing unavailable */ }
     }
+    var onHotStandbyState: ((HotStandbyController.HotStandbyState?) -> Void)? {
+        get { nil }
+        set { /* demo: no hot standby */ }
+    }
     var onRouteNotice: ((String, Bool) -> Void)? {
         get { nil }
         set { /* demo: routing unavailable */ }
@@ -110,6 +121,7 @@ extension CallDriver {
     }
     /// Changes the Auto/Direct/Relay mode for the active call.
     func selectRouteMode(_ mode: MediaRouteMode) {}
+    func setDenoiseLive(uplink: Bool?, downlink: Bool?) {}
     /// The currently selected route mode for the bound gateway.
     var routeModeDefault: MediaRouteMode { .auto }
     func setDefaultLineId(_ lineId: String?) {}
@@ -120,4 +132,5 @@ extension CallDriver {
     func holdConferenceLeg(callId: String, held: Bool) {}
     func playConferenceDTMF(_ digit: String, callId: String?) {}
     func splitConference(callId: String) {}
+    func toggleConferenceRecording() {}
 }

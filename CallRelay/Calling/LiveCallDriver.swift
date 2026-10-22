@@ -15,7 +15,11 @@ final class LiveCallDriver: NSObject, CallDriver {
     var onCallKitIssue: ((String?) -> Void)?
     /// Concise user-facing notice when an in-app answer failed.
     var onAnswerFailed: ((String) -> Void)?
+    /// Short, truthful recording feedback (merge saved a prior segment,
+    /// conference start/stop failed). Never a fabricated success.
+    var onRecordingNotice: ((String) -> Void)?
     /// Live Auto/Direct/Relay routing snapshot (compact in-call menu).
+    var onHotStandbyState: ((HotStandbyController.HotStandbyState?) -> Void)?
     var onRouteState: ((CallRouteState) -> Void)?
     /// A failed forced/auto route selection, plus an "offer auto" flag.
     var onRouteNotice: ((String, Bool) -> Void)?
@@ -102,6 +106,7 @@ final class LiveCallDriver: NSObject, CallDriver {
         coordinator.delegate = self
         coordinator.routePreflight = routePreflight
         coordinator.onQuality = { [weak self] quality in self?.onQuality?(quality) }
+        coordinator.onHotStandbyState = { [weak self] state in self?.onHotStandbyState?(state) }
         coordinator.onRouteState = { [weak self] state in self?.onRouteState?(state) }
         coordinator.onRouteNotice = { [weak self] message, offerAuto in
             self?.onRouteNotice?(message, offerAuto)
@@ -114,6 +119,25 @@ final class LiveCallDriver: NSObject, CallDriver {
         callKit.director = self
         CallGroupStore.shared.driver = self
         publishGroup()
+    }
+
+    /// Build-61 route-selection glue: the coordinator's multi-path decisions
+    /// publish to the AppModel (当前路径 stats + diagnostics export), and
+    /// the QUIC advertisement drives the 直连方式 chooser's visibility.
+    func bindRouteSelectionGlue(
+        publish: @escaping @MainActor (RouteSelectionDecision,
+                                       [RouteCandidateKind: RouteCandidateSample], Date) -> Void,
+        availability: @escaping @MainActor (ICEConfiguration) -> Void
+    ) {
+        coordinator.onRouteSelection = publish
+        coordinator.onDirectTransportAvailability = availability
+    }
+
+    /// Build-62 trust glue: the pairing binding's gateway id + fingerprint
+    /// (captured at enrollment) become the QUIC pin-verification anchor in
+    /// the call plane. Without this the QUIC attempt stays closed.
+    func bindGatewayTrust(gatewayId: String, fingerprint: String) {
+        coordinator.quicTrustedGatewayIdentity = (gatewayId, fingerprint)
     }
 
     func dial(peer: String) {
@@ -575,6 +599,10 @@ final class LiveCallDriver: NSObject, CallDriver {
         Task { @MainActor in await coordinator.selectRouteMode(mode) }
     }
 
+    func setDenoiseLive(uplink: Bool?, downlink: Bool?) {
+        Task { @MainActor in coordinator.setDenoiseLive(uplink: uplink, downlink: downlink) }
+    }
+
     var routeModeDefault: MediaRouteMode {
         MediaRoutePreferenceStore.shared.mode(for: routeGatewayID)
     }
@@ -590,6 +618,50 @@ final class LiveCallDriver: NSObject, CallDriver {
         coordinator.playConferenceDTMF(digit, callId: callId)
     }
     func splitConference(callId: String) { coordinator.splitConference(callId: callId) }
+
+    /// Manual conference recording toggle, host device only. The pending flag
+    /// tracks the awaited start/stop response so a rapid second tap cannot
+    /// emit a duplicate request; the indicator state always comes back from
+    /// the server response/events, never from a local guess.
+    func toggleConferenceRecording() {
+        guard let conference = coordinator.conferenceRecord,
+              !CallGroupStore.shared.conferenceRecordingPending else { return }
+        let starting = !conference.recordingInProgress
+        CallGroupStore.shared.setConferenceRecordingPending(true)
+        Task { [weak self] in
+            guard let self else {
+                CallGroupStore.shared.setConferenceRecordingPending(false)
+                return
+            }
+            defer { CallGroupStore.shared.setConferenceRecordingPending(false) }
+            do {
+                try await self.coordinator.setConferenceRecording(starting)
+                self.syncConferenceRecordingState()
+            } catch is CancellationError {
+                return
+            } catch {
+                self.onRecordingNotice?((error as? APIError)?.friendlyMessage
+                    ?? (starting ? String(localized: "无法开始会议录音。") : String(localized: "无法停止会议录音。")))
+            }
+        }
+    }
+
+    /// Forwards one key-scoped conference recording event to the coordinator.
+    func applyConferenceRecording(_ rec: RecordingRecord) {
+        coordinator.applyConferenceRecording(rec)
+        syncConferenceRecordingState()
+    }
+
+    /// Mirrors the conference's server-confirmed recording state onto the
+    /// focused call so the shared indicator/control stay truthful.
+    private func syncConferenceRecordingState() {
+        guard let conference = coordinator.conferenceRecord, var state = current else { return }
+        state.recordingId = conference.recordingId
+        state.recordingState = conference.recordingState ?? ""
+        state.recordingDurationMs = conference.recordingDurationMs
+        current = state
+        publish()
+    }
 
     // MARK: Focus / publishing
 
@@ -655,7 +727,10 @@ final class LiveCallDriver: NSObject, CallDriver {
             phase: phase,
             isMuted: false,
             startedAt: record.startedDate,
-            connectedAt: record.connectedDate
+            connectedAt: record.connectedDate,
+            recordingId: record.recordingId,
+            recordingState: record.recordingState ?? "",
+            recordingDurationMs: record.recordingDurationMs
         )
         currentUUID = uuid
         focusedGatewayId = record.id
@@ -682,11 +757,31 @@ extension LiveCallDriver: CallCoordinatorDelegate {
             state.gatewayCallId = gatewayId
             state.phase = phase
             if case .active(let at) = phase { state.connectedAt = at ?? state.connectedAt }
+            applyRecordingState(to: &state, gatewayId: gatewayId)
             current = state
             focusedGatewayId = gatewayId
             publish()
         }
         publishGroup()
+    }
+
+    /// Copies the server-confirmed recording fields for the focused call from
+    /// the coordinator's latest gateway record. The in-call indicator and the
+    /// record control therefore always reflect gateway truth, never a local
+    /// guess; a call without recording metadata clears them. While a
+    /// conference exists, its own segment state is authoritative for every
+    /// leg (a finalized 1:1 pointer on a leg row is history).
+    private func applyRecordingState(to state: inout ActiveCallViewState, gatewayId: String) {
+        if let conference = coordinator.conferenceRecord {
+            state.recordingId = conference.recordingId
+            state.recordingState = conference.recordingState ?? ""
+            state.recordingDurationMs = conference.recordingDurationMs
+            return
+        }
+        guard let record = coordinator.activeCallRecord, record.id == gatewayId else { return }
+        state.recordingId = record.recordingId
+        state.recordingState = record.recordingState ?? ""
+        state.recordingDurationMs = record.recordingDurationMs
     }
 
     func callDidEnd(gatewayId: String, reason: EndedCallReason) {
@@ -709,6 +804,18 @@ extension LiveCallDriver: CallCoordinatorDelegate {
     func callGroupChanged() {
         reconcileFocus()
         publishGroup()
+        // Cheap: keeps the focused call's recording fields aligned with
+        // conference state changes (start/stop/finalize) from any source.
+        syncConferenceRecordingState()
+    }
+
+    /// The gateway stops the prior 1:1 segment when the calls merge (its
+    /// finalization is asynchronous). Mirror the stopped conference state and
+    /// say exactly that; the "saved" confirmation only replaces it once the
+    /// server reports the prior segment ready.
+    func conferenceRecordingInterruptedByMerge() {
+        syncConferenceRecordingState()
+        onRecordingNotice?(String(localized: "已合并为会议，之前的录音已停止，可重新开始录音。"))
     }
 }
 

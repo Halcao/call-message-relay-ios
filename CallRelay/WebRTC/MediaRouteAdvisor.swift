@@ -181,3 +181,126 @@ struct MediaRouteAdvisor {
         return sorted[sorted.count / 2]
     }
 }
+
+// MARK: - Multi-path route selection (build 61)
+
+extension RouteCandidateKind {
+    /// Maps the three-valued candidate world onto the two-valued route world
+    /// the rest of the routing stack understands: both direct candidates own
+    /// the `.direct` route kind; the WSS relay owns `.relay`. Route-kind
+    /// consumers (route controller, UI status lines, diagnostics) keep their
+    /// existing two-valued semantics while the policy differentiates the
+    /// direct transports internally.
+    var routeKind: MediaRouteKind {
+        switch self {
+        case .quicDirect, .webRTCDirect: return .direct
+        case .wssRelay: return .relay
+        }
+    }
+}
+
+/// Build-61 multi-path advisor: a thin, coordinator-consumable wrapper over
+/// the deterministic ``RouteSelectionPolicy`` for QUIC-capable gateways.
+///
+/// This is ADDITIVE and strictly separate from ``decide()`` above: old
+/// gateways keep the exact single-promotion/one-fallback behavior they have
+/// today; only a gateway that advertises QUIC installs this advisor. It owns
+/// CONTINUED rescore with hysteresis across three candidates
+/// (QUIC direct / WebRTC direct / WSS relay) and maps the user's
+/// ``DirectTransportChoice`` onto the policy's forced candidate:
+/// `.auto` ⇒ no force (pure scoring), `.quic` ⇒ forced `quicDirect`,
+/// `.webRTC` ⇒ forced `webRTCDirect`.
+///
+/// Two-phase commit contract (root review defect 5 / fix 2): `evaluate` is
+/// phase 1 — it returns a decision plus its `proposed`/`proposalID`
+/// proposal but never adopts. After committing the route at the gateway the
+/// coordinator calls `confirmSwitch(to:proposalID:at:)` (phase 2); only the
+/// newest, unexpired proposal confirms, exactly once, so a failed commit or
+/// a late callback never corrupts policy state. While a REAL switch proposal
+/// is outstanding, further `evaluate` calls return `.switchPending` reusing
+/// the same proposalID (probe ticks cannot invalidate an in-flight commit);
+/// `cancelPendingSwitch(reason:`) abandons it after a failed/rolled-back
+/// commit without adoption side effects. `noteSample` feeds background probe
+/// evidence without producing a decision; `noteHardFailure` is the
+/// recovery-layer failure seam.
+struct MultiPathAdvisor {
+    private var policy: RouteSelectionPolicy
+
+    init(config: RouteSelectionPolicy.Config = .default) {
+        policy = RouteSelectionPolicy(config: config)
+    }
+
+    /// The candidate the policy currently carries, if any decision was
+    /// CONFIRMED. A merely proposed switch does not move this — evaluate
+    /// never adopts on its own.
+    var incumbentKind: RouteCandidateKind? { policy.incumbentKind }
+
+    /// Phase 1 — one deterministic evaluation. `now` is injected so tests
+    /// fully control the clock (the policy never reads a hidden `Date()`).
+    /// The returned decision carries the two-phase-commit fields:
+    /// `decision.proposed` is the candidate to commit at the gateway (nil =
+    /// keep `decision.chosen`), and `decision.proposalID` is the single
+    /// confirmable token.
+    mutating func evaluate(now: Date,
+                           samples: [RouteCandidateKind: RouteCandidateSample],
+                           forcedTransport: DirectTransportChoice = .auto) -> RouteSelectionDecision {
+        let forced: RouteCandidateKind?
+        switch forcedTransport {
+        case .auto: forced = nil
+        case .quic: forced = .quicDirect
+        case .webRTC: forced = .webRTCDirect
+        }
+        return policy.evaluate(now: now, samples: samples, forced: forced)
+    }
+
+    /// Build-62: evaluate against the RESOLVED user mode (forced kind /
+    /// permitted set). The mapping owns 中继 ⇒ WSS-only, 直连 ⇒ direct
+    /// family, 自动 ⇒ everything; the policy applies it strictly.
+    mutating func evaluate(now: Date,
+                           samples: [RouteCandidateKind: RouteCandidateSample],
+                           mode: RouteModeMapping) -> RouteSelectionDecision {
+        policy.evaluate(now: now, samples: samples,
+                        forced: mode.forcedKind, permitted: mode.permittedSet)
+    }
+
+    /// Seeds a confirmed incumbent (see ``RouteSelectionPolicy``).
+    mutating func seedIncumbent(_ kind: RouteCandidateKind, at date: Date) {
+        policy.seedIncumbent(kind, at: date)
+    }
+
+
+    /// Phase 2 — applies the adoption half of a decision the coordinator
+    /// already committed. Forwards to the policy; see
+    /// ``RouteSelectionPolicy/confirmSwitch(to:proposalID:at:)`` for the
+    /// exactly-once / pending / expired contract.
+    @discardableResult
+    mutating func confirmSwitch(to kind: RouteCandidateKind,
+                                proposalID: UInt64,
+                                at date: Date) -> Bool {
+        policy.confirmSwitch(to: kind, proposalID: proposalID, at: date)
+    }
+
+    /// Abandons an in-flight switch after a failed/rolled-back route commit
+    /// (fix 2): forwards to the policy, which clears the outstanding
+    /// proposal WITHOUT applying adoption — cooldown/min-hold clocks are
+    /// never started by a switch that never happened.
+    mutating func cancelPendingSwitch(reason: String) {
+        policy.cancelPendingSwitch(reason: reason)
+    }
+
+    /// Evidence-only seam: feeds one validated sample into the policy's
+    /// per-candidate evidence cache WITHOUT producing a decision
+    /// (coordinator background probes). Gain streaks, adoption state and
+    /// outstanding proposals are untouched.
+    mutating func noteSample(_ kind: RouteCandidateKind,
+                             _ sample: RouteCandidateSample,
+                             now: Date) {
+        policy.noteSample(kind, sample, now: now)
+    }
+
+    /// Recovery-layer seam: records a transport-reported hard failure so the
+    /// next evaluation demotes that candidate through the fast path.
+    mutating func noteHardFailure(_ kind: RouteCandidateKind, at date: Date) {
+        policy.noteHardFailure(kind, at: date)
+    }
+}

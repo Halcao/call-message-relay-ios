@@ -42,13 +42,13 @@ struct CloudSyncSettingsView: View {
             }
 
             Section("同步内容") {
-                LabeledContent("短信记录", value: "按网关隔离")
-                LabeledContent("通话记录", value: "按网关隔离")
+                LabeledContent("短信记录", value: "按网关分开")
+                LabeledContent("通话记录", value: "按网关分开")
                 LabeledContent("垃圾规则与信任号码", value: "已包含")
             }
 
             Section("不会同步") {
-                Label("配对私钥与网关令牌", systemImage: "key.slash")
+                Label("配对密钥与登录凭证", systemImage: "key.slash")
                 Label("待发送的设备短信", systemImage: "tray.slash")
             }
         }
@@ -119,7 +119,7 @@ struct CloudSyncSettingsView: View {
 
 private final class UnavailableTransport: CloudSyncTransport {
     func availability() async -> CloudSyncAvailability {
-        .unavailable("当前签名没有 iCloud 容器权限")
+        .unavailable("当前安装不支持 iCloud 同步")
     }
     func accountIdentity() async -> CloudAccountIdentity { .none }
     func ensureZone() async -> Bool { false }

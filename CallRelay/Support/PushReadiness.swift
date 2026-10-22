@@ -70,14 +70,14 @@ enum PushReadiness: Equatable {
         switch self {
         case .unpaired: return String(localized: "未配对")
         case .entitlementMissing: return String(localized: "缺少推送权限")
-        case .awaitingToken: return String(localized: "等待推送令牌")
-        case .registering: return String(localized: "登记中…")
-        case .registrationFailed: return String(localized: "登记失败")
-        case .gatewayNotConfigured: return String(localized: "网关未配置推送")
+        case .awaitingToken: return String(localized: "正在准备推送")
+        case .registering: return String(localized: "连接中…")
+        case .registrationFailed: return String(localized: "需重新连接")
+        case .gatewayNotConfigured: return String(localized: "网关未开启推送")
         case .environmentMismatch: return String(localized: "推送环境不匹配")
         case .registered(_, let configured, _):
-            if configured == true { return String(localized: "已登记") }
-            return String(localized: "已登记 · 网关状态未知")
+            if configured == true { return String(localized: "已配置") }
+            return String(localized: "已配置 · 网关状态未知")
         }
     }
 
@@ -89,7 +89,7 @@ enum PushReadiness: Equatable {
         case .unpaired, .registering:
             return nil
         case .entitlementMissing:
-            return String(localized: "当前安装无法接收锁屏来电推送，请重新签名安装。")
+            return String(localized: "当前安装无法接收锁屏来电，请更换正确的安装包后重试。")
         case .awaitingToken:
             return nil
         case .registrationFailed:
@@ -103,9 +103,9 @@ enum PushReadiness: Equatable {
                 return String(localized: "最近收到推送：\(PushReadiness.relative(lastPushAt))")
             }
             if configured == nil {
-                return String(localized: "网关状态未知，实际送达尚未验证。")
+                return String(localized: "网关状态未知，尚未收到推送记录。")
             }
-            return String(localized: "实际送达尚未验证。")
+            return String(localized: "尚未收到推送记录。")
         }
     }
 

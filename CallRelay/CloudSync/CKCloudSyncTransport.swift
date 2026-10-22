@@ -106,7 +106,7 @@ final class CKCloudSyncTransport: CloudSyncTransport, @unchecked Sendable {
         await withCheckedContinuation { continuation in
             guard let container = makeContainer() else {
                 continuation.resume(returning: .unavailable(
-                    "当前签名没有生效的 iCloud（CloudKit）权限，云同步不可用；本机功能不受影响。"))
+                    "当前安装不支持 iCloud 同步，本机功能不受影响。"))
                 return
             }
             var resumed = false
@@ -126,13 +126,13 @@ final class CKCloudSyncTransport: CloudSyncTransport, @unchecked Sendable {
                             // entitlement: terminal and actionable, NOT a
                             // transient retry loop.
                             resume(.unavailable(
-                                "当前安装包签名缺少生效的 iCloud（CloudKit）容器权限，云同步无法启用；本机功能不受影响。"
+                                "当前安装不支持 iCloud 同步，本机功能不受影响。"
                             ))
                         case .networkFailure, .networkUnavailable, .serviceUnavailable,
                              .requestRateLimited, .zoneBusy:
                             resume(.transient)
                         case .permissionFailure:
-                            resume(.restricted("系统设置限制了 iCloud（CloudKit）访问。"))
+                            resume(.restricted("系统设置限制了 iCloud 访问。"))
                         default:
                             resume(.transient)
                         }
@@ -143,7 +143,7 @@ final class CKCloudSyncTransport: CloudSyncTransport, @unchecked Sendable {
                     case .available: resume(.available)
                     case .noAccount: resume(.noAccount)
                     case .restricted:
-                        resume(.restricted("系统设置限制了 iCloud（CloudKit）访问。"))
+                        resume(.restricted("系统设置限制了 iCloud 访问。"))
                     case .couldNotDetermine:
                         // Transient/system error, NOT signed-out.
                         resume(.transient)
@@ -154,7 +154,7 @@ final class CKCloudSyncTransport: CloudSyncTransport, @unchecked Sendable {
             }, error: nil)
             if !invoked {
                 stateLock.lock(); hardFailed = true; stateLock.unlock()
-                resume(.unavailable("当前签名没有生效的 iCloud（CloudKit）权限，云同步不可用；本机功能不受影响。"))
+                resume(.unavailable("当前安装不支持 iCloud 同步，本机功能不受影响。"))
             }
         }
     }

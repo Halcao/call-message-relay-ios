@@ -112,7 +112,7 @@ struct LineNumberEditView: View {
         switch source {
         case "sim": return "来源：SIM 自动读取"
         case "manual": return "来源：手动设置"
-        case "empty": return "SIM 未存储号码"
+        case "empty": return "未设置号码"
         case "unsupported": return "SIM 暂不支持读取"
         case "sim_changed": return "SIM 已更换，请确认"
         default: return "号码未知"

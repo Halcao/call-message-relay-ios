@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Package an unsigned iphoneos app for on-device re-signing with Feather.
 set -euo pipefail
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/build-env.sh"
 APP_PATH="${1:?Usage: package-ipa.sh /path/CallRelay.app /path/CallRelay.ipa}"
 OUTPUT_PATH="${2:?Output IPA path is required}"
 test -f "$APP_PATH/Info.plist"

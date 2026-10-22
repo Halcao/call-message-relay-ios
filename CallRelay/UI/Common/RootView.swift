@@ -21,7 +21,10 @@ struct RootView: View {
                     .environmentObject(model)
             }
             ZStack {
-                if model.isDemo || model.bindingPresent {
+                if model.isDemo || model.bindingPresent || LaunchArguments.isManagementPreview {
+                    // The management preview flag is DEBUG-only (it evaluates to
+                    // false in Release) and exists so the UI review can reach
+                    // the console exactly as a paired user does.
                     MainTabs()
                 } else {
                     OnboardingView()

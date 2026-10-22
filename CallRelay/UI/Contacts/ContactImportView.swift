@@ -131,7 +131,7 @@ struct ContactImportView: View {
                 Label(sourceName == nil ? "选择 vCard 文件" : "重新选择文件",
                       systemImage: "doc.badge.plus")
             }
-            Text("支持 App 导出的 .vcf 与标准 vCard 3.0 文件；只在本机解析，不会上传。")
+            Text("支持 .vcf 文件，不会上传。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

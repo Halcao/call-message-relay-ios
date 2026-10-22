@@ -46,6 +46,10 @@ private struct MessageInboxView: View {
     @State private var composeLineExpiredMessage: String?
     /// Shortcuts "open voicemail" push navigation.
     @State private var openVoicemail = false
+    /// Tapped-SMS-alert conversation jump (exact scoped threadKey from the
+    /// gateway alert payload; bodies come from the scoped cache/fetch, never
+    /// from the truncated push preview).
+    @State private var smsJumpKey: String?
     /// Conversation awaiting the native delete confirmation.
     @State private var pendingDeleteKey: String?
     @State private var pendingDeletePeer = ""
@@ -59,7 +63,11 @@ private struct MessageInboxView: View {
     /// Single-conversation failure notice.
     @State private var deleteFailure: String?
 
-    private var editable: Bool { filter != .junk }
+    /// Editing is available in every filter, including the junk folder,
+    /// where the batch actions are the recoverable ones (恢复/标记已读/
+    /// 删除=仅本机隐藏). Raw shared SMS data is never destroyed and other
+    /// keys on the same line keep their own view.
+    private var editable: Bool { true }
 
     private var orderedSelectedKeys: [String] {
         filteredThreads.map(\.key).filter { selectedKeys.contains($0) }
@@ -72,6 +80,12 @@ private struct MessageInboxView: View {
     var body: some View {
         NavigationStack {
             content(for: inbox)
+                .safeAreaInset(edge: .top) {
+                    if let error = inbox.actionSyncError {
+                        HStack { Text(error).font(.footnote); Spacer(); Button("重试") { inbox.retrySMSActions() } }
+                            .padding(.horizontal).padding(.vertical, 6)
+                    }
+                }
                 .navigationTitle(navigationTitle)
                 .navigationBarTitleDisplayMode(.inline)
                 .safeAreaInset(edge: .bottom) {
@@ -210,16 +224,23 @@ private struct MessageInboxView: View {
                 // Bulk delete shares the gateway tombstone semantics: only the
                 // conversations the gateway accepted are removed locally.
                 .confirmationDialog(
-                    String(localized: "删除选中的 \(selectedKeys.count) 个对话？"),
+                    filter == .junk
+                        ? String(localized: "从本机垃圾箱移除选中的 \(selectedKeys.count) 个对话？")
+                        : String(localized: "删除选中的 \(selectedKeys.count) 个对话？"),
                     isPresented: $showBulkDeleteConfirm,
                     titleVisibility: .visible
                 ) {
-                    Button(String(localized: "删除对话"), role: .destructive) {
-                        Task { await performBulkDelete() }
+                    Button(filter == .junk ? String(localized: "从本机移除") : String(localized: "删除对话"),
+                           role: .destructive) {
+                        Task {
+                            if filter == .junk { performJunkBulkDelete() } else { await performBulkDelete() }
+                        }
                     }
                     Button(String(localized: "取消"), role: .cancel) {}
                 } message: {
-                    Text(String(localized: "删除后所有设备将不再显示这些对话历史。"))
+                    Text(filter == .junk
+                         ? String(localized: "只从本机隐藏这些对话；原始短信和其他设备不受影响，重新收到消息会再次出现。")
+                         : String(localized: "删除后所有设备将不再显示这些对话历史。"))
                 }
                 .alert(String(localized: "操作未全部完成"), isPresented: Binding(
                     get: { bulkNotice != nil },
@@ -241,6 +262,13 @@ private struct MessageInboxView: View {
                     guard let request, !request.peer.isEmpty else { return }
                     presentCompose(request)
                 }
+                .onChange(of: model.pendingSMSConversationKey) { _, key in
+                    // Tapped SMS alert: jump to the exact conversation. The
+                    // list loads lazily; ThreadDetailView renders the scoped
+                    // cache immediately and revalidates bounded when stale.
+                    guard let key, !key.isEmpty else { return }
+                    smsJumpKey = model.consumePendingSMSConversation()
+                }
                 .onChange(of: model.pendingVoicemailToken) { _, token in
                     guard token != nil else { return }
                     _ = model.consumePendingVoicemailToken()
@@ -260,6 +288,9 @@ private struct MessageInboxView: View {
                     if model.consumePendingVoicemailToken() != nil {
                         openVoicemail = true
                     }
+                    if let key = model.consumePendingSMSConversation(), !key.isEmpty {
+                        smsJumpKey = key
+                    }
                 }
                 // Shortcuts "open voicemail" deep link. Value-based
                 // navigationDestination keeps this independent of the list
@@ -267,6 +298,14 @@ private struct MessageInboxView: View {
                 // one-shot trigger after the push lands.
                 .navigationDestination(isPresented: $openVoicemail) {
                     VoicemailView()
+                }
+                // Tapped SMS alert jump: open the EXACT conversation the
+                // notification routing metadata named (full threadKey,
+                // gateway-verified before the jump was queued). Detail view
+                // renders the scoped cache instantly and revalidates.
+                .navigationDestination(item: $smsJumpKey) { key in
+                    ThreadDetailView(inbox: inbox, threadKey: key,
+                                     peer: ThreadKey.peer(of: key))
                 }
         }
     }
@@ -287,14 +326,34 @@ private struct MessageInboxView: View {
         VStack(spacing: 0) {
             Divider()
             HStack {
-                Button {
-                    Task { await performBulkMarkRead() }
-                } label: {
-                    Label(String(localized: "标记已读"), systemImage: "envelope.open")
+                if filter == .junk {
+                    Button {
+                        performJunkBulkRestore()
+                    } label: {
+                        Label(String(localized: "恢复"), systemImage: "arrow.uturn.backward")
+                    }
+                    .disabled(selectedKeys.isEmpty || bulkInProgress)
+                    .accessibilityIdentifier("bulkRestoreButton")
+                } else {
+                    Button {
+                        Task { await performBulkMarkRead() }
+                    } label: {
+                        Label(String(localized: "标记已读"), systemImage: "envelope.open")
+                    }
+                    .disabled(selectedKeys.isEmpty || bulkInProgress)
+                    .accessibilityIdentifier("bulkMarkReadButton")
                 }
-                .disabled(selectedKeys.isEmpty || bulkInProgress)
-                .accessibilityIdentifier("bulkMarkReadButton")
                 Spacer()
+                if filter == .junk {
+                    Button {
+                        Task { await performBulkMarkRead() }
+                    } label: {
+                        Label(String(localized: "已读"), systemImage: "envelope.open")
+                    }
+                    .disabled(selectedKeys.isEmpty || bulkInProgress)
+                    .accessibilityIdentifier("junkBulkReadButton")
+                    Spacer()
+                }
                 if bulkInProgress {
                     ProgressView()
                         .controlSize(.small)
@@ -342,15 +401,39 @@ private struct MessageInboxView: View {
         bulkInProgress = true
         let result = await inbox.markThreadsRead(keys)
         bulkInProgress = false
-        selectedKeys.removeAll()
+        exitEditMode()
         guard !result.isEmpty else { return }
         if !result.failed.isEmpty {
             bulkNotice = result.succeeded.isEmpty
                 ? String(localized: "标记已读失败，请检查网络后重试。")
                 : String(localized: "已标记 \(result.succeeded.count) 个对话，\(result.failed.count) 个失败，请重试。")
-        } else {
-            bulkNotice = String(localized: "已将 \(result.succeeded.count) 个对话标记为已读。")
         }
+    }
+
+    /// Junk batch restore: marks each sender known so the conversation leaves
+    /// the junk folder and future messages arrive normally.
+    private func performJunkBulkRestore() {
+        let keys = orderedSelectedKeys
+        guard !keys.isEmpty else { return }
+        let threads = inbox.junkThreads.filter { keys.contains($0.key) }
+        for thread in threads {
+            inbox.restoreJunk(threadKey: thread.key, peer: thread.peer)
+        }
+        selectedKeys.removeAll()
+        bulkNotice = String(localized: "已恢复 \(threads.count) 个对话。")
+    }
+
+    /// Junk batch delete is LOCAL-HIDE only: the raw SMS stays on the worker
+    /// for every key/device; a new message reopens the conversation.
+    private func performJunkBulkDelete() {
+        let keys = orderedSelectedKeys
+        guard !keys.isEmpty else { return }
+        for key in keys {
+            inbox.dismissJunk(threadKey: key)
+        }
+        selectedKeys.removeAll()
+        isEditing = false
+        bulkNotice = String(localized: "已从本机移除 \(keys.count) 个对话，原始短信未被删除。")
     }
 
     private var navigationTitle: String {
@@ -476,23 +559,44 @@ private struct MessageInboxView: View {
         Group {
             if inbox.junkThreads.isEmpty {
                 EmptyStateView(icon: "tray", title: "没有垃圾信息",
-                               message: "命中规则的短信会隔离到这里，可随时恢复；短信不会被删除。")
+                               message: "隔离的短信会显示在这里，可随时恢复，不会被删除。")
                     .accessibilityIdentifier("junkEmpty")
             } else {
-                List {
+                List(selection: isEditing ? $selectedKeys : nil) {
+                    if !isEditing {
+                        Section {
+                            Button {
+                                isEditing = true
+                            } label: {
+                                Label("管理垃圾信息", systemImage: "checklist")
+                            }
+                            .accessibilityIdentifier("junkManageEntry")
+                            .accessibilityLabel("管理垃圾信息：批量恢复、标记已读或从本机移除")
+                        }
+                    }
                     ForEach(inbox.junkThreads) { thread in
-                        NavigationLink {
-                            ThreadDetailView(inbox: inbox, threadKey: thread.key,
-                                             peer: thread.peer, junk: true)
-                        } label: {
+                        if isEditing {
                             ThreadRow(thread: thread,
                                       displayName: model.contacts.name(forPeer: thread.peer),
                                       reason: inbox.junkReason(for: thread.key))
+                                .tag(thread.key)
+                                .accessibilityIdentifier("junk-\(thread.key)")
+                                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                        } else {
+                            NavigationLink {
+                                ThreadDetailView(inbox: inbox, threadKey: thread.key,
+                                                 peer: thread.peer, junk: true)
+                            } label: {
+                                ThreadRow(thread: thread,
+                                          displayName: model.contacts.name(forPeer: thread.peer),
+                                          reason: inbox.junkReason(for: thread.key))
+                            }
+                            .accessibilityIdentifier("junk-\(thread.key)")
+                            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
                         }
-                        .accessibilityIdentifier("junk-\(thread.key)")
-                        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
                     }
                 }
+                .environment(\.editMode, .constant(isEditing ? .active : .inactive))
                 .listStyle(.plain)
                 .accessibilityIdentifier("junkList")
                 .refreshable { await inbox.refreshThreads() }
@@ -514,9 +618,9 @@ private struct MessageInboxView: View {
     private var emptyMessage: String {
         switch filter {
         case .all: return "点击右上角按钮写短信，收到的短信也会按号码显示在这里。"
-        case .unknown: return "来自陌生号码但未命中垃圾规则的短信会显示在这里。"
+        case .unknown: return "来自陌生号码的短信会显示在这里。"
         case .known: return "联系人或你回复过的号码会显示在这里。"
-        case .junk: return "命中规则的短信会隔离到这里，可随时恢复；短信不会被删除。"
+        case .junk: return "隔离的短信会显示在这里，可随时恢复，不会被删除。"
         }
     }
 }
@@ -585,7 +689,7 @@ private struct ThreadRow: View {
                     }
                 }
                 if let reason {
-                    Text("疑似垃圾：\(reason)")
+                    Text("疑似垃圾信息")
                         .font(.caption2)
                         .foregroundStyle(.orange)
                         .lineLimit(1)
@@ -635,7 +739,7 @@ enum MessageStatusPresentation {
         if isSending { return "发送中…" }
         switch status {
         case .queued: return "排队中…"
-        case .submitted: return "已提交到网关"
+        case .submitted: return "已提交"
         case .sent: return "已发送"
         case .delivered: return "已送达"
         case .failed: return "发送失败，可重试"
