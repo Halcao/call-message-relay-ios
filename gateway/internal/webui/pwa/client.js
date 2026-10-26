@@ -45,6 +45,8 @@
     peers: [],                // history peers for suggestions (no contacts access)
     threads: [],
     openThreadKey: null,
+    calls: [],                // /api/v2/calls history (own tab)
+    activeTab: 'dialer',
     call: null,               // active call controller
     events: null,
     dialNumber: '',
@@ -268,6 +270,9 @@
       return;
     }
     if (type.indexOf('call.') === 0) {
+      // Keep an open history list live; a call that ends while the tab is
+      // visible must appear without a manual reload.
+      if (type === 'call.ended' && state.activeTab === 'calls') { refreshCalls(); }
       if (state.call) {
         state.call.onEvent(msg);
         return;
@@ -455,11 +460,9 @@
     $('compose-body').addEventListener('input', function () {
       $('compose-send').style.color = $('compose-body').value.trim() && $('compose-to').value.trim() ? 'var(--accent)' : 'var(--muted)';
     });
-    var newBtn = el('button', 'tabbtn', '＋');
-    newBtn.setAttribute('aria-label', '新建短信');
-    newBtn.style.flex = '0 0 64px';
-    newBtn.addEventListener('click', openCompose);
-    $('tabbar').appendChild(newBtn);
+    // Compose is the floating button inside the messages tab (iOS Messages
+    // convention: actions belong to their tab, not to the global tab bar).
+    $('messages-compose').addEventListener('click', openCompose);
 
     // SMS management: native Edit mode (multi-select / select-all / bulk
     // mark-read / bulk delete) plus the explicit per-conversation menu.
@@ -498,6 +501,8 @@
     $('messages-edit').textContent = state.smsEditing ? '完成' : '编辑';
     $('messages-select-all').classList.toggle('hidden', !state.smsEditing);
     $('sms-editbar').classList.toggle('hidden', !state.smsEditing);
+    // The floating compose button would sit on top of the bulk-action bar.
+    $('messages-compose').classList.toggle('hidden', state.smsEditing);
     renderThreadList();
   }
 
@@ -640,7 +645,7 @@
     });
     updateEditBar();
     if (!state.threads.length) {
-      list.appendChild(el('p', 'muted', '暂无短信。点右下角 ＋ 新建。')).style.padding = '20px';
+      list.appendChild(el('p', 'list-empty', '暂无短信。点右下角的 ＋ 新建对话。'));
       return;
     }
     state.threads.forEach(function (thread) {
@@ -831,20 +836,33 @@
   }
 
   function openCompose() {
+    var senders = state.lines.filter(function (l) { return l.permissions.sendSms; });
+    // Nothing to send from: say so instead of opening a composer with an
+    // empty line picker that fails on send.
+    if (!senders.length) { toast('当前设备没有可发送短信的线路权限'); return; }
+    // The composer is an overlay INSIDE #tab-messages. Showing it without
+    // switching to that tab (which is display:none from any other tab) hid
+    // both the top bar and the tab bar and left a blank, unrecoverable
+    // screen — the "进去出不来" report.
+    showTab('messages');
     $('thread-list').classList.add('hidden');
     $('thread-view').classList.add('hidden');
     $('compose-view').classList.remove('hidden');
     $('tabbar').classList.add('hidden');
     $('topbar').classList.add('hidden');
-    fillLinePicker($('compose-from'), preferredLine(''), state.lines.filter(function (l) { return l.permissions.sendSms; }));
+    $('messages-compose').classList.add('hidden');
+    fillLinePicker($('compose-from'), preferredLine(''), senders);
     $('compose-to').focus();
   }
 
   function closeCompose() {
     $('compose-view').classList.add('hidden');
+    $('thread-view').classList.add('hidden');
     $('thread-list').classList.remove('hidden');
     $('tabbar').classList.remove('hidden');
     $('topbar').classList.remove('hidden');
+    $('messages-compose').classList.remove('hidden');
+    showTab('messages');
   }
 
   /* ---------------- contacts ---------------- */
@@ -958,7 +976,7 @@
     var card = el('div', 'confirm-card');
     card.appendChild(el('strong', null, '编辑联系人'));
     var nameInput = el('input');
-    nameInput.value = contact.displayName || '';
+    nameInput.value = CL.displayLabel(contact) || '';
     nameInput.placeholder = '姓名';
     var phoneInput = el('input');
     var phones = CL.phoneValues(contact);
@@ -1287,16 +1305,97 @@
     });
   }
 
+  /* ---------------- call history ---------------- */
+
+  function refreshCalls() {
+    return S.api('/api/v2/calls?limit=100').then(function (body) {
+      state.calls = (body && body.calls) ? body.calls : (body || []);
+      renderCallList();
+    }).catch(function () { /* transient */ });
+  }
+
+  function callLineId(call) {
+    var line = state.lines.filter(function (l) { return l.id === call.lineId; })[0];
+    if (line && line.permissions && line.permissions.dial) { return line.id; }
+    return preferredLine('', state.lines);
+  }
+
+  /* An inbound call that ended without ever connecting is a missed call.
+   * A still-ringing inbound call (state incoming_ringing, no connectedAt)
+   * must NOT be marked missed. */
+  function callMissed(call) {
+    return call.direction === 'inbound' && !call.connectedAt && call.state === 'ended';
+  }
+
+  function formatWhen(ms) {
+    if (!ms) { return ''; }
+    var date = new Date(ms);
+    var now = new Date();
+    if (date.toDateString() === now.toDateString()) {
+      return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+    var yesterday = new Date(now.getTime() - 864e5);
+    if (date.toDateString() === yesterday.toDateString()) {
+      return '昨天 ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+    return (date.getMonth() + 1) + '月' + date.getDate() + '日';
+  }
+
+  function formatDuration(call) {
+    if (!call.connectedAt) { return ''; }
+    var seconds = Math.max(0, Math.round(((call.endedAt || Date.now()) - call.connectedAt) / 1000));
+    if (seconds >= 3600) {
+      return Math.floor(seconds / 3600) + '小时' + Math.floor((seconds % 3600) / 60) + '分';
+    }
+    if (seconds >= 60) { return Math.floor(seconds / 60) + '分' + (seconds % 60) + '秒'; }
+    return seconds + '秒';
+  }
+
+  function renderCallList() {
+    var list = $('call-list');
+    list.textContent = '';
+    var calls = state.calls || [];
+    if (!calls.length) {
+      list.appendChild(el('p', 'list-empty', '暂无通话记录'));
+      return;
+    }
+    calls.forEach(function (call) {
+      var missed = callMissed(call);
+      var row = el('button', 'call-row');
+      var dir = el('span', 'call-dir' + (missed ? ' missed' : ''));
+      dir.textContent = call.direction === 'inbound' ? '↙' : '↗';
+      var body = el('span', 'c-body');
+      var name = el('span', 'c-name' + (missed ? ' missed' : ''));
+      name.textContent = peerName(call.peer) || call.peer || '未知号码';
+      var sub = el('span', 'c-sub');
+      sub.textContent = [call.lineName || '', formatDuration(call)].filter(Boolean).join(' · ') || '未接通';
+      body.appendChild(name);
+      body.appendChild(sub);
+      var when = el('span', 'c-time');
+      when.textContent = formatWhen(call.startedAt);
+      row.appendChild(dir);
+      row.appendChild(body);
+      row.appendChild(when);
+      row.addEventListener('click', function () {
+        startCall(call.peer, callLineId(call));
+      });
+      list.appendChild(row);
+    });
+  }
+
   /* ---------------- tabs ---------------- */
 
   function showTab(name) {
+    state.activeTab = name;
     document.querySelectorAll('.tabbtn[data-tab]').forEach(function (b) {
       b.classList.toggle('active', b.dataset.tab === name);
     });
     $('tab-dialer').classList.toggle('hidden', name !== 'dialer');
     $('tab-messages').classList.toggle('hidden', name !== 'messages');
+    $('tab-calls').classList.toggle('hidden', name !== 'calls');
     $('tab-contacts').classList.toggle('hidden', name !== 'contacts');
     if (name === 'contacts') { refreshContacts(); }
+    if (name === 'calls') { refreshCalls(); }
     // Edit mode is a conversation-list affordance: only on the messages tab,
     // and it exits cleanly when switching away.
     var onMessages = name === 'messages';

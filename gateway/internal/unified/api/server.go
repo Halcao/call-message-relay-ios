@@ -1669,11 +1669,11 @@ var eventUpgrader = websocket.Upgrader{
 		if parsed.Host != r.Host {
 			return false
 		}
-		scheme := "http"
-		if r.TLS != nil {
-			scheme = "https"
-		}
-		return parsed.Scheme == scheme
+		// The gateway always listens on plain loopback HTTP and a TLS
+		// terminating reverse proxy forwards X-Forwarded-Proto, so r.TLS is
+		// nil for every real browser hop. effectiveScheme() honors that
+		// trusted-proxy header first and falls back to r.TLS.
+		return parsed.Scheme == effectiveScheme(r)
 	},
 }
 

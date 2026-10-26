@@ -28,9 +28,15 @@
   }
 }
 * { box-sizing: border-box; }
+/* touch-action: manipulation is what actually disables double-tap-to-zoom on
+ * iOS (the viewport's user-scalable/maximum-scale are ignored since iOS 10).
+ * Pinch-to-zoom stays available for accessibility. */
+html { touch-action: manipulation; -webkit-text-size-adjust: 100%; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
-  font: -apple-system-body; font-family: -apple-system, "PingFang SC", sans-serif; }
-#app { max-width: 440px; margin: 0 auto; height: 100%; display: flex; flex-direction: column; }
+  font: -apple-system-body; font-family: -apple-system, "PingFang SC", sans-serif;
+  -webkit-tap-highlight-color: transparent; overscroll-behavior: none; }
+#app { max-width: 440px; margin: 0 auto; height: 100%; display: flex; flex-direction: column;
+  height: 100dvh; }
 .hidden { display: none !important; }
 .muted { color: var(--muted); }
 .error { color: var(--danger); }
@@ -42,13 +48,20 @@ button { font: inherit; color: inherit; }
 .card { margin: 12px 16px; padding: 16px; background: var(--fill); border-radius: 14px; }
 .card h2 { margin: 0 0 8px; font-size: 20px; }
 .row { display: flex; gap: 8px; margin: 10px 0; }
-input, select, textarea { font: inherit; color: var(--fg); background: var(--bg);
+/* 16px minimum keeps iOS from zooming the page when a control takes focus. */
+input, select, textarea { font: inherit; font-size: 16px; color: var(--fg); background: var(--bg);
   border: 1px solid var(--sep); border-radius: 10px; padding: 10px 12px; width: 100%; }
+/* A control inside a flex row must yield space to its sibling button. */
+.row > input, .row > select, .compose-row > input, .compose-row > select,
+#contacts-toolbar > input { width: auto; flex: 1; min-width: 0; }
 details { margin-top: 14px; }
 details input { margin: 6px 0; }
 
+/* Without the top inset the top bar sits under the status bar / notch in an
+ * installed (standalone, viewport-fit=cover) web app. */
+#pair-view, #main-view { padding-top: env(safe-area-inset-top); }
 #topbar { display: flex; align-items: center; gap: 10px; padding: 10px 16px;
-  border-bottom: 1px solid var(--sep); }
+  border-bottom: 1px solid var(--sep); flex: none; }
 #topbar select { width: auto; flex: 1; }
 #conn-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
 #conn-dot.on { background: var(--bubble-out); }
@@ -98,6 +111,7 @@ details input { margin: 6px 0; }
 .thread-row { display: flex; gap: 12px; align-items: center; width: 100%;
   padding: 10px 16px; background: transparent; border: 0; border-bottom: 1px solid var(--sep);
   text-align: left; }
+.thread-row:active, .contact-row:active, .suggestion:active { background: var(--fill); }
 .thread-row .t-body { flex: 1; min-width: 0; }
 .thread-row .t-name { font-size: 16px; }
 .thread-row .t-preview { font-size: 14px; color: var(--muted); white-space: nowrap;
@@ -106,7 +120,9 @@ details input { margin: 6px 0; }
 .thread-row .t-unread { background: var(--accent); color: #fff; border-radius: 10px;
   font-size: 12px; padding: 1px 7px; }
 
-.avatar { width: 40px; height: 40px; border-radius: 50%; background: var(--sep);
+/* --sep doubles as the dark-mode border colour (60% gray); using it as an
+ * avatar surface made dark-mode avatars far heavier than light-mode ones. */
+.avatar { width: 40px; height: 40px; border-radius: 50%; background: var(--fill);
   color: var(--muted); display: flex; align-items: center; justify-content: center;
   font-weight: 600; flex: none; }
 .avatar.large { width: 84px; height: 84px; font-size: 34px; }
@@ -114,9 +130,10 @@ details input { margin: 6px 0; }
 #thread-view, #compose-view { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 #thread-header, #compose-header { display: flex; align-items: center; gap: 10px;
   padding: 8px 12px; border-bottom: 1px solid var(--sep); }
-#thread-line { width: auto; max-width: 150px; font-size: 14px; padding: 5px 8px; flex: none; }
+#thread-line { width: auto; max-width: 150px; font-size: 16px; padding: 5px 8px; flex: none; }
+.list-empty { padding: 48px 24px; text-align: center; color: var(--muted); font-size: 15px; }
 #thread-header button, #compose-header button { background: none; border: 0;
-  font-size: 26px; color: var(--accent); padding: 4px 8px; }
+  font-size: 26px; color: var(--accent); padding: 4px 8px; min-width: 44px; min-height: 44px; }
 #compose-header { justify-content: space-between; font-size: 17px; }
 #compose-header .link { font-size: 17px; }
 .thread-peer { flex: 1; display: flex; align-items: center; gap: 10px; min-width: 0; }
@@ -155,16 +172,20 @@ details input { margin: 6px 0; }
 #compose-body { margin: 12px 16px; width: auto; border-radius: 14px; }
 
 #tabbar { display: flex; border-top: 1px solid var(--sep);
-  padding-bottom: env(safe-area-inset-bottom); background: var(--bg); min-height: 52px; }
-.tabbtn { flex: 1; border: 0; background: none; padding: 6px 0 4px; color: var(--muted);
-  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  padding-bottom: env(safe-area-inset-bottom); background: var(--bg); min-height: 52px;
+  flex: none; }
+.tabbtn { flex: 1 1 0; min-width: 0; border: 0; background: none; padding: 6px 0 4px;
+  color: var(--muted); display: flex; flex-direction: column; align-items: center; gap: 3px;
   min-height: 44px; font-size: 11px; }
-.tabbtn span { font-size: 11px; }
+.tabbtn svg { display: block; }
+.tabbtn span { font-size: 11px; line-height: 12px; white-space: nowrap; }
+.tabbtn:active { opacity: .55; }
 .tabbtn.active { color: var(--accent); }
 
 /* Call */
 #call-view { position: fixed; inset: 0; background: var(--bg); z-index: 20;
-  display: flex; align-items: center; justify-content: center; }
+  display: flex; align-items: center; justify-content: center;
+  padding: env(safe-area-inset-top) 12px calc(12px + env(safe-area-inset-bottom)); }
 .call-card { text-align: center; max-width: 420px; width: 100%; padding: 24px;
   display: flex; flex-direction: column; align-items: center; }
 #call-peer { font-size: 28px; font-weight: 600; margin: 14px 0 4px; }
@@ -183,7 +204,7 @@ details input { margin: 6px 0; }
 
 /* SMS management (native Edit mode parity) */
 .topbar-action { background: none; border: 0; color: var(--accent); font-size: 16px;
-  padding: 6px 6px; flex: none; }
+  padding: 6px 6px; flex: none; min-height: 44px; }
 .sms-editbar { display: flex; justify-content: space-between; align-items: center;
   padding: 8px 16px; border-top: 1px solid var(--sep); background: var(--bg); flex: none; }
 .sms-editbar button { background: none; border: 0; color: var(--accent); font-size: 16px;
@@ -204,6 +225,29 @@ details input { margin: 6px 0; }
 .confirm-card .actions button { background: none; border: 0; color: var(--accent);
   font-size: 16px; padding: 8px; }
 .confirm-card .actions button.danger { color: var(--danger); }
+
+/* Call history (own tab): iOS Phone conventions — direction glyph, missed
+ * calls in red, time on the right, tap to call back. */
+#call-list { overflow-y: auto; flex: 1; }
+.call-row { display: flex; align-items: center; gap: 12px; width: 100%;
+  padding: 10px 16px; background: transparent; border: 0; border-bottom: 1px solid var(--sep);
+  text-align: left; }
+.call-row:active { background: var(--fill); }
+.call-dir { width: 16px; flex: none; text-align: center; font-size: 15px; color: var(--muted); }
+.call-dir.missed { color: var(--danger); }
+.call-row .c-body { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.call-row .c-name { font-size: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.call-row .c-name.missed { color: var(--danger); }
+.call-row .c-sub { font-size: 13px; color: var(--muted); }
+.call-row .c-time { flex: none; font-size: 13px; color: var(--muted); }
+
+/* Floating compose button, messages tab only (sits above the list, under the
+ * conversation/compose overlays). */
+.fab { position: absolute; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom));
+  width: 56px; height: 56px; border-radius: 50%; border: 0; z-index: 4;
+  background: var(--accent); color: #fff; display: flex; align-items: center;
+  justify-content: center; box-shadow: 0 6px 18px rgba(0, 0, 0, .22); }
+.fab:active { transform: scale(.95); }
 
 /* Contacts (principal-scoped gateway address book) */
 #tab-contacts { display: flex; flex-direction: column; overflow-y: auto; flex: 1; }
@@ -244,6 +288,8 @@ details input { margin: 6px 0; }
   background: var(--bg);
   overflow-y: auto;
   z-index: 40;
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
 }
 #rules-bar {
   display: flex;

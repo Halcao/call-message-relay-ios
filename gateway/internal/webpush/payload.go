@@ -62,6 +62,43 @@ func CallPayload(locale, peer, navigateURL, tag string) ([]byte, error) {
 	})
 }
 
+// SmsPayload builds the encrypted-body bytes for one inbound SMS alert. The
+// peer and preview are already bounded by the runtime (push.TruncatePreview)
+// before they reach this function, so the final alert stays within the
+// notification budget. The tag is the message id: a replayed worker event
+// collapses onto the same notification instead of stacking a duplicate.
+func SmsPayload(locale, peer, preview, navigateURL, tag string) ([]byte, error) {
+	language := "zh-CN"
+	title := "CallRelay 短信"
+	separator := "："
+	if len(locale) >= 2 && locale[:2] == "en" {
+		language = "en-US"
+		title = "CallRelay SMS"
+		separator = ": "
+	}
+	body := peer
+	switch {
+	case preview == "":
+	case body == "":
+		body = preview
+	default:
+		body = peer + separator + preview
+	}
+	return json.Marshal(Message{
+		WebPush: 8030,
+		Notification: Notification{
+			Title:    title,
+			Body:     body,
+			Lang:     language,
+			Dir:      "auto",
+			Tag:      tag,
+			Navigate: navigateURL,
+			Renotify: true,
+			Silent:   false,
+		},
+	})
+}
+
 // TestPayload builds the settings-screen test notification body. The tap
 // target is the gateway's own setup page (same origin) so activating the
 // test notification always lands somewhere meaningful.

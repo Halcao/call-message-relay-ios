@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
 <meta name="theme-color" content="#0b1220">
 <title>CallRelay</title>
@@ -101,6 +101,14 @@
         </div>
         <textarea id="compose-body" rows="6" maxlength="10000" placeholder="信息·短信"></textarea>
       </div>
+      <button id="messages-compose" class="fab" type="button" aria-label="发短信">
+        <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path fill="currentColor" d="M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6z"/></svg>
+      </button>
+    </section>
+
+    <!-- 通话记录 -->
+    <section id="tab-calls" class="tab hidden">
+      <div id="call-list"></div>
     </section>
 
     <!-- 通讯录 -->
@@ -127,12 +135,15 @@
     </section>
 
     <nav id="tabbar">
-      <button class="tabbtn active" data-tab="dialer" aria-label="拨号键盘">
+      <button class="tabbtn active" data-tab="dialer" aria-label="电话">
         <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M3 5a2 2 0 0 1 2-2h3l2 5-2.2 1.6a13 13 0 0 0 6.6 6.6L16 14l5 2v3a2 2 0 0 1-2 2C9.8 21 3 14.2 3 5z"/></svg>
-        <span>拨号</span></button>
+        <span>电话</span></button>
       <button class="tabbtn" data-tab="messages" aria-label="短信">
         <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M4 4h16a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H8l-5 4V6a2 2 0 0 1 1-2z"/></svg>
         <span>短信</span></button>
+      <button class="tabbtn" data-tab="calls" aria-label="通话记录">
+        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M12 3a9 9 0 1 0 9 9h-2a7 7 0 1 1-7-7V3zm1 4v5.4l3.6 2.1 1-1.7-2.6-1.5V7h-2z"/></svg>
+        <span>通话记录</span></button>
       <button class="tabbtn" data-tab="contacts" aria-label="通讯录">
         <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M5 3h12a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zm2 4v2h8V7H7zm0 4v2h8v-2H7zm0 4v2h5v-2H7z"/></svg>
         <span>通讯录</span></button>

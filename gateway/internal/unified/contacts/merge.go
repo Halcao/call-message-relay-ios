@@ -377,3 +377,50 @@ func hasCJK(value string) bool {
 	}
 	return false
 }
+
+// preferredDisplayName renders a stored FN label in its own script's order.
+// A phone whose contact display order is "given name, family name" exports
+// FN as "黛茜 樊"; Chinese convention is surname-first with no separator.
+// Only the exact "given family" rendering of two Han-only parts is
+// reordered, so nicknames, organization labels and names the owner typed
+// with their own spacing are shown verbatim. A real Han surname is 1-2
+// characters: longer "family names" come from an account/nickname vCard
+// whose N field was split on a space, and reordering those is nonsense.
+func preferredDisplayName(displayName, given, family string) string {
+	name := strings.TrimSpace(displayName)
+	given = strings.TrimSpace(given)
+	family = strings.TrimSpace(family)
+	if name == "" || given == "" || family == "" {
+		return name
+	}
+	if !isHanOnly(given) || !isHanSurname(family) {
+		return name
+	}
+	if collapseSpaces(name) != collapseSpaces(given+" "+family) {
+		return name
+	}
+	return family + given
+}
+
+// isHanOnly reports whether value consists solely of Han characters, so a
+// latin given name (e.g. "Noora 崔") is never folded into a CJK surname.
+func isHanOnly(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if !unicode.Is(unicode.Han, r) {
+			return false
+		}
+	}
+	return true
+}
+
+func isHanSurname(value string) bool {
+	runes := []rune(value)
+	return len(runes) > 0 && len(runes) <= 2 && isHanOnly(value)
+}
+
+func collapseSpaces(value string) string {
+	return strings.Join(strings.Fields(value), " ")
+}

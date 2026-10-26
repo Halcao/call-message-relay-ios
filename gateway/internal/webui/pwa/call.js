@@ -82,12 +82,16 @@
   }
 
   function api(path, session, body) {
+    // A standalone (client-scope) browser binding never leaves a bearer in
+    // localStorage: its only credential is the HttpOnly cookie, so the
+    // Authorization header must be omitted rather than filled with "null".
     var options = {
+      credentials: 'same-origin',
       headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + session
+        'Content-Type': 'application/json'
       }
     };
+    if (session) options.headers['Authorization'] = 'Bearer ' + session;
     if (body !== undefined) {
       options.method = 'POST';
       options.body = JSON.stringify(body);
@@ -185,12 +189,16 @@
     var token = handoffToken();
     var session = localStorage.getItem(SESSION_KEY);
     if (!token) { showEnded(gen); return; }
-    if (!session) { showNeedBind(gen); return; }
     // Standalone branch: a bound browser CLIENT session (cookie) answers
     // IN THE PAGE — the tap foregrounds this page and the answer button
     // requests the mic via the user gesture. It never forces the native
-    // scheme handoff. Redeem the handoff with the legacy push session only
-    // to learn WHICH call is ringing; the client then owns the flow.
+    // scheme handoff. Redeem the handoff with the client cookie only to
+    // learn WHICH call is ringing; the client then owns the flow.
+    //
+    // The cookie check MUST come before the legacy-session check: a
+    // client-scope bind deliberately never returns a bearer, so requiring
+    // cr_wp_session here made every standalone binding land on "not bound"
+    // instead of the answer screen.
     CallRelaySession.current().then(function (client) {
       if (gen !== generation) return;
       if (client) {
@@ -210,6 +218,9 @@
         });
         return;
       }
+      // No cookie client and no legacy push session: nothing can redeem the
+      // handoff, so ask for a bind instead of showing a dead call screen.
+      if (!session) { showNeedBind(gen); return; }
       // Native handoff flow (existing): redeem, ring, try the scheme once.
       api('/api/v2/webpush/handoff', session, { token: token }).then(function (data) {
         if (gen !== generation) return;

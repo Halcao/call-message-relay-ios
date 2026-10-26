@@ -120,3 +120,33 @@ func FromParsedForTest(id string, card ParsedContact) Contact {
 	contact.ID = id
 	return contact
 }
+
+// Chinese contact cards exported by a phone set to "given name, family name"
+// carry FN: "黛茜 樊" while N holds family=樊 given=黛茜. The list/export
+// label must read surname-first with no separator, and it must stay
+// byte-identical for western names and for account-style labels whose
+// spaces are not a given/family split.
+func TestPreferredDisplayNameOrdersHanNamesSurnameFirst(t *testing.T) {
+	cases := []struct {
+		stored, given, family, want string
+	}{
+		{"黛茜 樊", "黛茜", "樊", "樊黛茜"},
+		{" 昊   曹 ", "昊", "曹", "曹昊"},
+		{"樊黛茜", "黛茜", "樊", "樊黛茜"},                     // already surname-first: idempotent
+		{"Alice Wang", "Alice", "Wang", "Alice Wang"}, // western order untouched
+		{"Noora 崔", "Noora", "崔", "Noora 崔"},          // latin given name stays
+		{"世界 莫名奇妙物语", "世界", "莫名奇妙物语", "世界 莫名奇妙物语"},    // not a surname
+		{"", "黛茜", "樊", ""},
+	}
+	for _, c := range cases {
+		if got := preferredDisplayName(c.stored, c.given, c.family); got != c.want {
+			t.Errorf("preferredDisplayName(%q,%q,%q) = %q, want %q",
+				c.stored, c.given, c.family, got, c.want)
+		}
+	}
+	// contactLabel keeps the composed/org/phone fallbacks when no label exists.
+	label := contactLabel(Contact{DisplayName: "黛茜 樊", GivenName: "黛茜", FamilyName: "樊"})
+	if label != "樊黛茜" {
+		t.Fatalf("contactLabel = %q, want 樊黛茜", label)
+	}
+}

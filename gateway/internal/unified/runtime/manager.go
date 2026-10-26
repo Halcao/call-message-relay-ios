@@ -750,6 +750,7 @@ func (m *Manager) handleMessageEvent(ctx context.Context, line *Line, event work
 	if event.Type == "message.created" && message.Direction == "inbound" {
 		m.recordInboundHarassSMS(ctx, line.Cfg.ID, message)
 		go m.pushMessage(line.Cfg.ID, message)
+		go m.pushWebMessage(line.Cfg.ID, message)
 		// Live carrier messages are classified for confirmed arrears/recharge
 		// alerts. Only newly created events reach here, and the notifier
 		// dedupes by message id, so no historical SMS is ever replayed.
@@ -1268,6 +1269,67 @@ func (m *Manager) pushWebIncoming(ctx context.Context, call store.Call) {
 					_ = m.Store.DeleteWebPushSubscription(context.Background(), target.DeviceID, target.SubID)
 				}
 				slog.Warn("webpush notification failed", "device_id", target.DeviceID, "line", call.LineID, "error", err)
+			}
+		}()
+	}
+}
+
+// pushWebMessage fans one inbound SMS out over the self-hosted PWA Web Push
+// path. Native SMS alerts require APNs (or a push broker); a self-hosted
+// deployment has neither, so without this path an SMS only reaches a phone
+// while the PWA is in the foreground. The channel choice mirrors calls: a
+// device that selected native-only never gets a duplicate web alert, while
+// both/web do. Sender and a bounded preview ride along exactly as in the APNs
+// payload, gated by the same ReceiveSMS grant and harassment policy.
+func (m *Manager) pushWebMessage(lineID string, message worker.Message) {
+	if m.WebPush == nil || m.WebPushSender == nil || !m.Cfg.WebPush.Enabled {
+		return
+	}
+	targets, err := m.Store.ListWebPushTargets(context.Background())
+	if err != nil {
+		return
+	}
+	base := strings.TrimRight(strings.TrimSpace(m.Cfg.Gateway.PublicBaseURL), "/")
+	if base == "" {
+		base = "https://" + strings.TrimSpace(m.GatewayID)
+	}
+	peer := push.TruncatePreview(message.Peer, push.PreviewPeerRunes)
+	preview := push.TruncatePreview(message.Body, push.PreviewBodyRunes)
+	messageID := lineID + ":" + message.ID
+	for _, target := range targets {
+		access, accessErr := m.Store.DeviceAccess(context.Background(), target.DeviceID)
+		if accessErr != nil {
+			continue
+		}
+		entry, ok := linePermission(access, lineID)
+		if !ok || !entry.Permissions.ReceiveSMS {
+			continue
+		}
+		if m.HarassSuppressedForKey(context.Background(), access.Key.ID, harass.KindSMS, message.Peer, message.Body) {
+			continue
+		}
+		mode, modeErr := m.Store.DeviceNotifyMode(context.Background(), target.DeviceID)
+		if modeErr == nil && mode == store.NotifyModeNative {
+			continue
+		}
+		target := target
+		if !m.webpushDedup.Reserve(target.DeviceID+":"+target.SubID, "sms:"+messageID) {
+			continue
+		}
+		go func() {
+			timeout, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			payload, payloadErr := webpush.SmsPayload(target.Locale, peer, preview, base+"/pwa/client.html", messageID)
+			if payloadErr != nil {
+				return
+			}
+			if err := m.WebPushSender.Send(timeout, webpush.Subscription{
+				ID: target.SubID, Endpoint: target.Endpoint, Auth: target.Auth, P256dh: target.P256dh,
+			}, payload); err != nil {
+				if webpush.SubscriptionGone(err) {
+					_ = m.Store.DeleteWebPushSubscription(context.Background(), target.DeviceID, target.SubID)
+				}
+				slog.Warn("webpush notification failed", "kind", "sms", "device_id", target.DeviceID, "line", lineID, "error", err)
 			}
 		}()
 	}

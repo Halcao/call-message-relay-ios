@@ -61,4 +61,15 @@ assert.strictEqual(logic.importSummary({ created: 1, warnings: ['x'] }), '新建
 assert.strictEqual(logic.entryText({ action: 'create', name: '张三', phones: ['138'] }), '新建：张三（138）');
 assert.strictEqual(logic.entryText({ action: 'unchanged', name: '李四' }), '无变化：李四');
 
+// 9. Chinese names render surname-first without a separator. Only the exact
+// "given family" FN rendering of Han-only parts is reordered; western names,
+// latin given names and long non-surname "family" fields stay verbatim.
+assert.strictEqual(logic.displayName({ displayName: '黛茜 樊', givenName: '黛茜', familyName: '樊' }), '樊黛茜');
+assert.strictEqual(logic.displayName({ displayName: ' 昊   曹 ', givenName: '昊', familyName: '曹' }), '曹昊');
+assert.strictEqual(logic.displayName({ displayName: '樊黛茜', givenName: '黛茜', familyName: '樊' }), '樊黛茜');
+assert.strictEqual(logic.displayName({ displayName: 'Alice Wang', givenName: 'Alice', familyName: 'Wang' }), 'Alice Wang');
+assert.strictEqual(logic.displayName({ displayName: 'Noora 崔', givenName: 'Noora', familyName: '崔' }), 'Noora 崔');
+assert.strictEqual(logic.displayName({ displayName: '世界 莫名奇妙物语', givenName: '世界', familyName: '莫名奇妙物语' }), '世界 莫名奇妙物语');
+assert.strictEqual(logic.displayLabel({ displayName: '', givenName: '', familyName: '' }), '');
+
 console.log('contactslogic harness: all assertions passed');

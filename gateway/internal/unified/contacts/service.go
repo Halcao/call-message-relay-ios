@@ -347,8 +347,8 @@ func fieldsFromWire(fields []Field) []Field {
 }
 
 func contactLabel(contact Contact) string {
-	if contact.DisplayName != "" {
-		return contact.DisplayName
+	if name := preferredDisplayName(contact.DisplayName, contact.GivenName, contact.FamilyName); name != "" {
+		return name
 	}
 	if composed := composeDisplayName(contact.GivenName, contact.FamilyName); composed != "" {
 		return composed

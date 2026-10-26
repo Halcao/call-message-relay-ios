@@ -50,8 +50,40 @@
     return values;
   }
 
+  // Chinese names read surname-first with no separator. A phone whose
+  // contact display order is "given name, family name" stores the label as
+  // "黛茜 樊"; reorder only that exact given+family rendering of two
+  // Han-only parts, so nicknames and western names stay verbatim. A real
+  // Han surname is 1-2 characters — longer "family names" come from an
+  // account/nickname vCard whose N field was split by a space, and
+  // reordering those produces nonsense.
+  function isHanOnly(value) {
+    return /^[㐀-䶿一-鿿豈-﫿]+$/.test(value || '');
+  }
+  function isHanSurname(value) {
+    return isHanOnly(value) && Array.from(value).length <= 2;
+  }
+  function preferredName(stored, given, family) {
+    stored = String(stored == null ? '' : stored).trim();
+    given = String(given == null ? '' : given).trim();
+    family = String(family == null ? '' : family).trim();
+    if (!stored || !given || !family) return stored;
+    if (!isHanOnly(given) || !isHanSurname(family)) return stored;
+    var collapsed = stored.replace(/\s+/g, ' ');
+    if (collapsed !== given + ' ' + family) return stored;
+    return family + given;
+  }
+
+  // displayLabel is the stored label with only the CJK reordering applied —
+  // no organization/phone fallback — for editable fields that must stay
+  // empty when the owner gave no name.
+  function displayLabel(contact) {
+    return preferredName(contact.displayName, contact.givenName, contact.familyName);
+  }
+
   function displayName(contact) {
-    if (contact.displayName) return String(contact.displayName);
+    var stored = displayLabel(contact);
+    if (stored) return stored;
     if (contact.organization) return String(contact.organization);
     var phones = phoneValues(contact);
     return phones.length ? phones[0] : '未命名联系人';
@@ -164,6 +196,7 @@
     samePhone: samePhone,
     phoneValues: phoneValues,
     displayName: displayName,
+    displayLabel: displayLabel,
     matchesContact: matchesContact,
     suggestions: suggestions,
     contactForPhone: contactForPhone,
