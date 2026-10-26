@@ -58,6 +58,7 @@
       bindPlaceholder: 'BIND CODE',
       bindButton: 'Bind',
       deviceLabel: 'Bound device',
+      browserLabel: 'This browser',
       modeLabel: 'Notify mode',
       subsLabel: 'Browser subscriptions',
       enableButton: 'Allow notifications',
@@ -81,7 +82,13 @@
       browserOn: 'On',
       browserOff: 'Not enabled',
       browserDenied: 'Blocked — allow notifications to enable',
-      clientBack: '‹ Back to Calls / Messages'
+      clientBack: 'Back',
+      pageTitle: 'Settings',
+      statusTitle: 'Status',
+      notifyTitle: 'Notifications',
+      denoiseTitle: 'Call noise reduction',
+      denoiseUplink: 'Reduce noise from my voice',
+      denoiseDownlink: 'Reduce noise from the other side'
     },
     zh: {},
     zhhant: {
@@ -115,7 +122,13 @@
       browserOn: '已開通',
       browserOff: '未開通',
       browserDenied: '通知被阻擋 — 請允許通知後開啟',
-      clientBack: '‹ 返回通話 / 簡訊客戶端'
+      clientBack: '返回',
+      pageTitle: '通知與設定',
+      statusTitle: '狀態',
+      notifyTitle: '通知',
+      denoiseTitle: '通話降噪',
+      denoiseUplink: '我的聲音降噪',
+      denoiseDownlink: '對方的聲音降噪'
     }
   };
   // zh-Hans is the source language embedded in the markup.
@@ -173,6 +186,8 @@
     Array.prototype.forEach.call(radios, function (r) { r.checked = r.value === mode; });
     var subs = data.subscriptions || [];
     $('st-subs').textContent = String(subs.length);
+    // The section only earns its space when there is something to remove.
+    $('subs-section').classList.toggle('hidden', subs.length === 0);
     renderBrowserState();
     var list = $('sub-list');
     list.innerHTML = '';
@@ -227,9 +242,12 @@
   function renderBrowserState() {
     var el = $('st-browser');
     function paint(state) {
-      if (state === 'on') { el.textContent = t('browserOn') || '已开通'; el.className = 'ok'; }
-      else if (state === 'denied') { el.textContent = t('browserDenied') || '通知被阻止'; el.className = 'error'; }
-      else { el.textContent = t('browserOff') || '未开通'; el.className = ''; }
+      // Keep the base class: the value cell's layout depends on it.
+      var tone = state === 'on' ? ' ok' : (state === 'denied' ? ' error' : '');
+      if (state === 'on') { el.textContent = t('browserOn') || '已开通'; }
+      else if (state === 'denied') { el.textContent = t('browserDenied') || '通知被阻止'; }
+      else { el.textContent = t('browserOff') || '未开通'; }
+      el.className = 'value' + tone;
     }
     if (!('serviceWorker' in navigator)) { paint('off'); return; }
     navigator.serviceWorker.getRegistration('/pwa/').then(function (reg) {

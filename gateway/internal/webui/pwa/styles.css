@@ -1,59 +1,264 @@
+/* CallRelay settings / call-fallback page — the same iOS conventions as the
+ * client, in one adaptive sheet:
+ *  - grouped inset lists on a grouped background, not a centered web card;
+ *  - half-pixel hairlines inset from the leading edge;
+ *  - one large title, one compact back bar, no text-link chrome;
+ *  - full light and dark palettes tied to prefers-color-scheme.
+ * call.html shares this sheet: its .card / .brand / .button rules are kept
+ * (plain card + buttons) so the incoming-call fallback still reads.
+ */
 :root {
-  --bg: #0b1220;
-  --card: #141d33;
-  --text: #eef2fa;
-  --muted: #93a0b8;
-  --accent: #0a84ff;
-  --danger: #ff453a;
-  --ok: #30d158;
+  --bg: #f2f2f7;
+  --group: #ffffff;
+  --fg: #000000;
+  --fg-2: rgba(60, 60, 67, 0.60);
+  --fg-3: rgba(60, 60, 67, 0.34);
+  --hairline: rgba(60, 60, 67, 0.16);
+  --sep: rgba(60, 60, 67, 0.18);
+  --fill: rgba(120, 120, 128, 0.12);
+  --fill-2: rgba(120, 120, 128, 0.22);
+  --accent: #007aff;
+  --danger: #ff3b30;
+  --ok: #34c759;
+  --switch-off: #e9e9eb;
+  --nav-bg: #f9f9f9;
+  --warn-bg: rgba(255, 149, 0, 0.14);
 }
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #000000;
+    --group: #1c1c1e;
+    --fg: #ffffff;
+    --fg-2: rgba(235, 235, 245, 0.62);
+    --fg-3: rgba(235, 235, 245, 0.34);
+    --hairline: rgba(84, 84, 88, 0.52);
+    --sep: rgba(84, 84, 88, 0.52);
+    --fill: rgba(120, 120, 128, 0.22);
+    --fill-2: rgba(120, 120, 128, 0.34);
+    --accent: #0a84ff;
+    --danger: #ff453a;
+    --ok: #30d158;
+    --switch-off: #39393d;
+    --nav-bg: #1c1c1e;
+    --warn-bg: rgba(255, 149, 0, 0.18);
+  }
+}
+
 * { box-sizing: border-box; }
-/* Installed (standalone, viewport-fit=cover) pages must stay clear of the
- * status bar; touch-action kills the double-tap zoom. */
+/* touch-action: manipulation actually disables double-tap zoom on iOS; the
+ * viewport's user-scalable flags are ignored since iOS 10. */
 html { touch-action: manipulation; -webkit-text-size-adjust: 100%; }
-html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
-  font: -apple-system-body, -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
-  -webkit-tap-highlight-color: transparent; }
-body { display: flex; justify-content: center;
-  padding: calc(24px + env(safe-area-inset-top)) 16px
-           calc(24px + env(safe-area-inset-bottom)); }
-.card { width: 100%; max-width: 560px; background: var(--card); border-radius: 18px;
-  padding: 24px 20px; }
-.brand { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
-.client-back { margin: -4px 0 14px; font-size: 15px; }
-.client-back a { display: inline-block; padding: 6px 10px; border-radius: 10px;
-  background: #1a2540; text-decoration: none; }
-.logo { width: 56px; height: 56px; border-radius: 14px; }
-h1 { font-size: 22px; margin: 0; }
-h2 { font-size: 18px; margin: 18px 0 8px; }
-h3 { font-size: 15px; margin: 18px 0 8px; color: var(--muted); }
-.muted { color: var(--muted); }
-.small { font-size: 12px; margin-top: 24px; }
+html, body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  font-size: 17px; line-height: 1.35;
+  -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+  -webkit-tap-highlight-color: transparent;
+}
+body { min-height: 100dvh; }
+.page { max-width: 560px; margin: 0 auto;
+  padding-bottom: calc(32px + env(safe-area-inset-bottom)); }
+
 .hidden { display: none !important; }
-.warn { background: #3a2f10; border-radius: 10px; padding: 12px; }
+.muted { color: var(--fg-2); }
 .error { color: var(--danger); }
 .ok { color: var(--ok); }
-.row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 10px 0; }
-input[type="text"], input:not([type]) { flex: 1; min-width: 160px; padding: 12px;
-  border-radius: 10px; border: 1px solid #2a3550; background: #0f1830; color: var(--text);
-  font-size: 16px; letter-spacing: 1px; }
-button, .button { padding: 12px 18px; border-radius: 12px; border: 0; font-size: 16px;
-  background: #24304d; color: var(--text); cursor: pointer; text-decoration: none;
-  display: inline-block; text-align: center; }
-button.primary, .button.primary { background: var(--accent); color: #fff; }
-button.danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
-button:disabled { opacity: 0.5; cursor: default; }
-.peer { font-size: 30px; font-weight: 600; margin: 20px 0 4px; text-align: center; }
-#state-text { text-align: center; }
-#ringing .row { justify-content: center; margin: 22px 0; }
-.kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 12px 0; }
-.kv dt { color: var(--muted); }
-.kv dd { margin: 0; }
-.sublist { list-style: none; padding: 0; margin: 10px 0; }
-.sublist li { display: flex; justify-content: space-between; align-items: center;
-  gap: 10px; padding: 10px 12px; border: 1px solid #24304d; border-radius: 10px;
-  margin-bottom: 8px; font-size: 14px; }
-.sublist .host { color: var(--muted); word-break: break-all; }
-label { display: flex; gap: 6px; align-items: center; font-size: 15px; }
-summary { cursor: pointer; color: var(--muted); }
 a { color: var(--accent); }
+
+/* ---------------- navigation bar ---------------- */
+
+/* Sticky + safe-area padding keeps the bar out from under the notch in an
+ * installed (standalone, viewport-fit=cover) web app. At rest the bar is
+ * invisible (the large title lives in the page); it takes on the standard
+ * bar surface + hairline once content scrolls underneath. */
+.nav {
+  position: sticky; top: 0; z-index: 10;
+  display: flex; align-items: center; min-height: 44px;
+  padding: env(safe-area-inset-top) 8px 0;
+  background: transparent;
+  transition: background-color .2s ease;
+}
+.nav.scrolled { background: var(--nav-bg); }
+/* The hairline only exists once there is content underneath, the way a
+ * standard navigation bar picks one up after the large title scrolls away. */
+.nav::after {
+  content: ''; position: absolute; left: 0; right: 0; bottom: 0;
+  height: .5px; background: var(--hairline); opacity: 0;
+  transition: opacity .2s ease;
+}
+.nav.scrolled::after { opacity: 1; }
+.back {
+  display: inline-flex; align-items: center; gap: 3px;
+  min-height: 44px; padding: 0 10px 0 2px;
+  color: var(--accent); text-decoration: none; font-size: 17px;
+}
+.back:active { opacity: .5; }
+.back svg { display: block; }
+
+.large-title { margin: 2px 16px 0; font-size: 34px; line-height: 41px;
+  font-weight: 700; letter-spacing: -.02em; }
+
+.section-title { margin: 22px 32px 7px; font-size: 13px; font-weight: 500;
+  color: var(--fg-2); }
+
+/* ---------------- grouped list ---------------- */
+
+.group { margin: 0 16px; background: var(--group); border-radius: 12px;
+  overflow: hidden; }
+.cell { position: relative; display: flex; align-items: center; gap: 12px;
+  min-height: 44px; padding: 11px 16px; font-size: 17px; }
+.cell + .cell::before {
+  content: ''; position: absolute; left: 16px; right: 0; top: 0;
+  height: .5px; background: var(--hairline);
+}
+.cell-label { flex: 1; min-width: 0; }
+.value { margin-left: auto; max-width: 62%; text-align: right; color: var(--fg-2);
+  overflow-wrap: anywhere; }
+.value.ok { color: var(--ok); }
+.value.error { color: var(--danger); }
+
+.group-hint { margin: 0; padding: 12px 16px; font-size: 15px; line-height: 1.4;
+  color: var(--fg-2); }
+.group-hint.error { color: var(--danger); padding-top: 0; }
+.group-hint + .field-row { border-top: .5px solid var(--hairline); }
+
+.field-row { display: flex; padding: 0 16px; }
+.field-row input {
+  flex: 1; min-width: 0; margin: 0; padding: 12px 0;
+  border: 0; background: transparent; color: var(--fg);
+  font: inherit; font-size: 17px; letter-spacing: 1.5px; text-transform: uppercase;
+}
+.field-row input::placeholder { color: var(--fg-3); letter-spacing: 0;
+  text-transform: none; }
+.field-row input:focus { outline: none; }
+
+/* ---------------- buttons ---------------- */
+
+.btn {
+  display: block; width: calc(100% - 32px); margin: 14px 16px 0;
+  padding: 14px 16px; border: 0; border-radius: 12px;
+  background: var(--fill); color: var(--fg);
+  font: inherit; font-size: 17px; font-weight: 600; text-align: center;
+  text-decoration: none; cursor: pointer;
+}
+.btn.primary { background: var(--accent); color: #fff; }
+.btn.danger { background: transparent; color: var(--danger); }
+.btn:active { opacity: .85; }
+.btn:disabled { opacity: .5; cursor: default; }
+
+/* A plain row that acts like a button ("Allow notifications"), the way
+ * Settings exposes actions instead of painted web buttons. */
+.action {
+  display: block; width: 100%; min-height: 44px; padding: 13px 16px;
+  border: 0; background: transparent; color: var(--accent);
+  font: inherit; font-size: 17px; text-align: center; cursor: pointer;
+}
+.action + .action { border-top: .5px solid var(--hairline); }
+.action:active { background: var(--fill); }
+.action.danger { color: var(--danger); }
+
+/* ---------------- radio choices ---------------- */
+
+.choice { cursor: pointer; }
+/* Visually hidden but still focusable: the label owns the hit target. */
+.choice input {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+  border: 0; clip: rect(0 0 0 0); clip-path: inset(50%); overflow: hidden;
+  white-space: nowrap;
+}
+.check {
+  width: 20px; height: 20px; flex: none; margin-left: auto;
+  background-color: transparent; border-radius: 4px;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M4 12.5l5 5L20 6.5' fill='none' stroke='%23fff' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / 18px 18px no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M4 12.5l5 5L20 6.5' fill='none' stroke='%23fff' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / 18px 18px no-repeat;
+  transition: background-color .15s ease;
+}
+.choice input:checked + .check { background-color: var(--accent); }
+.choice input:focus-visible + .check { box-shadow: 0 0 0 3px rgba(0, 122, 255, .28); }
+
+/* ---------------- switches ---------------- */
+
+.switch { position: relative; flex: none; margin-left: auto;
+  width: 51px; height: 31px; }
+.switch input {
+  position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%;
+  margin: 0; opacity: 0; -webkit-appearance: none; appearance: none;
+}
+.switch .track {
+  position: absolute; inset: 0; border-radius: 999px;
+  background: var(--switch-off);
+  transition: background-color .22s ease;
+}
+.switch .track::after {
+  content: ''; position: absolute; top: 2px; left: 2px;
+  width: 27px; height: 27px; border-radius: 50%;
+  background: #fff; box-shadow: 0 2px 4px rgba(0, 0, 0, .18);
+  transition: transform .22s cubic-bezier(.25, .1, .25, 1);
+}
+.switch input:checked + .track { background: var(--ok); }
+.switch input:checked + .track::after { transform: translateX(20px); }
+
+/* ---------------- subscriptions ---------------- */
+
+.list { list-style: none; margin: 0 16px; padding: 0; }
+#sub-list li { position: relative; display: flex; align-items: center; gap: 12px;
+  min-height: 44px; padding: 11px 16px; }
+#sub-list li + li::before {
+  content: ''; position: absolute; left: 16px; right: 0; top: 0;
+  height: .5px; background: var(--hairline);
+}
+#sub-list .host { flex: 1; min-width: 0; font-size: 15px; line-height: 1.3;
+  color: var(--fg-2); word-break: break-word; }
+#sub-list button { flex: none; padding: 6px 0 6px 8px; border: 0;
+  background: none; color: var(--accent); font: inherit; font-size: 15px;
+  cursor: pointer; }
+
+/* ---------------- unbind ---------------- */
+
+.unbind-group { margin-top: 26px; }
+.unbind summary { list-style: none; cursor: pointer; }
+.unbind summary::-webkit-details-marker { display: none; }
+.unbind summary .cell-label { color: var(--danger); }
+.chev { width: 8px; height: 8px; flex: none; margin-left: auto; margin-right: 3px;
+  border-right: 1.8px solid var(--fg-3); border-bottom: 1.8px solid var(--fg-3);
+  transform: rotate(45deg); transition: transform .2s ease; }
+.unbind[open] .chev { transform: rotate(-135deg); }
+.unbind .action { border-top: .5px solid var(--hairline); }
+
+/* ---------------- notes and status lines ---------------- */
+
+.note, .warn {
+  margin: 18px 16px 0; padding: 12px 14px; border-radius: 12px;
+  background: var(--group); color: var(--fg-2);
+  font-size: 15px; line-height: 1.4;
+}
+.warn { background: var(--warn-bg); color: var(--fg); }
+
+.status-line { margin: 8px 32px 0; font-size: 14px; line-height: 1.4;
+  color: var(--fg-2); }
+.status-line.error { color: var(--danger); }
+.status-line.ok { color: var(--ok); }
+.status-line:empty { display: none; }
+
+/* ---------------- call.html fallback card ---------------- */
+
+.card { width: calc(100% - 32px); max-width: 480px; margin: 24px auto;
+  padding: 20px; background: var(--group); border-radius: 16px; }
+.brand { display: flex; gap: 12px; align-items: center; margin-bottom: 8px; }
+.logo { width: 52px; height: 52px; border-radius: 13px; }
+.card h1 { margin: 0; font-size: 24px; font-weight: 700; letter-spacing: -.02em; }
+.card h2 { margin: 18px 0 8px; font-size: 20px; font-weight: 600; }
+.card h3 { margin: 18px 0 8px; font-size: 14px; color: var(--fg-2); }
+.peer { font-size: 30px; font-weight: 600; margin: 18px 0 4px; text-align: center; }
+#state-text { text-align: center; color: var(--fg-2); }
+#ringing .row { justify-content: center; margin: 20px 0; }
+.small { font-size: 13px; color: var(--fg-2); margin-top: 18px; }
+.row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center;
+  margin: 12px 0; }
+.button {
+  display: inline-block; padding: 12px 18px; border: 0; border-radius: 12px;
+  background: var(--fill); color: var(--fg); text-decoration: none;
+  font-size: 17px; text-align: center;
+}
+.button.primary { background: var(--accent); color: #fff; }

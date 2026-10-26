@@ -315,8 +315,13 @@
       return json(200, { sessionToken: 'preview', vapidPublicKey: 'preview', scope: 'client' });
     }
     if (path === '/api/v2/webpush/session' && method === 'GET') {
+      // ?unbound=1 previews the first-run bind screen.
+      if (/[?&]unbound=1/.test(location.search)) {
+        return json(401, { code: 'CB-V2-401', message: 'not enrolled' });
+      }
       return json(200, { subscriptionCount: 0, notifyMode: 'web',
-        vapidPublicKey: 'preview-vapid', deviceId: 'dev_preview' });
+        vapidPublicKey: 'preview-vapid', deviceId: 'dev_preview',
+        deviceName: '预览浏览器', subscriptions: [] });
     }
     if (path === '/api/v2/webpush/subscription' && method === 'PUT') {
       return json(200, { ok: true });
