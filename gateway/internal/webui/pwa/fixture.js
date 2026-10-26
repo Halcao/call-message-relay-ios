@@ -54,6 +54,13 @@
       phones: [{ label: 'CELL', value: '+15550160001' }, { label: 'WORK', value: '555-0123' }] },
     { id: 'ct_fixture_2', displayName: '李四', searchKey: 'lisi ls 5474', source: 'vcard',
       phones: [{ label: 'HOME', value: '555-0789' }] },
+    // Deliberately not in pinyin order: the client sorts the list itself.
+    { id: 'ct_fixture_3', displayName: '赵六', searchKey: 'zhaoliu zl', source: 'vcard',
+      phones: [{ label: 'CELL', value: '555-0203' }] },
+    { id: 'ct_fixture_4', displayName: '阿明', searchKey: 'aming am', source: 'sync',
+      phones: [{ label: 'CELL', value: '555-0201' }] },
+    { id: 'ct_fixture_5', displayName: '陈晓', searchKey: 'chenxiao cx', source: 'vcard',
+      phones: [{ label: 'CELL', value: '555-0202' }] },
   ];
   var CONTACT_REVISION = 2;
 

@@ -1005,7 +1005,9 @@
           ? '换个姓名、号码或拼音试试。'
           : '可导入 .vcf 文件，或在手机 App 中同步系统通讯录。');
     }
-    state.contacts.forEach(function (contact) {
+    // The gateway returns newest-first for sync; the address book reads in
+    // pinyin order, so sort a copy and leave the fetched page untouched.
+    CL.sortContacts(state.contacts).forEach(function (contact) {
       list.appendChild(contactRow(contact));
     });
     if (state.contactsHasMore) {

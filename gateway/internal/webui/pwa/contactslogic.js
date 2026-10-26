@@ -89,6 +89,38 @@
     return phones.length ? phones[0] : '未命名联系人';
   }
 
+  // Address-book order is pinyin order. Intl's zh collation sorts Han
+  // characters by their pinyin reading (阿 < 安 < 曾 < 陈 < 李 < 王 < 张 < 赵)
+  // rather than by code point, so 张 does not land before 陈. Latin names
+  // keep their alphabetical order after the Han block, which is how ICU
+  // defines zh ordering. Fall back to localeCompare where Intl is absent.
+  var nameCollator = null;
+  function compareNames(a, b) {
+    if (nameCollator === null) {
+      try {
+        nameCollator = new Intl.Collator('zh-Hans-CN');
+      } catch (e) {
+        nameCollator = false;
+      }
+    }
+    if (nameCollator) return nameCollator.compare(a, b);
+    return String(a).localeCompare(String(b), 'zh-Hans-CN');
+  }
+
+  // compareContacts is a total order: name first, id as the tie-break so two
+  // contacts with the same label never swap places between renders.
+  function compareContacts(a, b) {
+    var byName = compareNames(displayName(a), displayName(b));
+    if (byName) return byName;
+    var left = String(a && a.id || '');
+    var right = String(b && b.id || '');
+    return left < right ? -1 : (left > right ? 1 : 0);
+  }
+
+  function sortContacts(contacts) {
+    return (contacts || []).slice().sort(compareContacts);
+  }
+
   // matchesContact returns {match, isNameMatch, phone, score}. Numeric queries
   // match number fragments; text queries match the name and the precomputed
   // pinyin/T9 search key the phone app supplies at sync time.
@@ -149,7 +181,7 @@
     });
     results.sort(function (a, b) {
       if (a.score !== b.score) return a.score - b.score;
-      return a.name.localeCompare(b.name, 'zh-Hans-CN');
+      return compareNames(a.name, b.name);
     });
     if (limit && limit > 0) results = results.slice(0, limit);
     return results;
@@ -197,6 +229,9 @@
     phoneValues: phoneValues,
     displayName: displayName,
     displayLabel: displayLabel,
+    compareNames: compareNames,
+    compareContacts: compareContacts,
+    sortContacts: sortContacts,
     matchesContact: matchesContact,
     suggestions: suggestions,
     contactForPhone: contactForPhone,

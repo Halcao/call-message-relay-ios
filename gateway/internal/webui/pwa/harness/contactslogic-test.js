@@ -72,4 +72,41 @@ assert.strictEqual(logic.displayName({ displayName: 'Noora 崔', givenName: 'Noo
 assert.strictEqual(logic.displayName({ displayName: '世界 莫名奇妙物语', givenName: '世界', familyName: '莫名奇妙物语' }), '世界 莫名奇妙物语');
 assert.strictEqual(logic.displayLabel({ displayName: '', givenName: '', familyName: '' }), '');
 
+// 10. The address book reads in pinyin order (阿 < 陈 < 李 < 欧阳 < 王 < 张 < 赵),
+// not by code point — 张 must not sort before 陈 just because U+5F20 > U+9648.
+function contact(id, displayName, extra) {
+  return Object.assign({ id, displayName }, extra || {});
+}
+const unsorted = [
+  contact('c1', '张三'), contact('c2', '李四'), contact('c3', '王五'),
+  contact('c4', '阿明'), contact('c5', '陈'), contact('c6', '欧阳'),
+];
+assert.deepStrictEqual(
+  logic.sortContacts(unsorted).map((c) => c.displayName),
+  ['阿明', '陈', '李四', '欧阳', '王五', '张三']
+);
+// Sorting never reorders the caller's array.
+assert.deepStrictEqual(
+  unsorted.map((c) => c.displayName),
+  ['张三', '李四', '王五', '阿明', '陈', '欧阳']
+);
+// Equal labels fall back to id, so rows never swap between renders.
+assert.deepStrictEqual(
+  logic.sortContacts([contact('b', '张三'), contact('a', '张三')]).map((c) => c.id),
+  ['a', 'b']
+);
+// The surname-first label is what sorts: 樊黛茜 (fan) precedes 李四 (li).
+assert.deepStrictEqual(
+  logic.sortContacts([
+    { id: 'x', displayName: '黛茜 樊', givenName: '黛茜', familyName: '樊' },
+    contact('y', '李四'),
+  ]).map((c) => logic.displayName(c)),
+  ['樊黛茜', '李四']
+);
+// Latin labels follow the Han block, per ICU's zh ordering.
+assert.deepStrictEqual(
+  logic.sortContacts([contact('l', 'Alice Wang'), contact('h', '张三')]).map((c) => c.id),
+  ['h', 'l']
+);
+
 console.log('contactslogic harness: all assertions passed');
