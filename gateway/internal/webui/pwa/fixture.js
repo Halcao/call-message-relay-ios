@@ -71,6 +71,21 @@
   }
 
   var CALLS = {};   // id -> simulated call record
+  // Synthetic history so the call-log tab is reviewable without placing a
+  // real call. Every number is a reserved 555 number.
+  var CALL_HISTORY = [
+    { id: 'demo-call-h1', lineId: 'line1', lineName: '主卡', peer: '555-0123',
+      direction: 'inbound', state: 'ended', startedAt: NOW - 8 * 60000,
+      connectedAt: null, endedAt: NOW - 8 * 60000, endReason: 'missed' },
+    { id: 'demo-call-h2', lineId: 'line1', lineName: '主卡', peer: '555-0456',
+      direction: 'outbound', state: 'ended', startedAt: NOW - 3 * 3600000,
+      connectedAt: NOW - 3 * 3600000 + 4000, endedAt: NOW - 3 * 3600000 + 68000,
+      endReason: 'hangup' },
+    { id: 'demo-call-h3', lineId: 'line2', lineName: '流量卡', peer: '555-0789',
+      direction: 'inbound', state: 'ended', startedAt: NOW - 26 * 3600000,
+      connectedAt: NOW - 26 * 3600000 + 1000, endedAt: NOW - 26 * 3600000 + 121000,
+      endReason: 'hangup' },
+  ];
   var EVENT_LISTENERS = [];
 
   function fixtureCall(id, peer, direction) {
@@ -265,8 +280,9 @@
       }, 30000);
       return json(201, call);
     }
-    if (path === '/api/v2/calls' && method === 'GET') {
-      return json(200, { calls: Object.keys(CALLS).map(function (k) { return CALLS[k]; }) });
+    if (path.split('?')[0] === '/api/v2/calls' && method === 'GET') {
+      var live = Object.keys(CALLS).map(function (k) { return CALLS[k]; });
+      return json(200, { calls: live.concat(CALL_HISTORY) });
     }
     var callMatch = path.match(/^\/api\/v2\/calls\/([^/]+)(?:\/(answer|reject|hangup))?$/);
     if (callMatch) {

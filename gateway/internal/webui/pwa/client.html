@@ -41,18 +41,30 @@
   <!-- 主界面 -->
   <section id="main-view" class="hidden">
     <header id="topbar">
-      <select id="line-picker" aria-label="发送线路"></select>
-      <span id="conn-dot" title="连接状态"></span>
-      <button id="messages-select-all" class="topbar-action hidden" type="button">全选</button>
-      <button id="messages-edit" class="topbar-action hidden" type="button" aria-label="编辑短信">编辑</button>
-      <button id="rules-link" class="topbar-action" type="button" aria-label="骚扰拦截与录音">骚扰拦截</button>
-      <a id="settings-link" href="/pwa/" aria-label="通知与设置">
-        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M19.1 13.1c.1-.4.1-.8.1-1.1s0-.7-.1-1.1l2.1-1.6a.5.5 0 0 0 .1-.7l-2-3.4a.5.5 0 0 0-.6-.2l-2.4 1a7.3 7.3 0 0 0-1.9-1.1L13.8 2a.5.5 0 0 0-.5-.4h-4a.5.5 0 0 0-.5.4l-.4 2.6a7.3 7.3 0 0 0-1.9 1.1l-2.4-1a.5.5 0 0 0-.6.2l-2 3.4a.5.5 0 0 0 .1.7l2.1 1.6c-.1.4-.1.8-.1 1.1s0 .7.1 1.1l-2.1 1.6a.5.5 0 0 0-.1.7l2 3.4c.1.2.4.3.6.2l2.4-1c.6.5 1.2.8 1.9 1.1l.4 2.6c0 .2.2.4.5.4h4c.2 0 .4-.2.5-.4l.4-2.6a7.3 7.3 0 0 0 1.9-1.1l2.4 1c.2.1.5 0 .6-.2l2-3.4a.5.5 0 0 0-.1-.7l-2.1-1.6zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"/></svg>
-      </a>
+      <div class="nav-leading">
+        <h1 id="nav-title">电话</h1>
+        <span id="conn-dot" title="连接状态" aria-hidden="true"></span>
+      </div>
+      <div class="nav-actions">
+        <button id="messages-select-all" class="nav-text hidden" type="button">全选</button>
+        <button id="messages-edit" class="nav-text hidden" type="button" aria-label="编辑短信">编辑</button>
+        <button id="rules-link" class="nav-icon" type="button" aria-label="骚扰拦截与录音" title="骚扰拦截与录音">
+          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M12 3.2 19 6v5.1c0 4.3-2.9 7.8-7 9.7-4.1-1.9-7-5.4-7-9.7V6z"/><path d="M9.2 12.1l2 2 3.6-4" stroke-linecap="round"/></svg>
+        </button>
+        <a id="settings-link" class="nav-icon" href="/pwa/" aria-label="通知与设置" title="通知与设置">
+          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.1"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.56V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.9 19.3a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.7 15a1.7 1.7 0 0 0-1.56-1H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.7 9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.7a1.7 1.7 0 0 0 1-1.56V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.3 9v.09a1.7 1.7 0 0 0 1.56 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1z"/></svg>
+        </a>
+      </div>
     </header>
 
     <!-- 拨号 -->
     <section id="tab-dialer" class="tab">
+      <div class="dial-line">
+        <span class="line-seg">
+          <select id="line-picker" class="line-capsule" aria-label="拨号线路"></select>
+          <svg viewBox="0 0 10 10" width="10" height="10" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4l3 3 3-3"/></svg>
+        </span>
+      </div>
       <div id="dial-display" aria-live="polite"></div>
       <div id="dial-suggestions" class="suggestions hidden"></div>
       <div id="keypad"></div>
@@ -61,7 +73,9 @@
         <button id="dial-call" class="call-btn" aria-label="拨打">
           <svg viewBox="0 0 24 24" width="30" height="30"><path fill="currentColor" d="M6.6 10.8c1.4 2.8 3.8 5.1 6.6 6.6l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C10.8 21 3 13.2 3 4c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.2.2 2.4.6 3.6.1.3 0 .7-.2 1l-2.3 2.2z"/></svg>
         </button>
-        <button id="dial-delete" class="key ghost" aria-label="删除一位">⌫</button>
+        <button id="dial-delete" class="key ghost" aria-label="删除一位">
+          <svg viewBox="0 0 28 20" width="30" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 2h13.2A2.5 2.5 0 0 1 26 4.5v11a2.5 2.5 0 0 1-2.5 2.5H10.3L2 10z"/><path d="M14.2 7.4l5.2 5.2M19.4 7.4l-5.2 5.2"/></svg>
+        </button>
       </div>
     </section>
 
@@ -74,23 +88,36 @@
       </div>
       <div id="thread-view" class="hidden">
         <header id="thread-header">
-          <button id="thread-back" aria-label="返回">‹</button>
-          <div class="thread-peer"><div class="avatar" id="thread-avatar"></div><span id="thread-name"></span></div>
-          <select id="thread-line" aria-label="对话线路"></select>
-          <button id="thread-call" aria-label="呼叫该号码">☎</button>
-          <button id="thread-menu" aria-label="更多">⋯</button>
+          <button id="thread-back" class="nav-icon" aria-label="返回">
+            <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 4.5 7.5 12l7.5 7.5"/></svg>
+          </button>
+          <div class="thread-id">
+            <div class="thread-name-row">
+              <span class="avatar sm" id="thread-avatar"></span>
+              <span id="thread-name"></span>
+            </div>
+            <select id="thread-line" class="line-pill" aria-label="对话线路"></select>
+          </div>
+          <button id="thread-call" class="nav-icon" aria-label="呼叫该号码">
+            <svg viewBox="0 0 24 24" width="21" height="21" aria-hidden="true"><path fill="currentColor" d="M6.6 10.8c1.4 2.8 3.8 5.1 6.6 6.6l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C10.8 21 3 13.2 3 4c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.2.2 2.4.6 3.6.1.3 0 .7-.2 1l-2.3 2.2z"/></svg>
+          </button>
+          <button id="thread-menu" class="nav-icon" aria-label="更多">
+            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><circle cx="5" cy="12" r="1.9" fill="currentColor"/><circle cx="12" cy="12" r="1.9" fill="currentColor"/><circle cx="19" cy="12" r="1.9" fill="currentColor"/></svg>
+          </button>
         </header>
         <div id="thread-messages"></div>
         <footer id="composer">
           <textarea id="composer-input" rows="1" maxlength="10000" placeholder="信息·短信"></textarea>
-          <button id="composer-send" class="send-btn" aria-label="发送">↑</button>
+          <button id="composer-send" class="send-btn" aria-label="发送">
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5"/></svg>
+          </button>
         </footer>
       </div>
       <div id="compose-view" class="hidden">
         <header id="compose-header">
-          <button id="compose-cancel">取消</button>
+          <button id="compose-cancel" type="button">取消</button>
           <strong>新信息</strong>
-          <button id="compose-send" class="link">发送</button>
+          <button id="compose-send" class="strong" type="button">发送</button>
         </header>
         <div class="compose-row"><label for="compose-to">收件人</label>
           <input id="compose-to" autocomplete="off" inputmode="tel" placeholder="输入号码">
@@ -114,9 +141,16 @@
     <!-- 通讯录 -->
     <section id="tab-contacts" class="tab hidden">
       <div id="contacts-toolbar">
-        <input id="contacts-search" autocomplete="off" placeholder="搜索姓名、号码或拼音">
-        <button id="contacts-import" class="topbar-action" type="button">导入 .vcf</button>
-        <button id="contacts-export" class="topbar-action" type="button">导出</button>
+        <div class="search-field">
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6.4"/><path d="m16 16 4.2 4.2"/></svg>
+          <input id="contacts-search" type="search" autocomplete="off" placeholder="搜索姓名、号码或拼音">
+        </div>
+        <button id="contacts-import" class="nav-icon" type="button" aria-label="导入 vCard" title="导入 .vcf">
+          <svg viewBox="0 0 24 24" width="21" height="21" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5v10m0 0 3.8-3.8M12 13.5 8.2 9.7M4.5 16.5v2a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-2"/></svg>
+        </button>
+        <button id="contacts-export" class="nav-icon" type="button" aria-label="导出通讯录" title="导出 .vcf">
+          <svg viewBox="0 0 24 24" width="21" height="21" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 14.5v-10m0 0L8.2 8.3M12 4.5l3.8 3.8M4.5 16.5v2a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-2"/></svg>
+        </button>
         <input id="contacts-file" type="file" accept=".vcf,text/vcard,text/x-vcard" class="hidden">
       </div>
       <div id="contacts-preview" class="hidden">
@@ -136,16 +170,16 @@
 
     <nav id="tabbar">
       <button class="tabbtn active" data-tab="dialer" aria-label="电话">
-        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M3 5a2 2 0 0 1 2-2h3l2 5-2.2 1.6a13 13 0 0 0 6.6 6.6L16 14l5 2v3a2 2 0 0 1-2 2C9.8 21 3 14.2 3 5z"/></svg>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6.6 10.8c1.4 2.8 3.8 5.1 6.6 6.6l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C10.8 21 3 13.2 3 4c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.2.2 2.4.6 3.6.1.3 0 .7-.2 1l-2.3 2.2z"/></svg>
         <span>电话</span></button>
       <button class="tabbtn" data-tab="messages" aria-label="短信">
-        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M4 4h16a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H8l-5 4V6a2 2 0 0 1 1-2z"/></svg>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 3.4c-5.2 0-9.4 3.5-9.4 7.9 0 2.5 1.4 4.7 3.6 6.1-.1 1.2-.7 2.3-1.7 3.2 1.7-.1 3.2-.7 4.4-1.7.9.2 2 .3 3.1.3 5.2 0 9.4-3.5 9.4-7.9S17.2 3.4 12 3.4z"/></svg>
         <span>短信</span></button>
       <button class="tabbtn" data-tab="calls" aria-label="通话记录">
-        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M12 3a9 9 0 1 0 9 9h-2a7 7 0 1 1-7-7V3zm1 4v5.4l3.6 2.1 1-1.7-2.6-1.5V7h-2z"/></svg>
+        <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8.4"/><path d="M12 7.3V12l3.1 1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>通话记录</span></button>
       <button class="tabbtn" data-tab="contacts" aria-label="通讯录">
-        <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M5 3h12a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zm2 4v2h8V7H7zm0 4v2h8v-2H7zm0 4v2h5v-2H7z"/></svg>
+        <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8.4"/><circle cx="12" cy="10" r="2.7"/><path d="M6.7 18.4c.8-2.3 2.8-3.8 5.3-3.8s4.5 1.5 5.3 3.8" stroke-linecap="round"/></svg>
         <span>通讯录</span></button>
     </nav>
   </section>
@@ -202,12 +236,13 @@
     <div class="call-card">
       <div class="avatar large" id="call-avatar"></div>
       <p id="call-peer">—</p>
+      <p id="call-sub"></p>
       <p id="call-state" class="muted">—</p>
       <div class="call-controls" id="call-controls"></div>
     </div>
   </section>
 
-  <p id="toast" class="hidden" role="status"></p>
+  <p id="toast" class="hidden" role="status" aria-live="polite"></p>
 </main>
 <script src="/pwa/pcmu.js"></script>
 <script src="/pwa/audio.js"></script>

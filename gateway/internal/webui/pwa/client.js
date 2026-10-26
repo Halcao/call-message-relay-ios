@@ -44,8 +44,10 @@
     threadLinePrefs: {},      // threadKey -> lineId (UI preference, localStorage OK)
     peers: [],                // history peers for suggestions (no contacts access)
     threads: [],
+    threadsError: false,
     openThreadKey: null,
     calls: [],                // /api/v2/calls history (own tab)
+    callsError: false,
     activeTab: 'dialer',
     call: null,               // active call controller
     events: null,
@@ -69,8 +71,63 @@
     var node = $('toast');
     node.textContent = text;
     node.classList.remove('hidden');
+    // Two frames so the transition runs from the hidden state.
+    requestAnimationFrame(function () { node.classList.add('show'); });
     clearTimeout(toast.timer);
-    toast.timer = setTimeout(function () { node.classList.add('hidden'); }, 3200);
+    clearTimeout(toast.hideTimer);
+    toast.timer = setTimeout(function () {
+      node.classList.remove('show');
+      toast.hideTimer = setTimeout(function () { node.classList.add('hidden'); }, 200);
+    }, 3000);
+  }
+
+  /* Empty / failure states: icon, short title, one-line hint. */
+  var EMPTY_ICONS = {
+    messages: '<svg viewBox="0 0 24 24" width="44" height="44" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M4.5 5.5h15a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H9l-4.5 3.4V7.5a2 2 0 0 1 0-2z" stroke-linejoin="round"/></svg>',
+    calls: '<svg viewBox="0 0 24 24" width="44" height="44" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="12" cy="12" r="8.4"/><path d="M12 7.3V12l3.1 1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    contacts: '<svg viewBox="0 0 24 24" width="44" height="44" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="12" cy="12" r="8.4"/><circle cx="12" cy="10" r="2.7"/><path d="M6.7 18.4c.8-2.3 2.8-3.8 5.3-3.8s4.5 1.5 5.3 3.8" stroke-linecap="round"/></svg>',
+  };
+
+  function emptyState(container, icon, title, hint) {
+    var wrap = el('div', 'empty');
+    var iconNode = el('div', 'empty-icon');
+    iconNode.innerHTML = EMPTY_ICONS[icon] || '';
+    wrap.appendChild(iconNode);
+    wrap.appendChild(el('div', 'empty-title', title));
+    if (hint) { wrap.appendChild(el('div', 'empty-hint', hint)); }
+    container.appendChild(wrap);
+  }
+
+  /* Native action sheet: the secondary actions of a row live here instead of
+   * as a stack of blue text links inside the row. */
+  function actionSheet(title, items) {
+    var backdrop = el('div', 'sheet-backdrop');
+    var sheet = el('div', 'sheet');
+    if (title) { sheet.appendChild(el('div', 'sheet-title', title)); }
+    var group = el('div', 'sheet-group');
+    items.forEach(function (item) {
+      var btn = el('button', 'sheet-item' + (item.danger ? ' danger' : ''), item.label);
+      btn.type = 'button';
+      btn.addEventListener('click', function () {
+        close();
+        if (item.onSelect) { item.onSelect(); }
+      });
+      group.appendChild(btn);
+    });
+    var cancel = el('button', 'sheet-cancel', '取消');
+    cancel.type = 'button';
+    cancel.addEventListener('click', close);
+    sheet.appendChild(group);
+    sheet.appendChild(cancel);
+    backdrop.appendChild(sheet);
+    function close() {
+      if (backdrop.parentNode) { backdrop.parentNode.removeChild(backdrop); }
+    }
+    backdrop.addEventListener('click', function (event) {
+      if (event.target === backdrop) { close(); }
+    });
+    document.body.appendChild(backdrop);
+    requestAnimationFrame(function () { backdrop.classList.add('open'); });
   }
 
   /* Native-style destructive confirmation (no browser confirm() so the
@@ -207,12 +264,14 @@
     });
   }
 
-  function fillLinePicker(select, selected, lines) {
+  function fillLinePicker(select, selected, lines, shortNames) {
     select.textContent = '';
     lines.forEach(function (line) {
       var opt = el('option');
       opt.value = line.id;
-      opt.textContent = line.name + (line.phoneNumber ? ' · ' + line.phoneNumber : '');
+      opt.textContent = shortNames || !line.phoneNumber
+        ? line.name
+        : line.name + ' · ' + line.phoneNumber;
       select.appendChild(opt);
     });
     if (selected) { select.value = selected; }
@@ -248,7 +307,8 @@
     var ws = new WebSocket(scheme + '://' + location.host + '/api/v2/events');
     state.events = ws;
     ws.onopen = function () {
-      $('conn-dot').className = 'on';
+      // Only the degraded state is surfaced; a healthy stream shows nothing.
+      $('conn-dot').className = '';
       checkRingingSnapshot();
     };
     ws.onclose = function () {
@@ -332,6 +392,7 @@
       if (!to) { return; }
       startCall(to, preferredLine(''));
     });
+    renderDial();
   }
 
   function dialAppend(key) {
@@ -451,15 +512,15 @@
     $('composer-send').addEventListener('click', sendFromComposer);
     $('compose-cancel').addEventListener('click', closeCompose);
     $('compose-to').addEventListener('input', function () {
+      renderComposeReady();
       renderSuggestions($('compose-suggestions'), $('compose-to').value, function (peer) {
         $('compose-to').value = peer;
         $('compose-suggestions').classList.add('hidden');
+        renderComposeReady();
       });
     });
     $('compose-send').addEventListener('click', sendFromCompose);
-    $('compose-body').addEventListener('input', function () {
-      $('compose-send').style.color = $('compose-body').value.trim() && $('compose-to').value.trim() ? 'var(--accent)' : 'var(--muted)';
-    });
+    $('compose-body').addEventListener('input', renderComposeReady);
     // Compose is the floating button inside the messages tab (iOS Messages
     // convention: actions belong to their tab, not to the global tab bar).
     $('messages-compose').addEventListener('click', openCompose);
@@ -481,7 +542,7 @@
     $('thread-menu').addEventListener('click', function () {
       var thread = currentThread();
       if (!thread) { return; }
-      confirmDialog('删除与 ' + (thread.displayName || thread.peer) + ' 的对话？',
+      confirmDialog('删除与 ' + threadLabel(thread) + ' 的对话？',
         '删除后所有绑定设备将不再显示这段对话历史。', '删除对话', function () {
           deleteThreads([thread.key]);
         });
@@ -503,6 +564,9 @@
     $('sms-editbar').classList.toggle('hidden', !state.smsEditing);
     // The floating compose button would sit on top of the bulk-action bar.
     $('messages-compose').classList.toggle('hidden', state.smsEditing);
+    // Personal-settings shortcuts step out during the focused edit mode.
+    $('rules-link').classList.toggle('hidden', state.smsEditing);
+    $('settings-link').classList.toggle('hidden', state.smsEditing);
     renderThreadList();
   }
 
@@ -621,16 +685,31 @@
     $('composer-send').classList.toggle('ready', ready);
   }
 
+  function renderComposeReady() {
+    var ready = Boolean($('compose-to').value.trim() && $('compose-body').value.trim());
+    $('compose-send').classList.toggle('ready', ready);
+  }
+
   function currentThread() {
     return state.threads.filter(function (t) { return t.key === state.openThreadKey; })[0] || null;
+  }
+
+  function threadLabel(thread) {
+    return thread.displayName || peerName(thread.peer) || thread.peer;
   }
 
   function refreshThreads() {
     return S.api('/api/v2/threads').then(function (threads) {
       state.threads = threads || [];
+      state.threadsError = false;
       renderThreadList();
       refreshPeers();
-    }).catch(function () { /* transient */ });
+      $('messages-edit').classList.toggle('hidden',
+        state.activeTab !== 'messages' || state.threads.length === 0);
+    }).catch(function () {
+      state.threadsError = true;
+      if (state.activeTab === 'messages') { renderThreadList(); }
+    });
   }
 
   function renderThreadList() {
@@ -645,28 +724,35 @@
     });
     updateEditBar();
     if (!state.threads.length) {
-      list.appendChild(el('p', 'list-empty', '暂无短信。点右下角的 ＋ 新建对话。'));
+      if (state.threadsError) {
+        emptyState(list, 'messages', '无法加载短信', '请检查网络，切换到其他标签后再回来重试。');
+      } else {
+        emptyState(list, 'messages', '暂无短信', '点右下角的 ＋ 开始新对话。');
+      }
       return;
     }
     state.threads.forEach(function (thread) {
       var selected = Boolean(state.smsEditing && state.smsSelected[thread.key]);
+      var label = threadLabel(thread);
       var btn = el('button', 'thread-row' + (selected ? ' selected' : ''));
       if (state.smsEditing) {
         btn.appendChild(el('span', 'thread-check', selected ? '✓' : ''));
       } else {
-        btn.appendChild(el('span', 'avatar', (thread.displayName || thread.peer).charAt(0)));
+        btn.appendChild(el('span', 'avatar', (label || '?').charAt(0)));
       }
       var body = el('span', 't-body');
-      var name = el('div', 't-name', thread.displayName || thread.peer);
+      var name = el('div', 't-name', label);
       var last = thread.lastMessage || {};
       var preview = (last.direction === 'outbound' ? '✓ ' : '') + (last.body || '');
       body.appendChild(name);
       body.appendChild(el('div', 't-preview', preview));
       btn.appendChild(body);
-      btn.appendChild(el('span', 't-time', formatTime(last.createdAt)));
+      var meta = el('span', 't-meta');
+      meta.appendChild(el('span', 't-time', formatTime(last.createdAt)));
       if (thread.unreadCount > 0) {
-        btn.appendChild(el('span', 't-unread', String(Math.min(thread.unreadCount, 99))));
+        meta.appendChild(el('span', 't-unread', String(Math.min(thread.unreadCount, 99))));
       }
+      btn.appendChild(meta);
       btn.addEventListener('click', function () {
         if (state.smsEditing) {
           if (state.smsSelected[thread.key]) { delete state.smsSelected[thread.key]; }
@@ -691,15 +777,16 @@
     $('topbar').classList.add('hidden');
     var threadView = state.threads.filter(function (t) { return t.key === key; })[0] || null;
     fillLinePicker($('thread-line'),
-      preferredLine(key, smsLines(), threadView), smsLines());
+      preferredLine(key, smsLines(), threadView), smsLines(), true);
     // A manual pick is a CONVERSATION preference: it survives the canonical
     // re-open after a cross-line send, so the next message keeps this line.
     $('thread-line').onchange = function () {
       state.threadLinePrefs[key] = $('thread-line').value;
       saveLinePrefs();
     };
-    $('thread-name').textContent = peerName(peer) || peer;
-    $('thread-avatar').textContent = (peerName(peer) || peer).charAt(0);
+    var label = peerName(peer) || peer;
+    $('thread-name').textContent = label;
+    $('thread-avatar').textContent = (label || '?').charAt(0);
     // Opening a conversation marks its inbound unread messages read, exactly
     // like the native app (per-message authorized endpoint; failures stay
     // unread and silent so the badge remains honest).
@@ -723,10 +810,9 @@
     var lastDate = '';
     (messages || []).forEach(function (msg) {
       var date = new Date(msg.createdAt);
-      var day = date.toLocaleDateString();
+      var day = date.toDateString();
       if (day !== lastDate) {
-        box.appendChild(el('div', 'date-sep',
-          date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })));
+        box.appendChild(el('div', 'date-sep', formatDayStamp(date)));
         lastDate = day;
       }
       var wrap = el('div', 'msg ' + (msg.direction === 'outbound' ? 'out' : 'in'));
@@ -787,7 +873,7 @@
       }
       // Same key: re-sync the picker from the persisted preference too.
       fillLinePicker($('thread-line'), lineId,
-        state.lines.filter(function (l) { return l.permissions.sendSms; }));
+        state.lines.filter(function (l) { return l.permissions.sendSms; }), true);
       return refreshThread(canonical);
     }).catch(function (err) {
       toast(err.message || '发送失败');
@@ -803,6 +889,9 @@
     if (!to || !body) { return; }
     var lineId = TL.chosenLine($('compose-from').value, preferredLine(to));
     postMessage(to, body, lineId).then(function (record) {
+      $('compose-to').value = '';
+      $('compose-body').value = '';
+      renderComposeReady();
       closeCompose();
       // Follow the returned canonical thread and persist the chosen line
       // under ITS key so the header picker does not snap to the default.
@@ -852,6 +941,7 @@
     $('topbar').classList.add('hidden');
     $('messages-compose').classList.add('hidden');
     fillLinePicker($('compose-from'), preferredLine(''), senders);
+    renderComposeReady();
     $('compose-to').focus();
   }
 
@@ -902,16 +992,18 @@
     var note = $('contacts-note');
     list.textContent = '';
     if (state.contactsAccess) {
-      list.appendChild(el('p', 'muted contacts-empty', state.contactsAccess === 401
+      emptyState(list, 'contacts', '无法加载通讯录', state.contactsAccess === 401
         ? '登录状态已失效，请重新打开页面。'
-        : '通讯录暂时无法加载，请稍后重试。')).style.padding = '20px';
+        : '请检查网络，切换到其他标签后再回来重试。');
       note.classList.add('hidden');
       return;
     }
     if (!state.contacts.length) {
-      list.appendChild(el('p', 'muted contacts-empty', state.contactsQuery
-        ? '没有匹配的联系人。'
-        : '暂无联系人。可导入 .vcf 文件，或在手机 App 中同步系统通讯录。')).style.padding = '20px';
+      emptyState(list, 'contacts',
+        state.contactsQuery ? '没有匹配的联系人' : '暂无联系人',
+        state.contactsQuery
+          ? '换个姓名、号码或拼音试试。'
+          : '可导入 .vcf 文件，或在手机 App 中同步系统通讯录。');
     }
     state.contacts.forEach(function (contact) {
       list.appendChild(contactRow(contact));
@@ -924,45 +1016,79 @@
     }
   }
 
+  var CONTACT_CALL_ICON = '<svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true"><path fill="currentColor" d="M6.6 10.8c1.4 2.8 3.8 5.1 6.6 6.6l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C10.8 21 3 13.2 3 4c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.2.2 2.4.6 3.6.1.3 0 .7-.2 1l-2.3 2.2z"/></svg>';
+  var CONTACT_SMS_ICON = '<svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true"><path fill="currentColor" d="M12 3.4c-5.2 0-9.4 3.5-9.4 7.9 0 2.5 1.4 4.7 3.6 6.1-.1 1.2-.7 2.3-1.7 3.2 1.7-.1 3.2-.7 4.4-1.7.9.2 2 .3 3.1.3 5.2 0 9.4-3.5 9.4-7.9S17.2 3.4 12 3.4z"/></svg>';
+  var MORE_ICON = '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><circle cx="5" cy="12" r="1.8" fill="currentColor"/><circle cx="12" cy="12" r="1.8" fill="currentColor"/><circle cx="19" cy="12" r="1.8" fill="currentColor"/></svg>';
+
   function contactRow(contact) {
-    var row = el('div', 'contact-row');
-    row.appendChild(el('span', 'avatar', (CL.displayName(contact) || '?').charAt(0)));
-    var body = el('span', 'c-body');
-    body.appendChild(el('div', 'c-name', CL.displayName(contact)));
+    var label = CL.displayName(contact);
     var phones = CL.phoneValues(contact);
+    var row = el('div', 'contact-row');
+    row.appendChild(el('span', 'avatar', (label || '?').charAt(0)));
+    var body = el('span', 'c-body');
+    body.appendChild(el('div', 'c-name', label));
     body.appendChild(el('div', 'c-phone muted', phones.length ? phones[0] : '无号码'));
     if (contact.source === 'sync') {
       body.appendChild(el('div', 'c-source', '手机同步'));
     }
     row.appendChild(body);
+
     var actions = el('span', 'c-actions');
     if (phones.length) {
-      var call = el('button', null, '呼叫');
+      var call = el('button');
       call.type = 'button';
-      call.addEventListener('click', function () { startCall(phones[0], preferredLine('')); });
+      call.setAttribute('aria-label', '呼叫 ' + label);
+      call.innerHTML = CONTACT_CALL_ICON;
+      call.addEventListener('click', function (event) {
+        event.stopPropagation();
+        startCall(phones[0], preferredLine(''));
+      });
       actions.appendChild(call);
-      var sms = el('button', null, '短信');
+      var sms = el('button');
       sms.type = 'button';
-      sms.addEventListener('click', function () { openComposeFor(phones[0]); });
+      sms.setAttribute('aria-label', '给 ' + label + ' 发短信');
+      sms.innerHTML = CONTACT_SMS_ICON;
+      sms.addEventListener('click', function (event) {
+        event.stopPropagation();
+        openComposeFor(phones[0]);
+      });
       actions.appendChild(sms);
     }
-    var edit = el('button', null, '编辑');
-    edit.type = 'button';
-    edit.addEventListener('click', function () { openContactEditor(contact); });
-    actions.appendChild(edit);
-    var remove = el('button', 'danger', '删除');
-    remove.type = 'button';
-    remove.addEventListener('click', function () {
-      confirmDialog('删除联系人', '将从网关通讯录中删除「' + CL.displayName(contact) + '」，手机系统通讯录不受影响。', '删除', function () {
-        S.api('/api/v2/contacts/' + encodeURIComponent(contact.id), { method: 'DELETE' }).then(function () {
-          toast('已删除');
-          refreshContacts();
-        }).catch(function (err) { toast(err.message || '删除失败'); });
-      });
+    var more = el('button', 'more');
+    more.type = 'button';
+    more.setAttribute('aria-label', label + ' 的更多操作');
+    more.innerHTML = MORE_ICON;
+    more.addEventListener('click', function (event) {
+      event.stopPropagation();
+      openContactMenu(contact);
     });
-    actions.appendChild(remove);
+    actions.appendChild(more);
     row.appendChild(actions);
+    row.addEventListener('click', function () { openContactMenu(contact); });
     return row;
+  }
+
+  function openContactMenu(contact) {
+    var label = CL.displayName(contact);
+    var phones = CL.phoneValues(contact);
+    var items = [];
+    if (phones.length) {
+      items.push({ label: '呼叫 ' + phones[0], onSelect: function () { startCall(phones[0], preferredLine('')); } });
+      items.push({ label: '发送短信', onSelect: function () { openComposeFor(phones[0]); } });
+    }
+    items.push({ label: '编辑联系人', onSelect: function () { openContactEditor(contact); } });
+    items.push({
+      label: '删除联系人', danger: true,
+      onSelect: function () {
+        confirmDialog('删除联系人', '将从网关通讯录中删除「' + label + '」，手机系统通讯录不受影响。', '删除', function () {
+          S.api('/api/v2/contacts/' + encodeURIComponent(contact.id), { method: 'DELETE' }).then(function () {
+            toast('已删除');
+            refreshContacts();
+          }).catch(function (err) { toast(err.message || '删除失败'); });
+        });
+      },
+    });
+    actionSheet(label, items);
   }
 
   function openComposeFor(phone) {
@@ -1171,15 +1297,49 @@
   /* Call screen backed by CallFlow (ordering + teardown guarantees). */
   var PHONE_UP = '<svg viewBox="0 0 24 24" width="30" height="30"><path fill="currentColor" d="M6.6 10.8c1.4 2.8 3.8 5.1 6.6 6.6l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C10.8 21 3 13.2 3 4c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.2.2 2.4.6 3.6.1.3 0 .7-.2 1l-2.3 2.2z"/></svg>';
   var PHONE_DOWN = '<svg viewBox="0 0 24 24" width="30" height="30" style="transform:rotate(135deg)"><path fill="currentColor" d="M6.6 10.8c1.4 2.8 3.8 5.1 6.6 6.6l2.2-2.2c.3-.3.7-.4 1-.2 1.1.4 2.3.6 3.6.6.6 0 1 .4 1 1V20c0 .6-.4 1-1 1C10.8 21 3 13.2 3 4c0-.6.4-1 1-1h3.5c.6 0 1 .4 1 1 0 1.2.2 2.4.6 3.6.1.3 0 .7-.2 1l-2.3 2.2z"/></svg>';
+  var PERSON_ICON = '<svg viewBox="0 0 24 24" width="46" height="46" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="12" cy="9.4" r="3.6"/><path d="M5.6 19.4c.9-3 3.4-4.9 6.4-4.9s5.5 1.9 6.4 4.9" stroke-linecap="round"/></svg>';
+
+  /* Large title = the contact name when the address book knows this number,
+   * the number itself otherwise; the number stays visible as the subtitle. */
+  function setCallSubject(rawPeer) {
+    var peer = String(rawPeer || '').trim();
+    if (!peer) {
+      $('call-peer').textContent = '未知号码';
+      $('call-sub').textContent = '';
+      $('call-avatar').innerHTML = PERSON_ICON;
+      return;
+    }
+    var name = peerName(peer);
+    var display = (name && name !== peer) ? name : peer;
+    $('call-peer').textContent = display;
+    $('call-sub').textContent = (display !== peer) ? peer : '';
+    // An avatar initial only makes sense for a name; a phone number gets the
+    // person glyph instead of a stray digit.
+    if (/^[0-9+*#\s()-]+$/.test(display)) {
+      $('call-avatar').innerHTML = PERSON_ICON;
+    } else {
+      $('call-avatar').textContent = display.charAt(0);
+    }
+  }
+
+  function callControl(className, markup, label, onClick) {
+    var wrap = el('div', 'cc');
+    var btn = el('button', 'cbtn' + (className ? ' ' + className : ''));
+    btn.innerHTML = markup;
+    btn.setAttribute('aria-label', label);
+    btn.addEventListener('click', onClick);
+    wrap.appendChild(btn);
+    wrap.appendChild(el('span', null, label));
+    return wrap;
+  }
 
   function openCallScreen(callId, options) {
     options = options || {};
     var controls = $('call-controls');
     controls.textContent = '';
     $('call-view').classList.remove('hidden');
-    $('call-peer').textContent = options.peer || '…';
+    setCallSubject(options.peer || '');
     $('call-state').textContent = options.incoming ? '来电' : '正在呼叫…';
-    $('call-avatar').textContent = (options.peer || '?').charAt(0);
 
     var flow = new window.CallRelayCallFlow.CallFlow({
       callId: callId || '',
@@ -1229,7 +1389,7 @@
     };
 
     function renderCallView(view) {
-      if (view.peer) { $('call-peer').textContent = view.peer; }
+      if (view.peer) { setCallSubject(view.peer); }
       var phaseText = PHASE_TEXT[view.phase] || view.phase;
       if (view.error === 'mic-denied' || (view.error && view.error.indexOf('权限') >= 0)) {
         phaseText = '麦克风不可用，无法接听';
@@ -1242,39 +1402,30 @@
       }
       if (!view.canHangup) { return; }
       if (view.canAccept && (view.phase === 'ringing' || view.phase === 'preparing')) {
-        var reject = el('button', 'cbtn hangup');
-        reject.innerHTML = PHONE_DOWN;
-        reject.setAttribute('aria-label', '拒绝');
-        reject.addEventListener('click', function () { flow.hangup('reject'); });
-        var accept = el('button', 'cbtn accept');
-        accept.innerHTML = PHONE_UP;
-        accept.setAttribute('aria-label', '接听');
-        accept.addEventListener('click', function () {
+        controls.appendChild(callControl('hangup', PHONE_DOWN, '拒绝', function () {
+          flow.hangup('reject');
+        }));
+        controls.appendChild(callControl('accept', PHONE_UP, '接听', function () {
           flow.accept().then(function (ok) {
             if (!ok && state.call === flow) {
               $('call-state').textContent = '接听未完成：请允许麦克风后重试，或拒绝';
             }
           });
-        });
-        controls.appendChild(reject);
-        controls.appendChild(accept);
+        }));
         return;
       }
       if (view.phase === 'active') {
-        var mute = el('button', 'cbtn' + (view.muted ? ' on' : ''), '');
-        mute.innerHTML = '<svg viewBox="0 0 24 24" width="24" height="24"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-3.1A7 7 0 0 0 19 11h-2z"/></svg>';
+        var muteLabel = view.muted ? '取消静音' : '静音';
         // Single source of truth: the flow view (re-emitted by setMuted)
         // drives the label, so it updates immediately and can never claim a
         // state the capture gate does not enforce.
-        mute.setAttribute('aria-label', view.muted ? '取消静音' : '静音');
-        mute.addEventListener('click', function () { flow.setMuted(!flow.muted); });
-        controls.appendChild(mute);
+        controls.appendChild(callControl(view.muted ? 'on' : '',
+          '<svg viewBox="0 0 24 24" width="26" height="26"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-3.1A7 7 0 0 0 19 11h-2z"/></svg>',
+          muteLabel, function () { flow.setMuted(!flow.muted); }));
       }
-      var hang = el('button', 'cbtn hangup');
-      hang.innerHTML = PHONE_DOWN;
-      hang.setAttribute('aria-label', '挂断');
-      hang.addEventListener('click', function () { flow.hangup(); });
-      controls.appendChild(hang);
+      controls.appendChild(callControl('hangup', PHONE_DOWN, '挂断', function () {
+        flow.hangup();
+      }));
     }
 
     function closeCallScreen() {
@@ -1307,11 +1458,20 @@
 
   /* ---------------- call history ---------------- */
 
+  var CALL_ARROW_IN = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 8 16M8 9v7h7"/></svg>';
+  var CALL_ARROW_OUT = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 18 16 8M9 8h7v7"/></svg>';
+
   function refreshCalls() {
     return S.api('/api/v2/calls?limit=100').then(function (body) {
       state.calls = (body && body.calls) ? body.calls : (body || []);
+      state.callsError = false;
       renderCallList();
-    }).catch(function () { /* transient */ });
+    }).catch(function () {
+      // A failed fetch must still leave an honest screen — the old silent
+      // catch left the tab completely blank.
+      state.callsError = true;
+      renderCallList();
+    });
   }
 
   function callLineId(call) {
@@ -1332,11 +1492,11 @@
     var date = new Date(ms);
     var now = new Date();
     if (date.toDateString() === now.toDateString()) {
-      return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      return clockTime(date);
     }
     var yesterday = new Date(now.getTime() - 864e5);
     if (date.toDateString() === yesterday.toDateString()) {
-      return '昨天 ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      return '昨天 ' + clockTime(date);
     }
     return (date.getMonth() + 1) + '月' + date.getDate() + '日';
   }
@@ -1356,19 +1516,24 @@
     list.textContent = '';
     var calls = state.calls || [];
     if (!calls.length) {
-      list.appendChild(el('p', 'list-empty', '暂无通话记录'));
+      if (state.callsError) {
+        emptyState(list, 'calls', '无法加载通话记录', '请检查网络，切换到其他标签后再回来重试。');
+      } else {
+        emptyState(list, 'calls', '暂无通话记录', '拨出或接听电话后会显示在这里。');
+      }
       return;
     }
     calls.forEach(function (call) {
       var missed = callMissed(call);
       var row = el('button', 'call-row');
       var dir = el('span', 'call-dir' + (missed ? ' missed' : ''));
-      dir.textContent = call.direction === 'inbound' ? '↙' : '↗';
+      dir.innerHTML = call.direction === 'inbound' ? CALL_ARROW_IN : CALL_ARROW_OUT;
       var body = el('span', 'c-body');
       var name = el('span', 'c-name' + (missed ? ' missed' : ''));
       name.textContent = peerName(call.peer) || call.peer || '未知号码';
       var sub = el('span', 'c-sub');
-      sub.textContent = [call.lineName || '', formatDuration(call)].filter(Boolean).join(' · ') || '未接通';
+      var detail = missed ? '未接来电' : (formatDuration(call) || '未接通');
+      sub.textContent = [detail, call.lineName].filter(Boolean).join(' · ');
       body.appendChild(name);
       body.appendChild(sub);
       var when = el('span', 'c-time');
@@ -1385,8 +1550,11 @@
 
   /* ---------------- tabs ---------------- */
 
+  var NAV_TITLES = { dialer: '电话', messages: '短信', calls: '通话记录', contacts: '通讯录' };
+
   function showTab(name) {
     state.activeTab = name;
+    $('nav-title').textContent = NAV_TITLES[name] || '';
     document.querySelectorAll('.tabbtn[data-tab]').forEach(function (b) {
       b.classList.toggle('active', b.dataset.tab === name);
     });
@@ -1402,6 +1570,10 @@
     if (!onMessages && state.smsEditing) { setSmsEditing(false); }
     $('messages-edit').classList.toggle('hidden', !onMessages || state.threads.length === 0);
     $('messages-select-all').classList.toggle('hidden', !onMessages || !state.smsEditing);
+    // Edit mode is a focused mode: the personal-settings shortcuts step out.
+    var editing = onMessages && state.smsEditing;
+    $('rules-link').classList.toggle('hidden', editing);
+    $('settings-link').classList.toggle('hidden', editing);
   }
 
   function wireTabs() {
@@ -1410,9 +1582,28 @@
     });
   }
 
+  function clockTime(date) {
+    // 24-hour everywhere: a zh-CN UI reads 15:56, not 03:56 PM.
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+  }
+
   function formatTime(ms) {
     if (!ms) { return ''; }
-    return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return clockTime(new Date(ms));
+  }
+
+  /* Date stamp at the top of each conversation day. */
+  function formatDayStamp(date) {
+    var now = new Date();
+    var time = clockTime(date);
+    if (date.toDateString() === now.toDateString()) { return '今天 ' + time; }
+    var yesterday = new Date(now.getTime() - 864e5);
+    if (date.toDateString() === yesterday.toDateString()) { return '昨天 ' + time; }
+    var stamp = (date.getMonth() + 1) + '月' + date.getDate() + '日';
+    if (date.getFullYear() !== now.getFullYear()) {
+      stamp = date.getFullYear() + '年' + stamp;
+    }
+    return stamp + ' ' + time;
   }
 
   boot();
